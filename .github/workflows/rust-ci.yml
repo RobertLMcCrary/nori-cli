@@ -43,7 +43,7 @@ jobs:
       - name: Setup faster linker
         uses: rui314/setup-mold@v1
 
-      - uses: dtolnay/rust-toolchain@1.90
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
           components: clippy, rustfmt

@@ -797,10 +797,7 @@ fn is_session_metadata_update(update: &acp::SessionUpdate) -> bool {
 }
 
 fn saturating_i64(value: u64) -> i64 {
-    match i64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => i64::MAX,
-    }
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn is_terminal_phase(phase: &crate::normalized::ToolPhase) -> bool {

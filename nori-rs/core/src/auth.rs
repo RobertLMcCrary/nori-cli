@@ -765,7 +765,6 @@ mod tests {
             api_key,
             mode,
             auth_dot_json,
-            storage: _,
             ..
         } = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
             .unwrap()

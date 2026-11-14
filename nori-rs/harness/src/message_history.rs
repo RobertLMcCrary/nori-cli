@@ -355,7 +355,7 @@ pub fn search_entries(nori_home: &Path, max_results: usize) -> Vec<HistoryEntry>
     }
 
     let mut entries: Vec<HistoryEntry> = best_by_text.into_values().collect();
-    entries.sort_by(|a, b| b.ts.cmp(&a.ts));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.ts));
     entries.truncate(max_results);
     entries
 }

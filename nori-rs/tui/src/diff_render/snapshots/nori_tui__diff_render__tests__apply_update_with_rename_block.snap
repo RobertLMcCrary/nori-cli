@@ -1,10 +1,12 @@
 ---
-source: tui/src/diff_render.rs
+source: tui/src/diff_render/mod.rs
 expression: terminal.backend()
 ---
-"• Added new_file.txt (+2 -0)                                                    "
-"    1 +alpha                                                                    "
-"    2 +beta                                                                     "
+"• Edited old_name.rs → new_name.rs (+1 -1)                                      "
+"    1  A                                                                        "
+"    2 -B                                                                        "
+"    2 +B changed                                                                "
+"    3  C                                                                        "
 "                                                                                "
 "                                                                                "
 "                                                                                "

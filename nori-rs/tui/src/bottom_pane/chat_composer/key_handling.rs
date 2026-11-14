@@ -1294,7 +1294,7 @@ impl ChatComposer {
 
     fn expand_pending_pastes(&mut self, mut text: String) -> String {
         self.pending_pastes
-            .sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+            .sort_by_key(|(placeholder, _)| std::cmp::Reverse(placeholder.len()));
         for (placeholder, actual) in &self.pending_pastes {
             if text.contains(placeholder) {
                 text = text.replace(placeholder, actual);

@@ -29,6 +29,7 @@ use crate::render::line_utils::push_owned_lines;
 use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_line;
 use crate::wrapping::word_wrap_lines;
+use nori_harness::patch::first_line_in_file;
 
 #[derive(Debug)]
 pub(crate) struct ClientToolCell {
@@ -760,12 +761,9 @@ pub(crate) fn diff_changes_from_artifacts(
                     content: change.new_text.clone(),
                 },
                 Some(old_text) => crate::ui_types::FileChange::Update {
-                    unified_diff: create_contextual_patch(
-                        &change.path,
-                        cwd,
-                        old_text,
-                        &change.new_text,
-                    ),
+                    first_line: first_line_in_file(&change.path, cwd, old_text, &change.new_text),
+                    old_text: old_text.clone(),
+                    new_text: change.new_text.clone(),
                     move_path: None,
                 },
             };
@@ -788,12 +786,14 @@ pub(crate) fn changes_from_invocation(
                         content: change.new_text.clone(),
                     },
                     Some(old_text) => crate::ui_types::FileChange::Update {
-                        unified_diff: create_contextual_patch(
+                        first_line: first_line_in_file(
                             &change.path,
                             cwd,
                             old_text,
                             &change.new_text,
                         ),
+                        old_text: old_text.clone(),
+                        new_text: change.new_text.clone(),
                         move_path: None,
                     },
                 };
@@ -816,7 +816,9 @@ pub(crate) fn changes_from_invocation(
                     } => (
                         path.clone(),
                         crate::ui_types::FileChange::Update {
-                            unified_diff: create_contextual_patch(path, cwd, old_text, new_text),
+                            first_line: first_line_in_file(path, cwd, old_text, new_text),
+                            old_text: old_text.clone(),
+                            new_text: new_text.clone(),
                             move_path: None,
                         },
                     ),
@@ -837,7 +839,9 @@ pub(crate) fn changes_from_invocation(
                         (
                             from_path.clone(),
                             crate::ui_types::FileChange::Update {
-                                unified_diff: create_contextual_patch(from_path, cwd, &old, &new),
+                                first_line: first_line_in_file(from_path, cwd, &old, &new),
+                                old_text: old,
+                                new_text: new,
                                 move_path: Some(to_path.clone()),
                             },
                         )
@@ -861,15 +865,6 @@ fn changes_from_snapshot(
     } else {
         diff_changes
     }
-}
-
-fn create_contextual_patch(
-    path: &std::path::Path,
-    cwd: &std::path::Path,
-    old_text: &str,
-    new_text: &str,
-) -> String {
-    nori_harness::patch::create_patch_with_context(path, cwd, old_text, new_text)
 }
 
 impl HistoryCell for ClientToolCell {
@@ -940,6 +935,7 @@ mod tests {
     use crate::presentation::ToolKind;
     use crate::presentation::ToolPhase;
     use crate::presentation::ToolSnapshot;
+    use pretty_assertions::assert_eq;
 
     fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -2213,15 +2209,14 @@ mod tests {
             dir.path(),
         );
 
-        let change = changes
-            .get(&PathBuf::from("src/lib.rs"))
-            .expect("change should exist");
-        let crate::ui_types::FileChange::Update { unified_diff, .. } = change else {
-            panic!("expected update diff, got {change:?}");
-        };
-        assert!(
-            unified_diff.contains("@@ -50 +50 @@") || unified_diff.contains("@@ -50,1 +50,1 @@"),
-            "expected contextual hunk header for line 50, got:\n{unified_diff}"
+        assert_eq!(
+            changes.get(&PathBuf::from("src/lib.rs")),
+            Some(&crate::ui_types::FileChange::Update {
+                old_text: "fn line_50() {}\n".into(),
+                new_text: "fn line_50_updated() {}\n".into(),
+                first_line: 50,
+                move_path: None,
+            })
         );
     }
 
@@ -2242,15 +2237,14 @@ mod tests {
             dir.path(),
         );
 
-        let change = changes
-            .get(&PathBuf::from("src/old.rs"))
-            .expect("change should exist");
-        let crate::ui_types::FileChange::Update { unified_diff, .. } = change else {
-            panic!("expected update diff, got {change:?}");
-        };
-        assert!(
-            unified_diff.contains("@@ -75 +75 @@") || unified_diff.contains("@@ -75,1 +75,1 @@"),
-            "expected contextual hunk header for line 75, got:\n{unified_diff}"
+        assert_eq!(
+            changes.get(&PathBuf::from("src/old.rs")),
+            Some(&crate::ui_types::FileChange::Update {
+                old_text: "fn line_75() {}\n".into(),
+                new_text: "fn renamed_line_75() {}\n".into(),
+                first_line: 75,
+                move_path: Some(PathBuf::from("src/new.rs")),
+            })
         );
     }
 

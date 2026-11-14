@@ -84,11 +84,7 @@ pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<V
 
     let mut commands = Vec::new();
     for node in command_nodes {
-        if let Some(words) = parse_plain_command_from_node(node, src) {
-            commands.push(words);
-        } else {
-            return None;
-        }
+        commands.push(parse_plain_command_from_node(node, src)?);
     }
     Some(commands)
 }
@@ -152,11 +148,7 @@ fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Ve
                 let stripped = raw_string
                     .strip_prefix('\'')
                     .and_then(|s| s.strip_suffix('\''));
-                if let Some(s) = stripped {
-                    words.push(s.to_owned());
-                } else {
-                    return None;
-                }
+                words.push(stripped?.to_owned());
             }
             _ => return None,
         }

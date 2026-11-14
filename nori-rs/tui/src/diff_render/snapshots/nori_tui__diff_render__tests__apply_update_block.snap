@@ -1,12 +1,12 @@
 ---
-source: tui/src/diff_render.rs
-expression: terminal.backend()
+source: tui/src/diff_render/mod.rs
+expression: "rows.join(\"\\n\")"
 ---
-"• Edited old_name.rs → new_name.rs (+1 -1)                                      "
-"    1  A                                                                        "
-"    2 -B                                                                        "
-"    2 +B changed                                                                "
-"    3  C                                                                        "
+"• Edited example.txt (+1 -1)                                                    "
+"    1  line one                                                                 "
+"    2 -line two                                                                 "
+"    2 +line two {+changed+}                                                         "
+"    3  line three                                                               "
 "                                                                                "
 "                                                                                "
 "                                                                                "

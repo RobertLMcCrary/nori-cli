@@ -72,10 +72,7 @@ pub async fn run_resume_picker(
 
     let mut tui_events = alt.tui.event_stream().fuse();
 
-    loop {
-        let Some(ev) = tui_events.next().await else {
-            break;
-        };
+    while let Some(ev) = tui_events.next().await {
         match ev {
             TuiEvent::Key(key) => {
                 if matches!(key.kind, KeyEventKind::Release) {

@@ -391,6 +391,7 @@ pub(crate) fn with_border(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 /// This is useful when callers have already clamped their content to a
 /// specific width and want the border math centralized here instead of
 /// duplicating padding logic in the TUI widgets themselves.
+#[cfg_attr(debug_assertions, allow(dead_code))]
 pub(crate) fn with_border_with_inner_width(
     lines: Vec<Line<'static>>,
     inner_width: usize,
@@ -427,7 +428,7 @@ fn with_border_internal(
         let span_count = line.spans.len();
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(span_count + 4);
         spans.push(Span::from("│ ").dim());
-        spans.extend(line.into_iter());
+        spans.extend(line);
         if used_width < content_width {
             spans.push(Span::from(" ".repeat(content_width - used_width)).dim());
         }
@@ -443,6 +444,7 @@ fn with_border_internal(
 /// Return the emoji followed by a hair space (U+200A).
 /// Using only the hair space avoids excessive padding after the emoji while
 /// still providing a small visual gap across terminals.
+#[cfg_attr(debug_assertions, allow(dead_code))]
 pub(crate) fn padded_emoji(emoji: &str) -> String {
     format!("{emoji}\u{200A}")
 }

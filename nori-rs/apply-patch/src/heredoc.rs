@@ -117,7 +117,7 @@ pub(crate) fn extract_apply_patch_from_bash(
         let mut heredoc_text: Option<String> = None;
         let mut cd_path: Option<String> = None;
 
-        for capture in m.captures.iter() {
+        for capture in m.captures() {
             let name = APPLY_PATCH_QUERY.capture_names()[capture.index as usize];
             match name {
                 "heredoc" => {

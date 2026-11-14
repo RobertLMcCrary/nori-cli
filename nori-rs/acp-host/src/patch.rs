@@ -1,65 +1,37 @@
-pub fn create_patch_with_context(
+/// The line of the file at `path` (relative to `cwd`) that an edit's text begins on, counting
+/// from 1: where `old_text` is in the file, or `new_text` once the edit has been written. An
+/// edit's texts are often only the part of the file it replaced; when the file cannot be read or
+/// holds neither, the texts are taken to begin the file.
+pub fn first_line_in_file(
     path: &std::path::Path,
     cwd: &std::path::Path,
     old_text: &str,
     new_text: &str,
-) -> String {
+) -> usize {
     let full_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     };
 
-    let line_offset = if let Ok(file_content) = std::fs::read_to_string(&full_path) {
-        file_content
-            .find(old_text)
-            .or_else(|| file_content.find(new_text))
-            .map(|offset| file_content[..offset].lines().count() + 1)
-    } else {
-        None
-    };
-
-    let patch = diffy::create_patch(old_text, new_text).to_string();
-    if let Some(offset) = line_offset
-        && offset > 1
-    {
-        return adjust_patch_line_numbers(&patch, offset);
-    }
-    patch
-}
-
-fn adjust_patch_line_numbers(patch: &str, line_offset: usize) -> String {
-    let Ok(re) = regex::Regex::new(r"^@@ -(\d+)(,?\d*) \+(\d+)(,?\d*) @@") else {
-        return patch.to_string();
-    };
-    let mut result = String::new();
-    for line in patch.lines() {
-        if let Some(caps) = re.captures(line) {
-            let old_start: usize = caps[1].parse().unwrap_or(1);
-            let new_start: usize = caps[3].parse().unwrap_or(1);
-            let old_rest = &caps[2];
-            let new_rest = &caps[4];
-
-            let adjusted_old_start = old_start + line_offset - 1;
-            let adjusted_new_start = new_start + line_offset - 1;
-
-            result.push_str(&format!(
-                "@@ -{adjusted_old_start}{old_rest} +{adjusted_new_start}{new_rest} @@\n",
-            ));
-        } else {
-            result.push_str(line);
-            result.push('\n');
-        }
-    }
-    result
+    std::fs::read_to_string(&full_path)
+        .ok()
+        .and_then(|file_content| {
+            let offset = file_content
+                .find(old_text)
+                .or_else(|| file_content.find(new_text))?;
+            Some(file_content[..offset].lines().count() + 1)
+        })
+        .unwrap_or(1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn create_patch_with_context_uses_new_text_when_file_is_already_updated() {
+    fn first_line_in_file_uses_new_text_when_file_is_already_updated() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let file_path = temp_dir.path().join("story.txt");
         let file_content = (1..=100)
@@ -73,14 +45,27 @@ mod tests {
             .collect::<String>();
         std::fs::write(&file_path, file_content).expect("write updated file");
 
-        let patch = create_patch_with_context(
+        let first_line = first_line_in_file(
             std::path::Path::new("story.txt"),
             temp_dir.path(),
             "line 50\n",
             "line 50 updated\n",
         );
 
-        let hunk_header = patch.lines().find(|line| line.starts_with("@@ "));
-        assert_eq!(hunk_header, Some("@@ -50 +50 @@"));
+        assert_eq!(first_line, 50);
+    }
+
+    #[test]
+    fn first_line_in_file_is_the_first_line_when_the_file_is_gone() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let first_line = first_line_in_file(
+            std::path::Path::new("missing.txt"),
+            temp_dir.path(),
+            "old\n",
+            "new\n",
+        );
+
+        assert_eq!(first_line, 1);
     }
 }

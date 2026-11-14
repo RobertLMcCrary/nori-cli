@@ -23,14 +23,12 @@ axum = { workspace = true, features = ["http1", "tokio", "ws"] }
 base64 = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-utils-string = { workspace = true }
-diffy = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
 nori-config = { workspace = true }
 nori-protocol = { workspace = true }
 oauth2 = "5"
-regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = [

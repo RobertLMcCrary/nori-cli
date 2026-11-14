@@ -217,7 +217,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.97.1"
           targets: ${{ env.MUSL_TARGET }}
           components: clippy
 
@@ -289,7 +289,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.97.1"
           targets: ${{ matrix.target }}
 
       - name: Setup Android NDK

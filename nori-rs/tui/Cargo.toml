@@ -57,8 +57,8 @@ codex-utils-pty = { workspace = true, optional = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 derive_more = { workspace = true, features = ["is_variant"] }
-diffy = { workspace = true }
 dirs = { workspace = true }
+disparate = { workspace = true }
 dunce = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png"] }
 itertools = { workspace = true }

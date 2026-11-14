@@ -28,8 +28,13 @@ pub(crate) enum FileChange {
     Delete {
         content: String,
     },
+    /// The text an edit replaced and the text it wrote, diffed when they are drawn.
     Update {
-        unified_diff: String,
+        old_text: String,
+        new_text: String,
+        /// The line of the file the texts begin on, from 1: an edit's texts are often only
+        /// the part of the file it replaced.
+        first_line: usize,
         move_path: Option<PathBuf>,
     },
 }

@@ -606,6 +606,37 @@ cell renders it with the markdown renderer, its first 12 rows collapsed and
 all of it in the transcript. In an agent message, a markdown resource joins
 the message, and any other text resource is shown in a code block.
 
+#### File-change diffs
+
+An edit tool's change reaches `diff_render/` as `ui_types::FileChange::Update`:
+the text it replaced, the text it wrote, and the line of the file they begin
+on (`nori_harness::patch::first_line_in_file`, read when the tool's snapshot
+arrives, so the numbers survive the file changing again). The two texts are
+diffed with `disparate` when they are drawn (`diff_render/update.rs`). For a
+file whose extension names one of the grammars disparate compiles in (Rust,
+Python, JavaScript, TypeScript, Go, C, C++, Java, JSON, C#, Zig, HTML, CSS,
+Bash, Ruby, TOML, YAML), and when both texts parse without errors, the diff is
+structural (`disparate::syntax::Structural`): re-indented lines are unchanged
+and fold away with the context, rewrapped lines are changed but have nothing
+new in them, and code that moved is not new where it went. Otherwise the lines
+are diffed, and the words of each edited line are diffed against its
+counterpart. Either way, three unchanged lines are shown around each hunk and
+`⋮` stands for the rest; a hunk's removed lines come before its added ones;
+the header counts are the diff's lines removed and added.
+
+Each line keeps the look Codex uses (right-aligned line numbers, `+`/`-`,
+syntect colours, a tint by theme and colour depth). A changed line that is an
+edit of another also shows what changed in it, on a stronger tint over the same
+syntax colours (`disparate::layout::segments` cuts the line where colours and
+changes begin and end): in a structural diff, the novel tokens on it (a line
+with some tokens kept is an edit); in a line diff, the words that differ from
+the line it is paired with (`View::rows`). A line new throughout is only
+tinted, as added and removed lines are. On 16-colour terminals, which have no
+tints, the changed words are bold and underlined instead. A diff costs what
+changed, not the file: equal lines are compared as bytes, only the top-level
+items around changes are parsed, and only the lines shown are highlighted.
+Diffs are drawn on the UI thread and cached per width with the cell.
+
 #### Lifecycle behavior
 
 Connection preparation is separate from session activation, but ordinary local
