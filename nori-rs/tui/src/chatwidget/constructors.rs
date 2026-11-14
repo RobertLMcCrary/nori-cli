@@ -80,7 +80,12 @@ impl ChatWidget {
                     .unwrap_or_else(|| config.active_agent.clone()),
                 agent_slug: config.active_agent.clone(),
             }),
-            active_cell: None,
+            active_cell: Default::default(),
+            live_tail: Default::default(),
+            screen_rows: std::cell::Cell::new(0),
+            live_tail_has_header: false,
+            subagents: subagents::SubagentTree::new(config.cwd.clone(), config.animations),
+            subagents_running_shown: 0,
             active_user_message_id: None,
             config: config.clone(),
             auth_manager,
@@ -88,6 +93,8 @@ impl ChatWidget {
                 initial_prompt.unwrap_or_default(),
                 initial_images,
             ),
+            initial_echo_painted: false,
+            pending_echoes: Default::default(),
             stream_controller: None,
             session_generation,
             owned_prompt_request_id: None,
@@ -158,6 +165,8 @@ impl ChatWidget {
         if activating_prepared_cloud_session {
             widget.show_connecting_status("Nori Cloud");
         }
+        // A prompt given at launch is on screen from the first frame.
+        widget.paint_initial_prompt();
         widget
     }
 
@@ -256,7 +265,12 @@ impl ChatWidget {
                     .unwrap_or_else(|| config.active_agent.clone()),
                 agent_slug: config.active_agent.clone(),
             }),
-            active_cell: None,
+            active_cell: Default::default(),
+            live_tail: Default::default(),
+            screen_rows: std::cell::Cell::new(0),
+            live_tail_has_header: false,
+            subagents: subagents::SubagentTree::new(config.cwd.clone(), config.animations),
+            subagents_running_shown: 0,
             active_user_message_id: None,
             config: config.clone(),
             auth_manager,
@@ -264,6 +278,8 @@ impl ChatWidget {
                 initial_prompt.unwrap_or_default(),
                 initial_images,
             ),
+            initial_echo_painted: false,
+            pending_echoes: Default::default(),
             stream_controller: None,
             session_generation,
             owned_prompt_request_id: None,

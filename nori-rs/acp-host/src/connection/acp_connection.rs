@@ -10,7 +10,11 @@ use std::process::Stdio;
 use agent_client_protocol::Agent;
 use agent_client_protocol::Client;
 use agent_client_protocol::ConnectionTo;
+use agent_client_protocol::Dispatch;
+use agent_client_protocol::HandleDispatchFrom;
+use agent_client_protocol::Handled;
 use agent_client_protocol::Lines;
+use agent_client_protocol::UntypedMessage;
 use anyhow::Context;
 use anyhow::Result;
 use futures::AsyncBufReadExt;
@@ -33,6 +37,8 @@ use super::child_lifecycle::SHUTDOWN_GRACE;
 use super::child_lifecycle::STDERR_TAIL_LINES;
 use super::child_lifecycle::collect_stderr_tail;
 use super::child_lifecycle::wait_for_child_exit;
+use super::child_registry::Routed;
+use super::child_registry::SharedChildren;
 use super::wire_log::WireDirection;
 use super::wire_log::WireLogger;
 use crate::registry::AcpAgentConfig;
@@ -82,6 +88,9 @@ pub struct AcpConnection {
     /// Ordered inbox of raw ACP events from the transport layer.
     event_rx: mpsc::Receiver<ConnectionEvent>,
 
+    /// Which sessions on this connection are subagents of the root session.
+    children: SharedChildren,
+
     /// Sender retained so outgoing request completions join the ordered inbox.
     event_tx: mpsc::Sender<ConnectionEvent>,
 
@@ -98,6 +107,141 @@ pub struct AcpConnection {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Claims the `session/update` notifications that announce subagents.
+///
+/// The pinned ACP schema has no types for them, so the typed notification handler cannot parse
+/// them. They are recognized from the already-decoded JSON envelope (an O(1) peek at
+/// `params.update.sessionUpdate`) and everything else is passed on untouched.
+struct SubagentDispatch {
+    event_tx: mpsc::Sender<ConnectionEvent>,
+    children: SharedChildren,
+}
+
+impl HandleDispatchFrom<Agent> for SubagentDispatch {
+    async fn handle_dispatch_from(
+        &mut self,
+        message: Dispatch,
+        _connection: ConnectionTo<Agent>,
+    ) -> std::result::Result<Handled<Dispatch>, acp::Error> {
+        let Dispatch::Notification(notification) = message else {
+            return Ok(Handled::No {
+                message,
+                retry: false,
+            });
+        };
+        if notification.method != "session/update" {
+            return Ok(Handled::No {
+                message: Dispatch::Notification(notification),
+                retry: false,
+            });
+        }
+        let Some(wire) = nori_protocol::parse_subagent_update(&notification.params) else {
+            return Ok(Handled::No {
+                message: Dispatch::Notification(notification),
+                retry: false,
+            });
+        };
+        // Announcing a child releases the updates that arrived ahead of the announcement.
+        let released = match &wire {
+            nori_protocol::SubagentWire::Update(update) => self
+                .children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .announce(&update.session_id),
+            nori_protocol::SubagentWire::Message(_) => Vec::new(),
+        };
+        if self
+            .event_tx
+            .send(ConnectionEvent::Subagent(wire))
+            .await
+            .is_err()
+        {
+            warn!("Notification channel closed, dropping subagent update");
+        }
+        for notification in released {
+            let _ = self
+                .event_tx
+                .send(ConnectionEvent::Acp(Box::new(AcpEvent::ChildNotification(
+                    notification,
+                ))))
+                .await;
+        }
+        Ok(Handled::Yes)
+    }
+
+    fn describe_chain(&self) -> impl std::fmt::Debug {
+        "subagent updates"
+    }
+}
+
+/// The `initialize` request as JSON, with `clientCapabilities.subagents = {}` when advertised.
+///
+/// The typed request cannot carry the capability, so it is serialized and extended here and sent
+/// as an untyped message; the response is decoded as the usual typed response.
+fn initialize_params(
+    request: &acp::InitializeRequest,
+    advertise_subagents: bool,
+) -> std::result::Result<serde_json::Value, acp::Error> {
+    let mut params = serde_json::to_value(request)?;
+    if advertise_subagents
+        && let Some(capabilities) = params
+            .get_mut("clientCapabilities")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        capabilities.insert("subagents".to_string(), serde_json::json!({}));
+    }
+    Ok(params)
+}
+
+/// Write a file for the agent, if the path is inside the working directory or `/tmp`.
+fn write_text_file(cwd: &Path, requested: &Path, content: &str) -> Result<(), acp::Error> {
+    let resolved_path = if requested.is_relative() {
+        cwd.join(requested)
+    } else {
+        requested.to_path_buf()
+    };
+
+    let allowed = if let Ok(canonical) = resolved_path.canonicalize() {
+        let in_cwd = cwd
+            .canonicalize()
+            .map(|c| canonical.starts_with(&c))
+            .unwrap_or(false);
+        let in_tmp = canonical.starts_with("/tmp");
+        in_cwd || in_tmp
+    } else if let Some(parent) = resolved_path.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            let in_cwd = cwd
+                .canonicalize()
+                .map(|c| canonical_parent.starts_with(&c))
+                .unwrap_or(false);
+            let in_tmp = canonical_parent.starts_with("/tmp");
+            in_cwd || in_tmp
+        } else {
+            resolved_path.starts_with(cwd) || resolved_path.starts_with("/tmp")
+        }
+    } else {
+        false
+    };
+
+    if !allowed {
+        return Err(acp::Error::invalid_params().data(format!(
+            "Write restricted to working directory ({}) or /tmp. Path: {}",
+            cwd.display(),
+            resolved_path.display()
+        )));
+    }
+
+    if let Some(parent) = resolved_path.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return Err(acp::Error::internal_error().data(e.to_string()));
+    }
+
+    std::fs::write(&resolved_path, content)
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+}
+
 /// Shared ACP connection setup: registers notification/request handlers,
 /// performs the initialization handshake, and returns a `AcpConnection` with
 /// no process handles (`child`/`stderr_task` are `None`). `spawn()` fills in the
@@ -111,6 +255,8 @@ async fn establish_connection(
     event_tx: mpsc::Sender<ConnectionEvent>,
     event_rx: mpsc::Receiver<ConnectionEvent>,
     initialize_event_tx: Option<mpsc::Sender<AcpEvent>>,
+    advertise_subagents: bool,
+    children: SharedChildren,
 ) -> Result<AcpConnection> {
     let connection_event_tx = event_tx.clone();
     let event_tx_for_notifications = event_tx.clone();
@@ -129,14 +275,42 @@ async fn establish_connection(
         )>,
     >();
 
+    let subagent_event_tx = event_tx.clone();
+    let children_for_dispatch = children.clone();
+    let children_for_notifications = children.clone();
     let connection_task = tokio::spawn(async move {
         let result = Client
             .builder()
+            .with_handler(SubagentDispatch {
+                event_tx: subagent_event_tx,
+                children: children_for_dispatch,
+            })
             .on_receive_notification(
                 {
                     let event_tx = event_tx_for_notifications;
                     let session_config_state = session_config_state_for_notifications;
+                    let children = children_for_notifications;
                     async move |notification: acp::SessionNotification, _connection| {
+                        let routed = children
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .route(notification);
+                        let notification = match routed {
+                            Routed::Root(notification) => notification,
+                            Routed::Child(notification) => {
+                                if event_tx
+                                    .send(ConnectionEvent::Acp(Box::new(
+                                        AcpEvent::ChildNotification(notification),
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!("Notification channel closed, dropping child update");
+                                }
+                                return Ok(());
+                            }
+                            Routed::Held => return Ok(()),
+                        };
                         let session_id = notification.session_id.to_string();
                         debug!(
                             target: "acp_event_flow",
@@ -225,67 +399,23 @@ async fn establish_connection(
                                 responder: agent_client_protocol::Responder<
                         acp::WriteTextFileResponse,
                     >,
-                                _connection: ConnectionTo<Agent>| {
-                        let path = &request.path;
-                        let resolved_path = if path.is_relative() {
-                            cwd.join(path)
-                        } else {
-                            path.to_path_buf()
-                        };
-
-                        let allowed = if let Ok(canonical) = resolved_path.canonicalize() {
-                            let in_cwd = cwd
-                                .canonicalize()
-                                .map(|c| canonical.starts_with(&c))
-                                .unwrap_or(false);
-                            let in_tmp = canonical.starts_with("/tmp");
-                            in_cwd || in_tmp
-                        } else if let Some(parent) = resolved_path.parent() {
-                            if let Ok(canonical_parent) = parent.canonicalize() {
-                                let in_cwd = cwd
-                                    .canonicalize()
-                                    .map(|c| canonical_parent.starts_with(&c))
-                                    .unwrap_or(false);
-                                let in_tmp = canonical_parent.starts_with("/tmp");
-                                in_cwd || in_tmp
-                            } else {
-                                resolved_path.starts_with(&cwd) || resolved_path.starts_with("/tmp")
-                            }
-                        } else {
-                            false
-                        };
-
-                        if !allowed {
-                            responder.respond_with_error(acp::Error::invalid_params().data(
-                                format!(
-                                    "Write restricted to working directory ({}) or /tmp. Path: {}",
-                                    cwd.display(),
-                                    resolved_path.display()
-                                ),
-                            ))?;
-                            return Ok(());
-                        }
-
-                        if let Some(parent) = resolved_path.parent()
-                            && !parent.exists()
-                            && let Err(e) = std::fs::create_dir_all(parent)
-                        {
-                            responder.respond_with_error(
-                                acp::Error::internal_error().data(e.to_string()),
+                                connection: ConnectionTo<Agent>| {
+                        // File access runs off the connection's dispatch loop: a large read or
+                        // write must not hold up the agent's streamed output behind it.
+                        let cwd = cwd.clone();
+                        connection.spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                write_text_file(&cwd, &request.path, &request.content)
+                            })
+                            .await
+                            .unwrap_or_else(|error| {
+                                Err(acp::Error::internal_error().data(error.to_string()))
+                            });
+                            responder.respond_with_result(
+                                result.map(|()| acp::WriteTextFileResponse::new()),
                             )?;
-                            return Ok(());
-                        }
-
-                        match std::fs::write(&resolved_path, &request.content) {
-                            Ok(()) => {
-                                responder.respond(acp::WriteTextFileResponse::new())?;
-                            }
-                            Err(e) => {
-                                responder.respond_with_error(
-                                    acp::Error::internal_error().data(e.to_string()),
-                                )?;
-                            }
-                        }
+                            Ok(())
+                        })?;
                         Ok(())
                     }
                 },
@@ -298,43 +428,50 @@ async fn establish_connection(
                                 responder: agent_client_protocol::Responder<
                         acp::ReadTextFileResponse,
                     >,
-                                _connection: ConnectionTo<Agent>| {
+                                connection: ConnectionTo<Agent>| {
                         let resolved_path = if request.path.is_relative() {
                             cwd.join(&request.path)
                         } else {
                             request.path
                         };
-
-                        match std::fs::read_to_string(&resolved_path) {
-                            Ok(content) => {
-                                responder.respond(acp::ReadTextFileResponse::new(content))?;
-                            }
-                            Err(e) => {
-                                responder.respond_with_error(
-                                    acp::Error::internal_error().data(e.to_string()),
-                                )?;
-                            }
-                        }
+                        connection.spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                std::fs::read_to_string(&resolved_path)
+                            })
+                            .await
+                            .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+                            responder.respond_with_result(
+                                result.map(acp::ReadTextFileResponse::new).map_err(|error| {
+                                    acp::Error::internal_error().data(error.to_string())
+                                }),
+                            )?;
+                            Ok(())
+                        })?;
                         Ok(())
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
-                let request = connection.send_request(
-                    acp::InitializeRequest::new(ProtocolVersion::LATEST)
-                        .client_capabilities(
-                            acp::ClientCapabilities::new().fs(acp::FileSystemCapabilities::new()
-                                .read_text_file(true)
-                                .write_text_file(true)),
-                        )
-                        .client_info(
-                            acp::Implementation::new("nori", env!("CARGO_PKG_VERSION"))
-                                .title("Nori CLI"),
-                        ),
-                );
+                let initialize = acp::InitializeRequest::new(ProtocolVersion::LATEST)
+                    .client_capabilities(
+                        acp::ClientCapabilities::new().fs(acp::FileSystemCapabilities::new()
+                            .read_text_file(true)
+                            .write_text_file(true)),
+                    )
+                    .client_info(
+                        acp::Implementation::new("nori", env!("CARGO_PKG_VERSION"))
+                            .title("Nori CLI"),
+                    );
+                let request = connection.send_request(UntypedMessage::new(
+                    "initialize",
+                    initialize_params(&initialize, advertise_subagents)?,
+                )?);
                 let request_id = schema_request_id(request.id());
-                let response = request.block_task().await;
+                let response = request.block_task().await.and_then(|value| {
+                    serde_json::from_value::<acp::InitializeResponse>(value)
+                        .map_err(acp::Error::from)
+                });
                 let initialize_event = AcpEvent::Response {
                     request_id,
                     response: response.clone().map(acp::AgentResponse::InitializeResponse),
@@ -397,6 +534,7 @@ async fn establish_connection(
         event_rx,
         event_tx: connection_event_tx,
         session_config_state,
+        children,
         connection_task,
         child: None,
         stderr_task: None,
@@ -601,7 +739,15 @@ impl AcpConnection {
         let child_died = async move {
             let _ = exit_watch.wait_for(std::option::Option::is_some).await;
         };
-        let init = establish_connection(transport, cwd, event_tx, event_rx, initialize_event_tx);
+        let init = establish_connection(
+            transport,
+            cwd,
+            event_tx,
+            event_rx,
+            initialize_event_tx,
+            config.advertise_subagents,
+            SharedChildren::default(),
+        );
         let init_result = tokio::select! {
             result = init => result,
             () = child_died => Err(anyhow::anyhow!("agent exited before initialization finished")),
@@ -644,6 +790,13 @@ impl AcpConnection {
         Ok(connection)
     }
 
+    fn set_root_session(&self, session_id: acp::SessionId) {
+        self.children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_root(session_id);
+    }
+
     /// Create a new session with the agent.
     ///
     /// `mcp_servers` are forwarded to the agent so it can connect to CLI-configured
@@ -666,6 +819,7 @@ impl AcpConnection {
             })))
             .await;
         let response = response.context("Failed to create ACP session")?;
+        self.set_root_session(response.session_id.clone());
 
         if let Some(config_options) = response.config_options
             && let Ok(mut state) = self.session_config_state.write()
@@ -688,6 +842,8 @@ impl AcpConnection {
         mcp_servers: Vec<acp::McpServer>,
         request_started: Option<oneshot::Sender<RequestId>>,
     ) -> Result<acp::SessionId> {
+        // Replay updates can arrive before the response, and are the root's.
+        self.set_root_session(acp::SessionId::new(session_id));
         let request = self.cx.send_request(
             acp::LoadSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers),
         );
@@ -730,6 +886,7 @@ impl AcpConnection {
         cwd: &Path,
         mcp_servers: Vec<acp::McpServer>,
     ) -> Result<acp::SessionId> {
+        self.set_root_session(acp::SessionId::new(session_id));
         let request = self.cx.send_request(
             acp::ResumeSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers),
         );
@@ -781,6 +938,7 @@ impl AcpConnection {
             })))
             .await;
         let response = response.context("Failed to fork ACP session")?;
+        self.set_root_session(response.session_id.clone());
 
         if let Some(config_options) = response.config_options
             && let Ok(mut state) = self.session_config_state.write()

@@ -472,11 +472,13 @@ fn load_auth(
 
     let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
 
-    let client = crate::default_client::create_client();
     let auth_dot_json = match storage.load()? {
         Some(auth) => auth,
         None => return Ok(None),
     };
+    // Building the HTTP client sets up TLS, which costs milliseconds; without saved credentials
+    // there is nothing to use it for.
+    let client = crate::default_client::create_client();
 
     let AuthDotJson {
         openai_api_key: auth_json_api_key,

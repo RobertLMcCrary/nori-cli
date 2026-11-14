@@ -55,6 +55,11 @@ use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 pub(crate) mod agent;
 mod agent_status;
+mod conflate;
+mod layout_cache;
+mod local_echo;
+mod stream_frame;
+pub(crate) mod subagents;
 pub(crate) use self::agent::HarnessHandle;
 use self::agent::spawn_acp_agent_resume;
 use self::agent::spawn_agent;
@@ -177,11 +182,26 @@ pub(crate) enum PlanDrawerMode {
 pub(crate) struct ChatWidget {
     app_event_tx: AppEventSender,
     bottom_pane: BottomPane,
-    active_cell: Option<Box<dyn HistoryCell>>,
+    /// The cell still being built (a tool call, the user's prompt), shown above the composer.
+    active_cell: layout_cache::CachedCell,
+    /// The rendered but not yet final tail of the streaming answer, shown above the composer.
+    live_tail: layout_cache::CachedCell,
+    /// Rows of the terminal, so the viewport can leave room for history to flush above it.
+    screen_rows: std::cell::Cell<u16>,
+    /// Whether the live tail starts the message, so it carries the `• ` header.
+    live_tail_has_header: bool,
+    /// Subagent sessions of this conversation.
+    subagents: subagents::SubagentTree,
+    /// How many running subagents the status line currently names.
+    subagents_running_shown: usize,
     active_user_message_id: Option<String>,
     config: Config,
     auth_manager: Arc<AuthManager>,
     initial_user_message: Option<UserMessage>,
+    /// True once `initial_user_message` was painted before its session existed.
+    initial_echo_painted: bool,
+    /// Prompts painted locally ahead of the harness echo.
+    pending_echoes: local_echo::PendingEchoes,
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
     session_generation: crate::app_event::SessionGeneration,

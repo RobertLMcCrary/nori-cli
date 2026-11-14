@@ -30,11 +30,8 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -106,9 +103,6 @@ pub(crate) struct App {
 
     pub(crate) enhanced_keys_supported: bool,
 
-    /// Controls the animation thread that sends CommitTick events.
-    pub(crate) commit_anim_running: Arc<AtomicBool>,
-
     // Esc-backtracking state grouped
     pub(crate) backtrack: crate::app_backtrack::BacktrackState,
     /// Set when the user confirms an update; propagated on exit.
@@ -176,6 +170,9 @@ struct PrimaryAgentPreparation {
 
 pub(crate) enum PendingSessionActivation {
     New,
+    /// A resume chosen at startup whose transcript is still loading. The agent starts in the
+    /// meantime, and a prepared agent waits for the transcript instead of starting a session.
+    ResumeLoading,
     Resume {
         acp_session_id: Option<String>,
         title: Option<String>,
@@ -211,6 +208,7 @@ struct SystemInfoRefreshRequest {
 
 mod config_persistence;
 mod event_handling;
+mod frame;
 mod resize_reflow;
 mod session_setup;
 
@@ -260,16 +258,19 @@ impl App {
             };
             match resume_selection {
                 ResumeSelection::Resume(target) => {
-                    let loader = nori_harness::transcript::TranscriptLoader::new(target.nori_home);
-                    let transcript = loader
-                        .load_transcript(&target.project_id, &target.session_id)
-                        .await?;
-                    let acp_session_id = transcript.meta.acp_session_id.clone();
-                    pending_session_activation = Some(PendingSessionActivation::Resume {
-                        acp_session_id,
-                        title: None,
-                        transcript: Some(Box::new(transcript)),
+                    // The transcript loads while the agent starts, never before the first frame.
+                    let tx = app_event_tx.clone();
+                    tokio::spawn(async move {
+                        let loader =
+                            nori_harness::transcript::TranscriptLoader::new(target.nori_home);
+                        let transcript = loader
+                            .load_transcript(&target.project_id, &target.session_id)
+                            .await
+                            .map(Box::new)
+                            .map_err(|error| error.to_string());
+                        tx.send(AppEvent::ResumeTranscriptLoaded { transcript });
                     });
+                    pending_session_activation = Some(PendingSessionActivation::ResumeLoading);
                     ChatWidget::new(init)
                 }
                 ResumeSelection::StartFresh | ResumeSelection::Exit => {
@@ -281,12 +282,14 @@ impl App {
             }
         };
 
+        crate::startup_trace::mark("chat_widget");
         chat_widget.maybe_prompt_windows_sandbox_enable();
 
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        crate::startup_trace::mark("file_search");
         let (system_info_tx, system_info_rx) = mpsc::channel();
         let _system_info_worker =
             Self::spawn_system_info_worker(system_info_rx, app_event_tx.clone());
@@ -310,7 +313,6 @@ impl App {
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             transcript_reflow: Default::default(),
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
             backtrack: BacktrackState::default(),
             pending_update_action: None,
             skip_world_writable_scan_once: false,
@@ -332,6 +334,7 @@ impl App {
             mcp_oauth_cancel_tx: None,
         };
 
+        crate::startup_trace::mark("app_struct");
         if let Some(addr) = startup_remote_addr {
             let report = app
                 .remote_control
@@ -370,7 +373,9 @@ impl App {
         // but it spawns Node for the skillset version and walks the filesystem
         // for transcripts, so without a seed every footer segment stays blank
         // for as long as that takes.
+        crate::startup_trace::mark("widget_config");
         app.chat_widget.seed_system_info();
+        crate::startup_trace::mark("system_info_seeded");
 
         // Write the welcome card before the agent session exists, so a session
         // that has not been prompted yet still says where it is running and
@@ -389,6 +394,7 @@ impl App {
         // write `.claude/CLAUDE.md` before the agent reads it. Applying or
         // dismissing the picker starts preparation without activating a
         // session.
+        crate::startup_trace::mark("welcome_card");
         if skillset_per_session {
             app.chat_widget.handle_switch_skillset_command();
         } else if app.pending_session_activation.is_some() {
@@ -448,6 +454,7 @@ impl App {
             .await?;
         }
 
+        crate::startup_trace::mark("app_ready");
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
 
@@ -457,16 +464,23 @@ impl App {
             app.chat_widget.first_prompt_text(),
         );
 
-        tui.frame_requester().schedule_frame();
+        // The first frame is drawn here rather than requested: under load the scheduler task,
+        // the broadcast and the event stream between a request and its draw can each wait to be
+        // scheduled, and nothing the frame shows depends on them.
+        let keep_running = app
+            .handle_tui_event_batched(tui, &mut app_event_rx, TuiEvent::Draw)
+            .await?;
 
-        while select! {
-            Some(event) = app_event_rx.recv() => {
-                app.handle_event(tui, event).await?
+        while keep_running
+            && select! {
+                Some(event) = app_event_rx.recv() => {
+                    app.handle_event(tui, event).await?
+                }
+                Some(event) = tui_events.next() => {
+                    app.handle_tui_event_batched(tui, &mut app_event_rx, event).await?
+                }
             }
-            Some(event) = tui_events.next() => {
-                app.handle_tui_event(tui, event).await?
-            }
-        } {}
+        {}
 
         app.cancel_primary_agent_preparation();
         if let Some(agent) = app.prepared_agent.take() {

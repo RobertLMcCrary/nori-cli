@@ -379,6 +379,11 @@ async fn forward_events<H: HostedAgent>(
                     break;
                 }
             }
+            SessionEvent::Acp(AcpEvent::ChildNotification(notification)) => {
+                if client.send_notification(notification).is_err() {
+                    break;
+                }
+            }
             SessionEvent::Acp(AcpEvent::Request {
                 request_id,
                 request,

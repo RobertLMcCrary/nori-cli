@@ -1,0 +1,249 @@
+//! Subagent presentation, driven by wire traffic recorded from a real adapter.
+
+use super::*;
+use crate::chatwidget::subagents::SubagentBlock;
+use nori_protocol::AcpEvent;
+use nori_protocol::NoriEvent;
+use nori_protocol::SessionEvent;
+use nori_protocol::acp::v1 as acp;
+use pretty_assertions::assert_eq;
+use std::time::Instant;
+
+fn fixture(name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../mock-acp-agent/fixtures")
+        .join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+/// The harness events a recorded `session/update` stream turns into, plus the root session id.
+fn replay_events(name: &str) -> (String, Vec<SessionEvent>) {
+    let mut root: Option<String> = None;
+    let mut events = Vec::new();
+    for line in fixture(name).lines() {
+        let record: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
+        let message = &record["msg"];
+        if record["dir"] != "in" || message["method"] != "session/update" {
+            continue;
+        }
+        let params = &message["params"];
+        let session = params["sessionId"].as_str().expect("session id").to_owned();
+        let root_id = root.get_or_insert_with(|| session.clone()).clone();
+        if let Some(wire) = nori_protocol::parse_subagent_update(params) {
+            events.push(SessionEvent::Nori(NoriEvent::Subagent(wire)));
+            continue;
+        }
+        let notification: acp::SessionNotification =
+            serde_json::from_value(params.clone()).expect("typed notification");
+        events.push(SessionEvent::Acp(if session == root_id {
+            AcpEvent::Notification(acp::AgentNotification::SessionNotification(notification))
+        } else {
+            AcpEvent::ChildNotification(notification)
+        }));
+    }
+    (root.expect("root session"), events)
+}
+
+fn plain(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
+        .collect()
+}
+
+fn history_text(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> String {
+    drain_insert_history(rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect()
+}
+
+fn block_lines(chat: &ChatWidget, width: u16) -> Vec<String> {
+    plain(
+        &SubagentBlock {
+            tree: &chat.subagents,
+            now: Instant::now(),
+            screen_rows: 0,
+        }
+        .lines(width),
+    )
+}
+
+#[test]
+fn announced_children_get_a_live_block_and_a_summary_each() {
+    let (root, events) = replay_events("claude_subagents.jsonl");
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    chat.subagents.set_root(acp::SessionId::new(root));
+
+    // Up to the point where both children are announced and working.
+    let both_running = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Acp(AcpEvent::ChildNotification(_))))
+        .expect("a child update");
+    for event in events[..both_running].iter().cloned() {
+        chat.handle_session_event(generation, event);
+    }
+    let live = block_lines(&chat, 80);
+    assert!(
+        live.iter().any(|line| line.contains("Read a.txt contents")),
+        "{live:#?}"
+    );
+    // The launcher's own tool call must not be painted as a root tool cell.
+    assert!(chat.active_cell.as_ref().is_none(), "{live:#?}");
+
+    for event in events[both_running..].iter().cloned() {
+        chat.handle_session_event(generation, event);
+    }
+    chat.commit_stream_for_frame();
+    chat.flush_answer_stream_with_separator();
+    chat.flush_active_cell();
+
+    assert_eq!(chat.subagents.running_count(), 0);
+    let history = history_text(&mut rx);
+    // One summary per child, in completion order (a.txt finished first).
+    let first = history
+        .find("Read a.txt contents")
+        .expect("summary for a.txt");
+    let second = history
+        .find("Count lines in b.txt")
+        .expect("summary for b.txt");
+    assert!(first < second, "{history}");
+    // The children's own words are in their summaries, never in the root answer's cells.
+    assert!(
+        history.contains("The file exists and I read it"),
+        "{history}"
+    );
+    // The root's text is all there, once.
+    assert_eq!(
+        history.matches("Both subagents are running").count(),
+        1,
+        "{history}"
+    );
+    assert_eq!(history.matches("a.txt contains").count(), 1, "{history}");
+}
+
+#[test]
+fn a_launcher_call_that_reports_completion_does_not_finish_the_child() {
+    let (root, events) = replay_events("claude_subagents.jsonl");
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    chat.subagents.set_root(acp::SessionId::new(root));
+    // Everything up to the first child's tool call: both Agent calls already reported
+    // "completed", the children are still working.
+    let stop = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Acp(AcpEvent::ChildNotification(_))))
+        .expect("a child update");
+    for event in events[..stop].iter().cloned() {
+        chat.handle_session_event(generation, event);
+    }
+    assert!(chat.subagents.running_count() >= 1);
+}
+
+#[test]
+fn without_the_capability_tagged_tool_calls_group_under_their_launcher() {
+    let (root, events) = replay_events("claude_plain.jsonl");
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    chat.subagents.set_root(acp::SessionId::new(root));
+
+    // The children's tool calls arrive on the root session; stop once both launched and one child
+    // tool call was seen.
+    let mut saw_child_tool = false;
+    for event in events.iter().cloned() {
+        let is_tool = matches!(
+            &event,
+            SessionEvent::Acp(AcpEvent::Notification(
+                acp::AgentNotification::SessionNotification(n)
+            )) if matches!(n.update, acp::SessionUpdate::ToolCall(_))
+                && nori_protocol::ClaudeToolMeta::read(match &n.update {
+                    acp::SessionUpdate::ToolCall(call) => call.meta.as_ref(),
+                    _ => None,
+                })
+                .parent_tool_use_id
+                .is_some()
+        );
+        chat.handle_session_event(generation, event);
+        if is_tool && !saw_child_tool {
+            saw_child_tool = true;
+            let live = block_lines(&chat, 80);
+            assert!(
+                live.iter().any(|line| line.contains("Read a.txt contents")),
+                "{live:#?}"
+            );
+            assert!(
+                live.iter().any(|line| line.contains("Read a.txt")),
+                "{live:#?}"
+            );
+            // Nothing of the child's work is in the root's conversation.
+            assert!(chat.active_cell.as_ref().is_none());
+        }
+    }
+    assert!(saw_child_tool);
+
+    // The root turn ending ends the children that only a launcher call stood for.
+    chat.subagents_turn_ended(false);
+    chat.flush_answer_stream_with_separator();
+    chat.flush_active_cell();
+    assert_eq!(chat.subagents.running_count(), 0);
+    let history = history_text(&mut rx);
+    assert!(history.contains("Read a.txt contents"), "{history}");
+    assert!(history.contains("Count lines in b.txt"), "{history}");
+    assert!(
+        history.contains("2 tools") || history.contains("1 tool"),
+        "{history}"
+    );
+}
+
+#[test]
+fn cancelling_the_turn_shows_running_children_cancelled() {
+    let (root, events) = replay_events("claude_subagents.jsonl");
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    chat.subagents.set_root(acp::SessionId::new(root));
+    let stop = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Acp(AcpEvent::ChildNotification(_))))
+        .expect("a child update");
+    for event in events[..stop].iter().cloned() {
+        chat.handle_session_event(generation, event);
+    }
+    chat.subagents_turn_ended(true);
+    chat.flush_active_cell();
+
+    assert_eq!(chat.subagents.running_count(), 0);
+    let history = history_text(&mut rx);
+    assert!(history.contains("cancelled"), "{history}");
+}
+
+#[test]
+fn a_childs_permission_request_names_the_child() {
+    let (root, events) = replay_events("claude_subagents.jsonl");
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    chat.subagents.set_root(acp::SessionId::new(root));
+    for event in events[..events.len().min(15)].iter().cloned() {
+        chat.handle_session_event(generation, event);
+    }
+    let child = chat
+        .subagents
+        .label_for_session(&acp::SessionId::new("aecd710fff4bf3369"))
+        .expect("the first child is announced");
+    assert_eq!(child, "Read a.txt contents");
+    assert_eq!(
+        chat.subagent_label_for(&acp::SessionId::new("aecd710fff4bf3369"))
+            .as_deref(),
+        Some("Read a.txt contents")
+    );
+    // The root is never labelled.
+    assert_eq!(
+        chat.subagent_label_for(&acp::SessionId::new("04953aff-63b8-4f90-a3e5-da4b0c353046")),
+        None
+    );
+}

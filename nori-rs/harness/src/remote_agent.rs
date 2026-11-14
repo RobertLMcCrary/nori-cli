@@ -271,7 +271,9 @@ fn outcome_request_id(event: &SessionEvent) -> Option<&acp::RequestId> {
     match event {
         SessionEvent::Acp(AcpEvent::Response { request_id, .. }) => Some(request_id),
         SessionEvent::Nori(NoriEvent::RequestFailed(failure)) => failure.request_id.as_ref(),
-        SessionEvent::Acp(AcpEvent::Notification(_) | AcpEvent::Request { .. })
+        SessionEvent::Acp(
+            AcpEvent::Notification(_) | AcpEvent::ChildNotification(_) | AcpEvent::Request { .. },
+        )
         | SessionEvent::Nori(_) => None,
     }
 }
@@ -430,8 +432,11 @@ async fn run_event_loop(state: Arc<Mutex<HostShared>>, mut events: mpsc::Receive
                 | NoriEvent::UserShell(_)
                 | NoriEvent::HookOutput(_)
                 | NoriEvent::PromptSummaryUpdated(_)
-                | NoriEvent::Notice(_),
-            ) => {}
+                | NoriEvent::Notice(_)
+                | NoriEvent::Subagent(_),
+            )
+            // A remote controller sees the root session only.
+            | SessionEvent::Acp(AcpEvent::ChildNotification(_)) => {}
         }
     }
 }

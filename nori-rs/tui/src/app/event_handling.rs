@@ -97,6 +97,19 @@ impl App {
         if matches!(event, TuiEvent::Draw) {
             self.handle_resize_reflow_draw(tui)?;
         }
+        // Redraw works everywhere: with a popup open, with a pager overlay open, and while a turn
+        // streams. It must not be left to a popup that would swallow the key.
+        if let TuiEvent::Key(key_event) = &event
+            && key_event.kind == KeyEventKind::Press
+            && crate::nori::hotkey_match::matches_binding(
+                self.hotkey_config
+                    .binding_for(nori_config::HotkeyAction::Redraw),
+                key_event,
+            )
+        {
+            self.repaint_screen(tui)?;
+            return Ok(true);
+        }
         if self.overlay.is_some() {
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
         } else {
@@ -116,15 +129,20 @@ impl App {
                     {
                         return Ok(true);
                     }
-                    tui.draw(
-                        self.chat_widget.desired_height(tui.terminal.size()?.width),
-                        |frame| {
-                            self.chat_widget.render(frame.area(), frame.buffer);
-                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
-                                frame.set_cursor_position((x, y));
-                            }
-                        },
-                    )?;
+                    let screen = tui.terminal.size()?;
+                    self.chat_widget.set_screen_rows(screen.height);
+                    // Two rows above the viewport must stay free: history is flushed by
+                    // scrolling them, and a taller viewport would leave it nowhere to go.
+                    let viewport_rows = self
+                        .chat_widget
+                        .desired_height(screen.width)
+                        .min(screen.height.saturating_sub(2).max(1));
+                    tui.draw(viewport_rows, |frame| {
+                        self.chat_widget.render(frame.area(), frame.buffer);
+                        if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
+                            frame.set_cursor_position((x, y));
+                        }
+                    })?;
                 }
             }
         }
@@ -412,6 +430,10 @@ impl App {
                             });
                             if let Some(event) = automatic_resume {
                                 self.app_event_tx.send(event);
+                            } else if sessions.is_empty() {
+                                // Nothing to resume: the agent just picked starts a session
+                                // at once instead of asking about a list with one row.
+                                self.app_event_tx.send(AppEvent::NewSession);
                             } else {
                                 self.chat_widget
                                     .show_acp_resume_session_picker(sessions, true);
@@ -504,6 +526,12 @@ impl App {
                                 match activation {
                                     PendingSessionActivation::New => {
                                         self.app_event_tx.send(AppEvent::NewSession)
+                                    }
+                                    // The prepared agent waits for the transcript, which
+                                    // activates it when it arrives.
+                                    PendingSessionActivation::ResumeLoading => {
+                                        self.pending_session_activation =
+                                            Some(PendingSessionActivation::ResumeLoading);
                                     }
                                     PendingSessionActivation::Resume {
                                         acp_session_id,
@@ -692,28 +720,6 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
             }
-            AppEvent::StartCommitAnimation => {
-                if self
-                    .commit_anim_running
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    let tx = self.app_event_tx.clone();
-                    let running = self.commit_anim_running.clone();
-                    thread::spawn(move || {
-                        while running.load(Ordering::Relaxed) {
-                            thread::sleep(Duration::from_millis(50));
-                            tx.send(AppEvent::CommitTick);
-                        }
-                    });
-                }
-            }
-            AppEvent::StopCommitAnimation => {
-                self.commit_anim_running.store(false, Ordering::Release);
-            }
-            AppEvent::CommitTick => {
-                self.chat_widget.on_commit_tick();
-            }
             AppEvent::SessionEvent { generation, event } => {
                 let candidate_matches = matches!(
                     &self.candidate_agent,
@@ -897,6 +903,9 @@ impl App {
             AppEvent::GoalLoaded(Some(goal)) => self.chat_widget.handle_thread_goal_updated(goal),
             AppEvent::GoalLoaded(None) => self.chat_widget.handle_thread_goal_cleared(),
             AppEvent::HarnessActionFailed(message) => self.chat_widget.add_error_message(message),
+            AppEvent::PromptSubmitFailed(message) => {
+                self.chat_widget.on_prompt_submit_failed(message);
+            }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane
                 self.chat_widget.on_diff_complete();
@@ -1185,16 +1194,17 @@ impl App {
                 self.chat_widget
                     .open_acp_session_config_picker(config_options, focus_config_id);
             }
-            AppEvent::OpenAcpSessionConfigValuePicker { option } => {
+            AppEvent::OpenAcpSessionConfigValuePicker { option, origin } => {
                 self.chat_widget
-                    .open_acp_session_config_value_picker(option);
+                    .open_acp_session_config_value_picker(option, origin);
             }
             AppEvent::OpenCustomModelInput {
                 config_id,
                 option_name,
+                origin,
             } => {
                 self.chat_widget
-                    .open_custom_model_input(config_id, option_name);
+                    .open_custom_model_input(config_id, option_name, origin);
             }
             AppEvent::SetAcpSessionConfigOption {
                 config_id,
@@ -1202,6 +1212,7 @@ impl App {
                 option_name,
                 value_name,
                 is_custom_model,
+                origin,
             } => {
                 self.chat_widget.set_acp_session_config_option(
                     config_id,
@@ -1209,6 +1220,7 @@ impl App {
                     option_name,
                     value_name,
                     is_custom_model,
+                    origin,
                 );
             }
             AppEvent::AcpSessionConfigSetResult {
@@ -1573,80 +1585,119 @@ impl App {
                 project_id,
                 session_id,
             } => {
-                let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
-                match loader.load_transcript(&project_id, &session_id).await {
-                    Ok(transcript) => {
-                        let acp_session_id = transcript.meta.acp_session_id.clone();
-                        let display_name =
-                            crate::nori::agent_picker::get_agent_info(&self.config.active_agent)
-                                .map(|info| info.display_name)
-                                .unwrap_or_else(|| self.config.active_agent.clone());
-
-                        if self.prepared_agent.is_none() {
-                            self.defer_resume_activation(
-                                tui.frame_requester(),
-                                acp_session_id,
-                                None,
-                                Some(transcript),
-                            );
-                            self.chat_widget.add_info_message(
-                                format!("Resuming session with {display_name}..."),
-                                None,
-                            );
-                            tui.frame_requester().schedule_frame();
-                            return Ok(true);
-                        }
-
-                        self.pending_session_activation = Some(PendingSessionActivation::Resume {
-                            acp_session_id: acp_session_id.clone(),
-                            title: None,
-                            transcript: Some(Box::new(transcript.clone())),
-                        });
-                        let agent = match self.take_refreshed_prepared_agent() {
-                            Ok(Some(agent)) => agent,
-                            Ok(None) => return Ok(true),
-                            Err(error) => {
-                                self.chat_widget.add_error_message(format!(
-                                    "Couldn't resume prepared agent: {error}"
-                                ));
-                                return Ok(true);
-                            }
-                        };
+                // Reading and parsing a long transcript must not hold up the UI: it loads on a
+                // task and the resume continues when it arrives.
+                self.chat_widget
+                    .add_info_message("Loading session…".to_string(), None);
+                let tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
+                    let transcript = loader
+                        .load_transcript(&project_id, &session_id)
+                        .await
+                        .map(Box::new)
+                        .map_err(|error| error.to_string());
+                    tx.send(AppEvent::ResumeTranscriptLoaded { transcript });
+                });
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ResumeTranscriptLoaded { transcript } => match transcript {
+                Ok(transcript) => {
+                    let transcript = *transcript;
+                    let acp_session_id = transcript.meta.acp_session_id.clone();
+                    let display_name =
+                        crate::nori::agent_picker::get_agent_info(&self.config.active_agent)
+                            .map(|info| info.display_name)
+                            .unwrap_or_else(|| self.config.active_agent.clone());
+                    let loaded_at_startup = matches!(
+                        self.pending_session_activation,
+                        Some(PendingSessionActivation::ResumeLoading)
+                    );
+                    if loaded_at_startup {
                         self.pending_session_activation = None;
+                    }
 
-                        let (initial_prompt, initial_images) =
-                            self.chat_widget.take_initial_input();
-                        self.shutdown_current_conversation();
-
-                        let mut init = self.chat_widget_init(
+                    if self.prepared_agent.is_none()
+                        && loaded_at_startup
+                        && self.primary_agent_preparation.is_some()
+                    {
+                        // The agent is still starting; it activates the resume once ready.
+                        self.pending_session_activation = Some(PendingSessionActivation::Resume {
+                            acp_session_id,
+                            title: None,
+                            transcript: Some(Box::new(transcript)),
+                        });
+                        return Ok(true);
+                    }
+                    if self.prepared_agent.is_none() {
+                        self.defer_resume_activation(
                             tui.frame_requester(),
-                            initial_prompt,
-                            initial_images,
-                            None,
-                            false,
-                            None,
-                        );
-                        init.prepared_agent = Some(agent);
-                        self.chat_widget = ChatWidget::new_resumed_acp(
-                            init,
                             acp_session_id,
                             None,
                             Some(transcript),
                         );
-                        self.configure_new_chat_widget();
-
                         self.chat_widget.add_info_message(
                             format!("Resuming session with {display_name}..."),
                             None,
                         );
                         tui.frame_requester().schedule_frame();
+                        return Ok(true);
                     }
-                    Err(e) => {
-                        self.chat_widget
-                            .add_error_message(format!("Failed to load session transcript: {e}"));
+
+                    self.pending_session_activation = Some(PendingSessionActivation::Resume {
+                        acp_session_id: acp_session_id.clone(),
+                        title: None,
+                        transcript: Some(Box::new(transcript.clone())),
+                    });
+                    let agent = match self.take_refreshed_prepared_agent() {
+                        Ok(Some(agent)) => agent,
+                        Ok(None) => return Ok(true),
+                        Err(error) => {
+                            self.chat_widget.add_error_message(format!(
+                                "Couldn't resume prepared agent: {error}"
+                            ));
+                            return Ok(true);
+                        }
+                    };
+                    self.pending_session_activation = None;
+
+                    let (initial_prompt, initial_images) = self.chat_widget.take_initial_input();
+                    self.shutdown_current_conversation();
+
+                    let mut init = self.chat_widget_init(
+                        tui.frame_requester(),
+                        initial_prompt,
+                        initial_images,
+                        None,
+                        false,
+                        None,
+                    );
+                    init.prepared_agent = Some(agent);
+                    self.chat_widget =
+                        ChatWidget::new_resumed_acp(init, acp_session_id, None, Some(transcript));
+                    self.configure_new_chat_widget();
+
+                    self.chat_widget
+                        .add_info_message(format!("Resuming session with {display_name}..."), None);
+                    tui.frame_requester().schedule_frame();
+                }
+                Err(error) => {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to load session transcript: {error}"));
+                    // A resume chosen at startup falls back to a fresh session.
+                    if matches!(
+                        self.pending_session_activation,
+                        Some(PendingSessionActivation::ResumeLoading)
+                    ) {
+                        if self.prepared_agent.is_some() {
+                            self.pending_session_activation = None;
+                            self.app_event_tx.send(AppEvent::NewSession);
+                        } else {
+                            self.pending_session_activation = Some(PendingSessionActivation::New);
+                        }
                     }
                 }
-            }
+            },
             AppEvent::ResumeAcpSession {
                 acp_session_id,
                 title,

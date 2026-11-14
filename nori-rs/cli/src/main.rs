@@ -339,6 +339,7 @@ fn pre_main_hardening() {
 }
 
 fn main() -> anyhow::Result<()> {
+    nori_tui::startup_trace::mark("main");
     arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
         cli_main(codex_linux_sandbox_exe).await?;
         Ok(())
@@ -346,12 +347,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
+    nori_tui::startup_trace::mark("cli_main");
     let MultitoolCli {
         config_overrides: root_config_overrides,
         print,
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
+    nori_tui::startup_trace::mark("args_parsed");
 
     // Initialize ACP rolling file tracing in $NORI_HOME/log/ (non-critical, log warning on failure)
     // Logs are stored as daily rolling files like: ~/.nori/cli/log/nori-acp.2024-01-15.log
@@ -361,6 +364,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             eprintln!("Warning: Failed to initialize ACP file tracing: {e}");
         }
     }
+    nori_tui::startup_trace::mark("acp_tracing_ready");
 
     // `-p` selects a mode, so a subcommand that selects a different one is a
     // contradiction. Falling through would silently drop `print` and open the

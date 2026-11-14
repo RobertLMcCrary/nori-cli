@@ -139,8 +139,10 @@ fn render_transcript_tail_with_limits(
     let mut rendered = Vec::new();
     let mut has_emitted = false;
 
-    for cell in &transcript_cells[start..] {
-        let mut lines = cell.display_lines(width);
+    for (cell, mut lines) in transcript_cells[start..]
+        .iter()
+        .zip(display_lines_in_parallel(&transcript_cells[start..], width))
+    {
         if lines.is_empty() {
             continue;
         }
@@ -175,6 +177,82 @@ fn render_transcript_tail_with_limits(
     result.push(Line::default());
     result.extend(retained);
     result
+}
+
+/// Cells below this count are laid out on the calling thread; spawning costs more than it saves.
+const PARALLEL_LAYOUT_MIN_CELLS: usize = 64;
+
+/// Lay out every cell at `width`, in order, spreading the cells over the available cores.
+///
+/// Laying a cell out depends on nothing but the cell, and cells are `Send + Sync`, so replaying a
+/// long transcript (resize, resume) costs its longest share rather than its sum.
+fn display_lines_in_parallel(
+    cells: &[Arc<dyn HistoryCell>],
+    width: u16,
+) -> Vec<Vec<Line<'static>>> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8);
+    if cells.len() < PARALLEL_LAYOUT_MIN_CELLS || threads < 2 {
+        return cells.iter().map(|cell| cell.display_lines(width)).collect();
+    }
+    let chunk_len = cells.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "every worker is spawned before the first is joined"
+        )]
+        let handles: Vec<_> = cells
+            .chunks(chunk_len)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|cell| cell.display_lines(width))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// The newest `rows` terminal rows of the transcript, oldest first, rendered at `width`.
+///
+/// Only as many cells as it takes to fill `rows` are laid out, so the cost depends on the screen,
+/// not on the length of the transcript. A line that would straddle the cut is left out whole.
+pub(crate) fn render_transcript_tail_rows(
+    transcript_cells: &[Arc<dyn HistoryCell>],
+    width: u16,
+    rows: usize,
+) -> Vec<Line<'static>> {
+    if rows == 0 {
+        return Vec::new();
+    }
+    // Newest cell first; each entry is the cell's wrapped lines followed by its separator.
+    let mut newest_first: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut collected = 0;
+    for (index, cell) in transcript_cells.iter().enumerate().rev() {
+        let lines = cell.display_lines(width);
+        if lines.is_empty() {
+            continue;
+        }
+        let mut wrapped = crate::insert_history::wrap_history_lines_for_width(&lines, width);
+        // Every cell after the first is set apart by a blank line, except a continuation.
+        if !cell.is_stream_continuation() && index > 0 {
+            wrapped.insert(0, Line::default());
+        }
+        collected += physical_rows(&wrapped, width);
+        newest_first.push(wrapped);
+        if collected >= rows {
+            break;
+        }
+    }
+    let lines: Vec<Line<'static>> = newest_first.into_iter().rev().flatten().collect();
+    retain_newest_rows(lines, width, rows)
 }
 
 fn retain_newest_rows(

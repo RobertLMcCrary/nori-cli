@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 26082650fb2db43f58ba85d364f612826f869f63572547d984f862ff7ad9f121 # shrinks to ops = [Announce { child: 0, parent: None }, Announce { child: 0, parent: None }, Announce { child: 1, parent: Some(0) }, Announce { child: 0, parent: Some(1) }]

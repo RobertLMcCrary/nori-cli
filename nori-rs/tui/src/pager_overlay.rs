@@ -105,9 +105,59 @@ fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(&[KeyBinding], &str)
     Paragraph::new(vec![Line::from(spans).dim()]).render(area, buf);
 }
 
+/// Where each item of a pager starts, in rows, at one width.
+///
+/// Prefix sums of the item heights. They make "which item is at this row" a binary search and
+/// "append an item" a single push, so neither scrolling nor adding a cell depends on how many
+/// cells the transcript holds.
+struct RowIndex {
+    width: u16,
+    /// `tops[i]` is the first row of item `i`; the last entry is the total number of rows.
+    tops: Vec<usize>,
+}
+
+impl RowIndex {
+    fn new(width: u16) -> Self {
+        Self {
+            width,
+            tops: vec![0],
+        }
+    }
+
+    fn items(&self) -> usize {
+        self.tops.len() - 1
+    }
+
+    fn total(&self) -> usize {
+        self.tops.last().copied().unwrap_or(0)
+    }
+
+    fn push(&mut self, height: usize) {
+        self.tops.push(self.total() + height);
+    }
+
+    fn truncate(&mut self, items: usize) {
+        self.tops.truncate(items + 1);
+    }
+
+    fn top_of(&self, item: usize) -> usize {
+        self.tops[item]
+    }
+
+    /// The item that covers `row`, or the item count when `row` is past the end.
+    fn item_at_row(&self, row: usize) -> usize {
+        self.tops
+            .partition_point(|top| *top <= row)
+            .saturating_sub(1)
+            .min(self.items())
+    }
+}
+
 /// Generic widget for rendering a pager view.
 struct PagerView {
     renderables: Vec<Box<dyn Renderable>>,
+    /// Row layout of `renderables`; rebuilt only when the width changes.
+    index: Option<RowIndex>,
     scroll_offset: usize,
     title: String,
     last_content_height: Option<usize>,
@@ -120,6 +170,7 @@ impl PagerView {
     fn new(renderables: Vec<Box<dyn Renderable>>, title: String, scroll_offset: usize) -> Self {
         Self {
             renderables,
+            index: None,
             scroll_offset,
             title,
             last_content_height: None,
@@ -128,11 +179,44 @@ impl PagerView {
         }
     }
 
-    fn content_height(&self, width: u16) -> usize {
-        self.renderables
-            .iter()
-            .map(|c| c.desired_height(width) as usize)
-            .sum()
+    /// The row layout at `width`, laying items out only if the width changed.
+    fn index_for(&mut self, width: u16) -> &RowIndex {
+        let valid = self
+            .index
+            .as_ref()
+            .is_some_and(|index| index.width == width && index.items() == self.renderables.len());
+        if !valid {
+            let mut index = RowIndex::new(width);
+            for renderable in &self.renderables {
+                index.push(usize::from(renderable.desired_height(width)));
+            }
+            self.index = Some(index);
+        }
+        self.index.get_or_insert_with(|| RowIndex::new(width))
+    }
+
+    fn content_height(&mut self, width: u16) -> usize {
+        self.index_for(width).total()
+    }
+
+    /// Add an item at the end. Costs the rows of that item.
+    fn push_renderable(&mut self, renderable: Box<dyn Renderable>) {
+        if let Some(index) = self.index.as_mut() {
+            index.push(usize::from(renderable.desired_height(index.width)));
+        }
+        self.renderables.push(renderable);
+    }
+
+    /// Replace the items from `start` on with `replacement`, keeping the layout of those before
+    /// `start`.
+    fn replace_from(&mut self, start: usize, replacement: Vec<Box<dyn Renderable>>) {
+        self.renderables.truncate(start);
+        if let Some(index) = self.index.as_mut() {
+            index.truncate(start);
+        }
+        for renderable in replacement {
+            self.push_renderable(renderable);
+        }
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -165,27 +249,33 @@ impl PagerView {
     }
 
     fn render_content(&self, area: Rect, buf: &mut Buffer) {
-        let mut y = -(self.scroll_offset as isize);
         let mut drawn_bottom = area.y;
-        for renderable in &self.renderables {
-            let top = y;
-            let height = renderable.desired_height(area.width) as isize;
-            y += height;
-            let bottom = y;
-            if bottom < area.y as isize {
-                continue;
-            }
-            if top > area.y as isize + area.height as isize {
-                break;
-            }
-            if top < 0 {
-                let drawn = render_offset_content(area, buf, &**renderable, (-top) as u16);
-                drawn_bottom = drawn_bottom.max(area.y + drawn);
-            } else {
-                let draw_height = (height as u16).min(area.height.saturating_sub(top as u16));
-                let draw_area = Rect::new(area.x, area.y + top as u16, area.width, draw_height);
-                renderable.render(draw_area, buf);
-                drawn_bottom = drawn_bottom.max(draw_area.y.saturating_add(draw_area.height));
+        if let Some(index) = self
+            .index
+            .as_ref()
+            .filter(|index| index.width == area.width)
+        {
+            // Only the items that intersect the viewport are touched.
+            let first = index.item_at_row(self.scroll_offset);
+            for item in first..self.renderables.len() {
+                let top = index.top_of(item) as isize - self.scroll_offset as isize;
+                if top > area.height as isize {
+                    break;
+                }
+                let renderable = &self.renderables[item];
+                let height = (index.top_of(item + 1) - index.top_of(item)) as isize;
+                if top + height < 0 {
+                    continue;
+                }
+                if top < 0 {
+                    let drawn = render_offset_content(area, buf, &**renderable, (-top) as u16);
+                    drawn_bottom = drawn_bottom.max(area.y + drawn);
+                } else {
+                    let draw_height = (height as u16).min(area.height.saturating_sub(top as u16));
+                    let draw_area = Rect::new(area.x, area.y + top as u16, area.width, draw_height);
+                    renderable.render(draw_area, buf);
+                    drawn_bottom = drawn_bottom.max(draw_area.y.saturating_add(draw_area.height));
+                }
             }
         }
 
@@ -305,13 +395,9 @@ impl PagerView {
         if area.height == 0 || idx >= self.renderables.len() {
             return;
         }
-        let first = self
-            .renderables
-            .iter()
-            .take(idx)
-            .map(|r| r.desired_height(area.width) as usize)
-            .sum();
-        let last = first + self.renderables[idx].desired_height(area.width) as usize;
+        let index = self.index_for(area.width);
+        let first = index.top_of(idx);
+        let last = index.top_of(idx + 1);
         let current_top = self.scroll_offset;
         let current_bottom = current_top.saturating_add(area.height.saturating_sub(1) as usize);
         if first < current_top {
@@ -360,7 +446,7 @@ struct CellRenderable {
 
 fn transcript_overlay_lines(cell: &dyn HistoryCell, width: u16) -> Vec<Line<'static>> {
     let mut lines = cell.transcript_lines(width);
-    if lines.len() <= TRANSCRIPT_HISTORY_MAX_LINES {
+    if cell.full_transcript() || lines.len() <= TRANSCRIPT_HISTORY_MAX_LINES {
         return lines;
     }
 
@@ -414,42 +500,58 @@ impl TranscriptOverlay {
         cells: &[Arc<dyn HistoryCell>],
         highlight_cell: Option<usize>,
     ) -> Vec<Box<dyn Renderable>> {
+        Self::render_cells_from(cells, 0, highlight_cell)
+    }
+
+    /// The renderables of `cells[start..]`.
+    fn render_cells_from(
+        cells: &[Arc<dyn HistoryCell>],
+        start: usize,
+        highlight_cell: Option<usize>,
+    ) -> Vec<Box<dyn Renderable>> {
         cells
             .iter()
             .enumerate()
-            .flat_map(|(i, c)| {
-                let mut v: Vec<Box<dyn Renderable>> = Vec::new();
-                let mut cell_renderable = if c.as_any().is::<UserHistoryCell>() {
-                    Box::new(CachedRenderable::new(CellRenderable {
-                        cell: c.clone(),
-                        style: if highlight_cell == Some(i) {
-                            user_message_style().reversed()
-                        } else {
-                            user_message_style()
-                        },
-                    })) as Box<dyn Renderable>
-                } else {
-                    Box::new(CachedRenderable::new(CellRenderable {
-                        cell: c.clone(),
-                        style: Style::default(),
-                    })) as Box<dyn Renderable>
-                };
-                if !c.is_stream_continuation() && i > 0 {
-                    cell_renderable = Box::new(InsetRenderable::new(
-                        cell_renderable,
-                        Insets::tlbr(1, 0, 0, 0),
-                    ));
-                }
-                v.push(cell_renderable);
-                v
-            })
+            .skip(start)
+            .map(|(i, c)| Self::cell_renderable(c, i, highlight_cell))
             .collect()
+    }
+
+    fn cell_renderable(
+        c: &Arc<dyn HistoryCell>,
+        i: usize,
+        highlight_cell: Option<usize>,
+    ) -> Box<dyn Renderable> {
+        let mut cell_renderable = if c.as_any().is::<UserHistoryCell>() {
+            Box::new(CachedRenderable::new(CellRenderable {
+                cell: c.clone(),
+                style: if highlight_cell == Some(i) {
+                    user_message_style().reversed()
+                } else {
+                    user_message_style()
+                },
+            })) as Box<dyn Renderable>
+        } else {
+            Box::new(CachedRenderable::new(CellRenderable {
+                cell: c.clone(),
+                style: Style::default(),
+            })) as Box<dyn Renderable>
+        };
+        if !c.is_stream_continuation() && i > 0 {
+            cell_renderable = Box::new(InsetRenderable::new(
+                cell_renderable,
+                Insets::tlbr(1, 0, 0, 0),
+            ));
+        }
+        cell_renderable
     }
 
     pub(crate) fn insert_cell(&mut self, cell: Arc<dyn HistoryCell>) {
         let follow_bottom = self.view.is_scrolled_to_bottom();
+        let index = self.cells.len();
+        let renderable = Self::cell_renderable(&cell, index, self.highlight_cell);
         self.cells.push(cell);
-        self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
+        self.view.push_renderable(renderable);
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
         }
@@ -461,16 +563,25 @@ impl TranscriptOverlay {
         replacement: Arc<dyn HistoryCell>,
     ) {
         let follow_bottom = self.view.is_scrolled_to_bottom();
+        let start = range.start;
         self.cells.splice(range, std::iter::once(replacement));
-        self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
+        // Items before the replaced range keep their layout; only the tail is rebuilt.
+        let tail = Self::render_cells_from(&self.cells, start, self.highlight_cell);
+        self.view.replace_from(start, tail);
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
         }
     }
 
     pub(crate) fn set_highlight_cell(&mut self, cell: Option<usize>) {
-        self.highlight_cell = cell;
-        self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
+        let previous = std::mem::replace(&mut self.highlight_cell, cell);
+        // Only the style of the two user messages involved changes, never a height.
+        for index in previous.into_iter().chain(cell) {
+            if let Some(cell) = self.cells.get(index) {
+                let renderable = Self::cell_renderable(cell, index, self.highlight_cell);
+                self.view.renderables[index] = renderable;
+            }
+        }
         if let Some(idx) = self.highlight_cell {
             self.view.scroll_chunk_into_view(idx);
         }
@@ -835,7 +946,7 @@ mod tests {
 
     #[test]
     fn pager_view_content_height_counts_renderables() {
-        let pv = PagerView::new(
+        let mut pv = PagerView::new(
             vec![paragraph_block("a", 2), paragraph_block("b", 3)],
             "T".to_string(),
             0,

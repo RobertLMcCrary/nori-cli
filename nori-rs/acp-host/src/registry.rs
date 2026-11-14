@@ -18,7 +18,6 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -571,23 +570,11 @@ fn detect_agent_installation_uncached(agent: AgentKind) -> (bool, Option<Package
         AgentKind::Gemini => "gemini",
     };
 
-    // Check if the binary exists in PATH (fast check)
-    if let Ok(output) = Command::new("which").arg(binary_name).output()
-        && output.status.success()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let managed_by = detect_package_manager_from_path(&path);
+    // Look the binary up in PATH in-process: a `which` process per agent would hold up everything
+    // that waits on this cache, the first frame included.
+    if let Ok(path) = which::which(binary_name) {
+        let managed_by = detect_package_manager_from_path(&path.to_string_lossy());
         return (true, managed_by);
-    }
-
-    // On Windows, try `where` instead
-    #[cfg(target_os = "windows")]
-    if let Ok(output) = Command::new("where").arg(binary_name).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let managed_by = detect_package_manager_from_path(&path);
-            return (true, managed_by);
-        }
     }
 
     // Binary not in PATH - agent is not locally installed.
@@ -627,8 +614,8 @@ pub fn detect_preferred_package_manager() -> PackageManager {
         return PackageManager::Npm;
     }
 
-    // Check if bun is available in PATH
-    if Command::new("bun").arg("--version").output().is_ok() {
+    // Check if bun is available in PATH, without starting it.
+    if which::which("bun").is_ok() {
         return PackageManager::Bun;
     }
 
@@ -689,6 +676,9 @@ pub struct AcpAgentConfig {
     pub install_hint: String,
     /// How to force a model on this agent at spawn time.
     pub model_injection: ModelInjection,
+    /// Advertise `clientCapabilities.subagents` in `initialize`, so adapters that implement the
+    /// subagents proposal report their child sessions instead of flattening or hiding them.
+    pub advertise_subagents: bool,
 }
 
 impl AcpAgentConfig {
@@ -901,6 +891,7 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
             display_name: registered.name.clone(),
             install_hint,
             model_injection: registered.model_injection.clone(),
+            advertise_subagents: true,
         });
     }
 
@@ -978,6 +969,7 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
             display_name: agent.display_name().to_string(),
             install_hint: format!("npm install -g {}", agent.npm_package()),
             model_injection: agent.model_injection(),
+            advertise_subagents: true,
         });
     }
 
@@ -1077,6 +1069,7 @@ fn get_mock_agent_config(normalized: &str) -> Option<AcpAgentConfig> {
                 model_injection: ModelInjection::Env {
                     var: "MOCK_AGENT_INJECTED_MODEL".to_string(),
                 },
+                advertise_subagents: true,
             })
         }
         "mock-model-alt" => {
@@ -1128,6 +1121,7 @@ fn get_mock_agent_config(normalized: &str) -> Option<AcpAgentConfig> {
                 model_injection: ModelInjection::Env {
                     var: "MOCK_AGENT_INJECTED_MODEL".to_string(),
                 },
+                advertise_subagents: true,
             })
         }
         _ => None,

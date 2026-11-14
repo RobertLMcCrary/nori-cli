@@ -391,6 +391,13 @@ after every change. Each panel re-derives its `initial_selected_idx` from a row
 identifier: a `SettingsItem` enum for `/settings`, or the ACP option id for
 `/config`.
 
+That return belongs to the panel only. A value picker opened for a single
+setting, such as `/model`, closes once its value is applied: every value
+picker carries a `ConfigPickerOrigin` (`Panel` or `Direct`) from where it was
+opened through the custom-model input to the set request, and only `Panel`
+reopens `/config`. Switching agents with `/agent` skips the resume picker when
+the new agent lists no sessions and starts a session at once.
+
 `/settings` is searchable through the shared-picker adapter. Each setting
 builds its search value from the displayed name and optional description before
 the panel opens, so filtering can match either the setting identity or its
@@ -520,6 +527,59 @@ bounded history. It does not attempt to discover or preserve a scrollback
 origin. The behavior is enabled by default and can be toggled through
 `/settings` or `[tui] resize_reflow` in `config.toml`; disabling it cancels any
 pending replay.
+
+#### Startup
+
+Nothing before the first frame starts a process or waits on the network. Git
+facts for the footer and for project trust come from `nori_config::GitFacts`,
+which opens the repository in-process with `gix` using only the repository's
+own configuration. Agent installation checks look binaries up in `PATH`
+in-process. The Codex auth manager builds its HTTP client only once saved
+credentials exist. A transcript chosen with `nori resume` loads on a task while
+the agent starts (`PendingSessionActivation::ResumeLoading`), never before the
+first frame, and the first frame is drawn directly once the app is ready
+rather than through the frame scheduler. `NORI_STARTUP_TRACE=<file>` appends
+`<phase> <microseconds>` for each startup phase (`startup_trace.rs`) to find
+anything that creeps back onto this path.
+
+#### Streaming paint, local echo, and redraw
+
+Agent deltas only append; once per frame (frames are at least 8 ms apart)
+`ChatWidget::commit_stream_for_frame` renders what arrived, sends the lines
+that became final to the scrollback in one cell, and shows the rest as the
+live tail above the composer. Adjacent text deltas of one message are merged
+before they reach the UI (`chatwidget/conflate.rs`), so a frame costs the
+messages that changed, not the token rate. `MarkdownStreamCollector` freezes
+each completed top-level block and re-renders only the open one; a top-level
+fenced code block is streamed by `markdown_stream/fence.rs`, which highlights
+each line once with the syntax state carried forward, so a long code block
+costs its length in total. Streamed lines equal the one-shot render, styles
+included, which the property tests in `markdown_stream/incremental_tests.rs`
+check.
+
+A prompt submitted while the session is idle is painted at once. Its
+`PromptEchoId` travels in `_meta` on the `session/prompt` request and on every
+`user_message_chunk` the harness echoes, and `chatwidget/local_echo.rs` drops
+the chunks whose id it painted: a hash lookup, never a text comparison.
+
+Each frame is written with one `write` through `FrameWriter`, inside one
+synchronized update. The Redraw hotkey (default `ctrl+l`) repaints the rows
+Nori owns from its own model and leaves scrollback alone.
+
+#### Subagents
+
+Child sessions never reach the root conversation. The harness delivers a
+child's updates as `AcpEvent::ChildNotification` and announcements as
+`NoriEvent::Subagent`; for agents that do not announce children, root updates
+tagged with `_meta.claudeCode.parentToolUseId` and the `Agent`/`Task` launcher
+calls stand in. `chatwidget/subagents/` keeps one node per running child in a
+tree keyed by `NodeId`; a child that ends leaves the tree as a
+`FinishedSubagent` (whose `SubagentOutcome` cannot be "running") and becomes
+one summary cell in the scrollback, with its full detail in the transcript
+overlay. The live block above the composer shows a header and an activity row
+per running child, capped at a third of the screen with a `+N more` row; a
+frame visits only the rows it shows. Permission requests from a child carry
+its label.
 
 #### Lifecycle behavior
 

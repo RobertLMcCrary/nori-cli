@@ -422,6 +422,9 @@ impl AcpBackend {
                 );
             }
         }
+        if let ClientEvent::ToolSnapshot(snapshot) = &client_event {
+            self.edit_journal.record(snapshot, &self.cwd, None);
+        }
         let goal_event = self
             .thread_goal_update_from_client_event(&client_event)
             .await;
@@ -725,6 +728,16 @@ impl AcpBackend {
                             None,
                         ))
                 };
+                match prompt_kind {
+                    QueuedPromptKind::User => self
+                        .edit_journal
+                        .begin_turn(display_text.clone().unwrap_or_default()),
+                    QueuedPromptKind::GoalContinuation => {
+                        self.edit_journal
+                            .begin_turn("goal continuation".to_string());
+                    }
+                    QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact => {}
+                }
                 let client_request_started = self
                     .pending_prompt_submissions
                     .lock()

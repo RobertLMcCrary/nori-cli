@@ -72,6 +72,11 @@ fn drain_setup_session_events(
             // The exact notification is the preceding ACP event. The private
             // reducer projection starts after setup completes.
             crate::connection::ConnectionEvent::SessionUpdate(_) => {}
+            crate::connection::ConnectionEvent::Subagent(wire) => {
+                events.push(nori_protocol::SessionEvent::Nori(
+                    nori_protocol::NoriEvent::Subagent(wire),
+                ));
+            }
             crate::connection::ConnectionEvent::DelegatedRequest(request) => {
                 let _ =
                     request
@@ -189,7 +194,9 @@ impl AcpBackend {
             deferred_replay_batches,
             event_rx,
             session_driver_state,
-        ) = if let Some(sid) = acp_session_id.filter(|_| supports_load_session) {
+        ) = if let Some(sid) = acp_session_id
+            .filter(|_| supports_load_session && !(supports_session_resume && transcript.is_some()))
+        {
             debug!("Agent supports session/load — using server-side resume");
 
             // Collect replay events into a buffer. The collector runs until
@@ -228,6 +235,11 @@ impl AcpBackend {
                                             .events,
                                     ));
                                 }
+                                Some(crate::connection::ConnectionEvent::Subagent(wire)) => {
+                                    buffered_session_events.push(nori_protocol::SessionEvent::Nori(
+                                        nori_protocol::NoriEvent::Subagent(wire),
+                                    ));
+                                }
                                 Some(crate::connection::ConnectionEvent::SessionClosed) => break,
                                 Some(crate::connection::ConnectionEvent::DelegatedRequest(request)) => {
                                     let _ = request.response_tx.send(Ok(
@@ -259,6 +271,11 @@ impl AcpBackend {
                                             session_driver
                                                 .apply(session_reducer::InboundEvent::Notification(Box::new(update)))
                                                 .events,
+                                        ));
+                                    }
+                                    crate::connection::ConnectionEvent::Subagent(wire) => {
+                                        buffered_session_events.push(nori_protocol::SessionEvent::Nori(
+                                            nori_protocol::NoriEvent::Subagent(wire),
                                         ));
                                     }
                                     crate::connection::ConnectionEvent::SessionClosed => {}
@@ -470,7 +487,10 @@ impl AcpBackend {
         } else if let Some(sid) = acp_session_id.filter(|_| supports_session_resume) {
             debug!("Agent supports session/resume — using live reattach");
 
-            // Live reattach with no history replay (`session/resume`).
+            // Live reattach (`session/resume`) costs the same however long the session is: the
+            // agent keeps its context and replays nothing. When the local transcript is at hand
+            // the history is painted from it, which is preferred over `session/load` because the
+            // agent would otherwise stream the whole session back before anything is shown.
             // Failures propagate instead of falling back to `session/new`,
             // which would abandon the session the user selected.
             let mcp_servers = session_mcp_servers(
@@ -493,6 +513,15 @@ impl AcpBackend {
             };
             debug!("ACP session resumed via session/resume: {sid}");
             let setup_session_events = drain_setup_session_events(&mut event_rx)?;
+            let history = transcript
+                .and_then(|transcript| {
+                    ReplayBatch::new(
+                        nori_protocol::ReplaySource::Transcript,
+                        transcript_to_replay_session_events(transcript),
+                    )
+                })
+                .into_iter()
+                .collect();
 
             (
                 session_id,
@@ -501,7 +530,7 @@ impl AcpBackend {
                 None,
                 setup_session_events,
                 Vec::new(),
-                Vec::new(),
+                history,
                 event_rx,
                 session_runtime_driver::SessionDriver::new(),
             )
@@ -654,7 +683,7 @@ impl AcpBackend {
             prompt_result_tx: prompt_result_tx.clone(),
             prompt_phase_gate: Arc::new(Mutex::new(None)),
             notify_after_idle: config.notify_after_idle,
-            ghost_snapshots: Arc::new(GhostSnapshotStack::new()),
+            edit_journal: Arc::new(EditJournal::new()),
             is_first_prompt: Arc::new(Mutex::new(is_first_prompt_val)),
             prompt_summary_enabled: config.prompt_summary_enabled,
             agent_name: config.agent.clone(),

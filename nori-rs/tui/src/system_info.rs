@@ -416,39 +416,20 @@ fn parse_git_shortstat(output: &str) -> (Option<i32>, Option<i32>) {
     (added, removed)
 }
 
+/// The checked-out branch, as `git branch --show-current` reports it: `None` when HEAD is
+/// detached or there is no repository. Long names are shortened to 30 characters. Read with `gix`,
+/// without starting `git`, because the footer asks before the first frame.
 fn get_git_branch(dir: Option<&std::path::Path>) -> Option<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(["branch", "--show-current"]);
-    if let Some(d) = dir {
-        cmd.current_dir(d);
-    }
-
-    let output = match cmd.output() {
-        Ok(output) => output,
-        Err(_e) => {
-            return None;
-        }
-    };
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let branch = String::from_utf8(output.stdout).ok()?;
-    let branch = branch.trim();
-
-    if branch.is_empty() {
-        return None;
-    }
-
-    // Truncate long branch names to 30 characters
-    let truncated = if branch.len() > 30 {
-        format!("{}...", &branch[..27])
+    let facts = git_facts(dir)?;
+    let branch = facts.current_branch()?;
+    if branch.chars().count() > 30 {
+        Some(format!(
+            "{}...",
+            branch.chars().take(27).collect::<String>()
+        ))
     } else {
-        branch.to_string()
-    };
-
-    Some(truncated)
+        Some(branch.to_string())
+    }
 }
 
 /// Disk space threshold: warn when free space is below this percentage.
@@ -573,38 +554,14 @@ pub(crate) fn extract_worktree_name(dir: &std::path::Path) -> Option<String> {
 /// Check if the directory is a git worktree (not the main repository).
 /// Returns true if this is a linked worktree, false if it's the main repo or not a git repo.
 fn is_git_worktree(dir: Option<&std::path::Path>) -> bool {
-    let mut cmd = Command::new("git");
-    cmd.args(["rev-parse", "--git-common-dir"]);
-    if let Some(d) = dir {
-        cmd.current_dir(d);
-    }
+    git_facts(dir).is_some_and(|facts| facts.is_linked_worktree())
+}
 
-    let common_dir_output = match cmd.output() {
-        Ok(output) if output.status.success() => String::from_utf8(output.stdout).ok(),
-        _ => return false,
-    };
-
-    let mut cmd = Command::new("git");
-    cmd.args(["rev-parse", "--git-dir"]);
-    if let Some(d) = dir {
-        cmd.current_dir(d);
-    }
-
-    let git_dir_output = match cmd.output() {
-        Ok(output) if output.status.success() => String::from_utf8(output.stdout).ok(),
-        _ => return false,
-    };
-
-    match (common_dir_output, git_dir_output) {
-        (Some(common), Some(git)) => {
-            let common = common.trim();
-            let git = git.trim();
-            // In a worktree, git-dir points to .git/worktrees/<name>
-            // while common-dir points to the main .git directory
-            // They differ when in a worktree
-            common != git && !git.ends_with(".git")
-        }
-        _ => false,
+/// The repository of `dir`, or of the current directory, read in-process with `gix`.
+fn git_facts(dir: Option<&std::path::Path>) -> Option<nori_config::GitFacts> {
+    match dir {
+        Some(dir) => nori_config::GitFacts::read(dir),
+        None => nori_config::GitFacts::read(&env::current_dir().ok()?),
     }
 }
 
@@ -750,6 +707,43 @@ mod tests {
 
         assert_eq!(seeded.git_branch, None);
         assert!(!seeded.is_worktree);
+    }
+
+    #[test]
+    fn git_facts_read_from_files_match_what_git_reports() {
+        let repo = create_git_repo();
+        run_git(
+            repo.path(),
+            &["switch", "-c", "a-branch-name-that-is-longer-than-thirty"],
+        );
+        assert_eq!(
+            get_git_branch(Some(repo.path())).as_deref(),
+            Some("a-branch-name-that-is-longe...")
+        );
+        assert!(!is_git_worktree(Some(repo.path())));
+        let nested = repo.path().join("src/deep");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        assert!(get_git_branch(Some(&nested)).is_some());
+
+        let worktree = repo.path().join(".worktrees/wt");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wt-branch",
+                worktree.to_str().expect("utf-8 path"),
+            ],
+        );
+        assert!(is_git_worktree(Some(&worktree)));
+        assert_eq!(
+            get_git_branch(Some(&worktree)).as_deref(),
+            Some("wt-branch")
+        );
+
+        run_git(&worktree, &["switch", "--detach"]);
+        assert_eq!(get_git_branch(Some(&worktree)), None);
     }
 
     #[test]

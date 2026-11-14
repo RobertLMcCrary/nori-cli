@@ -3,6 +3,9 @@
 mod browser_modify;
 mod context_usage;
 mod runaway_search;
+mod stream_file;
+mod timeline;
+mod wire_replay;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -295,6 +298,7 @@ impl MockAgent {
         self,
         arguments: acp::PromptRequest,
     ) -> Result<acp::PromptResponse, acp::Error> {
+        timeline::mark("prompt");
         eprintln!("Mock agent: prompt");
         if let Ok(expected) = std::env::var("MOCK_AGENT_EXPECT_LAST_PROMPT_TEXT_BLOCK") {
             let actual = last_prompt_text_block(&arguments.prompt);
@@ -378,8 +382,11 @@ impl MockAgent {
             eprintln!("Mock agent: exiting during prompt");
             std::process::exit(17);
         }
-        self.state.cancel_requested.store(false, Ordering::SeqCst);
         let session_id = arguments.session_id.clone();
+
+        if let Some(result) = wire_replay::run(&self, &session_id).await {
+            return result;
+        }
 
         if std::env::var("MOCK_AGENT_PROMPT_UNOWNED_USER_NOTIFICATION").is_ok() {
             self.send_user_chunk(
@@ -1060,7 +1067,7 @@ impl MockAgent {
                     self.send_text_chunk(session_id.clone(), &response).await?;
                 }
             }
-        } else {
+        } else if std::env::var_os("MOCK_AGENT_STREAM_TEXT_FILE").is_none() {
             // Default behavior
             self.send_text_chunk(session_id.clone(), "Test message 1")
                 .await?;
@@ -1068,6 +1075,8 @@ impl MockAgent {
             self.send_text_chunk(session_id.clone(), "Test message 2")
                 .await?;
         }
+
+        stream_file::emit(&self, &session_id).await?;
 
         // Support configurable delay for simulating realistic streaming
         if let Ok(delay_str) = std::env::var("MOCK_AGENT_DELAY_MS")
@@ -1504,6 +1513,7 @@ Connection: close\r\n\r\n\
 
 #[tokio::main]
 async fn main() -> acp::Result<()> {
+    timeline::mark("process_start");
     env_logger::init();
 
     #[cfg(unix)]
@@ -1518,6 +1528,7 @@ async fn main() -> acp::Result<()> {
             async move |arguments: acp::InitializeRequest,
                         responder: Responder<acp::InitializeResponse>,
                         _cx: ConnectionTo<Client>| {
+                timeline::mark("initialize");
                 if std::env::var("MOCK_AGENT_HANG").is_ok() {
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 }
@@ -1654,6 +1665,7 @@ async fn main() -> acp::Result<()> {
                 async move |arguments: acp::NewSessionRequest,
                             responder: Responder<acp::NewSessionResponse>,
                             cx: ConnectionTo<Client>| {
+                    timeline::mark("new_session");
                     let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
                     let model_name = std::env::var("MOCK_AGENT_MODEL_NAME").unwrap_or_default();
                     if std::env::var("MOCK_AGENT_FAIL_NEW_SESSION_MODEL")
@@ -1927,7 +1939,10 @@ async fn main() -> acp::Result<()> {
                             cx: ConnectionTo<Client>| {
                     // Run the prompt work in a spawned task so the dispatch loop
                     // stays free to deliver cancel notifications and client
-                    // request responses while the agent streams.
+                    // request responses while the agent streams. A cancel left over from an
+                    // earlier turn is cleared here, in dispatch order, so that a cancel
+                    // arriving right behind this prompt is not erased by the spawned task.
+                    state.cancel_requested.store(false, Ordering::SeqCst);
                     let agent = MockAgent {
                         cx: cx.clone(),
                         state: state.clone(),

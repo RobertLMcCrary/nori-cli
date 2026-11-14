@@ -147,18 +147,12 @@ impl AcpBackend {
             .cancel(&*self.session_id.read().await)
             .await
             .ok();
-        crate::undo::handle_undo(
-            &self.backend_event_tx,
-            &generate_id(),
-            &self.cwd,
-            &self.ghost_snapshots,
-        )
-        .await;
+        crate::undo::handle_undo(&self.backend_event_tx, &generate_id(), &self.edit_journal).await;
         Ok(())
     }
 
     pub(crate) async fn undo_snapshots(&self) -> Vec<crate::UndoSnapshot> {
-        self.ghost_snapshots.list().await
+        self.edit_journal.list()
     }
 
     pub(crate) async fn undo_to(&self, index: i64) -> Result<()> {
@@ -169,8 +163,7 @@ impl AcpBackend {
         crate::undo::handle_undo_to(
             &self.backend_event_tx,
             &generate_id(),
-            &self.cwd,
-            &self.ghost_snapshots,
+            &self.edit_journal,
             index,
         )
         .await;

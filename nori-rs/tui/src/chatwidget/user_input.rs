@@ -1,6 +1,6 @@
 use super::*;
 
-fn local_image_content(
+pub(super) fn local_image_content(
     path: &std::path::Path,
 ) -> Result<nori_protocol::acp::v1::ContentBlock, String> {
     use base64::Engine as _;
@@ -157,6 +157,7 @@ impl ChatWidget {
                 self.first_prompt_text = Some(text.clone());
             }
             self.initial_user_message = Some(UserMessage { text, image_paths });
+            self.paint_initial_prompt();
             self.app_event_tx.send(AppEvent::NewSession);
             return;
         }
@@ -191,24 +192,14 @@ impl ChatWidget {
                 agent: Some(self.config.active_agent.clone()),
             });
 
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(nori_protocol::acp::v1::ContentBlock::Text(
-                nori_protocol::acp::v1::TextContent::new(text.clone()),
-            ));
+        // Paint the prompt now instead of waiting for the harness echo. The
+        // image attachments are read and encoded in the submit task, never here.
+        let painted_already = std::mem::take(&mut self.initial_echo_painted);
+        let echo = self.pending_echoes.issue();
+        if painted_already || self.can_echo_locally() {
+            self.echo_submitted_prompt(&text, image_paths.len(), painted_already, echo.clone());
         }
-
-        for path in image_paths {
-            match local_image_content(&path) {
-                Ok(image) => content.push(image),
-                Err(error) => {
-                    self.add_error_message(error);
-                    return;
-                }
-            }
-        }
-
-        self.submit_prompt(content);
+        self.submit_prompt(text.clone(), image_paths, echo);
 
         // Persist the text to cross-session message history.
         self.persist_prompt_history(&text);

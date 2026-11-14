@@ -25,6 +25,9 @@ use std::sync::atomic::Ordering;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 
+/// The most session events taken from the harness in one wakeup.
+const SESSION_EVENT_BATCH: usize = 256;
+
 static NEXT_SESSION_GENERATION: AtomicI64 = AtomicI64::new(1);
 
 pub(crate) fn next_session_generation() -> crate::app_event::SessionGeneration {
@@ -169,8 +172,18 @@ fn forward_launched_session(
     let handle = Some(session.handle.clone());
 
     tokio::spawn(async move {
-        while let Some(event) = session.events.recv().await {
-            app_event_tx.send(AppEvent::SessionEvent { generation, event });
+        // Drain whatever has queued and merge adjacent text deltas, so a burst costs the UI one
+        // event per message instead of one per token.
+        let mut queued = Vec::with_capacity(SESSION_EVENT_BATCH);
+        while session
+            .events
+            .recv_many(&mut queued, SESSION_EVENT_BATCH)
+            .await
+            > 0
+        {
+            for event in super::conflate::conflate(std::mem::take(&mut queued)) {
+                app_event_tx.send(AppEvent::SessionEvent { generation, event });
+            }
         }
     });
 

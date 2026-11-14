@@ -36,7 +36,7 @@ impl TestScenario {
     }
 
     fn run_insert(&mut self, lines: Vec<Line<'static>>) {
-        nori_tui::insert_history::insert_history_lines(&mut self.term, lines)
+        nori_tui::insert_history::insert_history_lines(&mut self.term, &lines)
             .expect("Failed to insert history lines in test");
     }
 }

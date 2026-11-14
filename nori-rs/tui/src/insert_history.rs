@@ -24,6 +24,7 @@ use ratatui::prelude::Backend;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
+#[cfg(test)]
 use ratatui::text::Span;
 
 fn queue_colors(writer: &mut impl Write, fg: Color, bg: Color) -> io::Result<()> {
@@ -35,16 +36,6 @@ fn queue_colors(writer: &mut impl Write, fg: Color, bg: Color) -> io::Result<()>
         writer,
         SetBackgroundColor(crate::custom_terminal::crossterm_color(bg))
     )
-}
-
-fn merged_line_spans(line: &Line<'_>) -> Vec<Span<'static>> {
-    line.spans
-        .iter()
-        .map(|span| Span {
-            style: span.style.patch(line.style),
-            content: span.content.to_string().into(),
-        })
-        .collect()
 }
 
 fn wrap_history_line<'a>(line: &'a Line<'a>, width: usize) -> Vec<Line<'a>> {
@@ -64,6 +55,16 @@ pub(crate) fn wrap_history_lines_for_width(lines: &[Line<'_>], width: u16) -> Ve
     wrapped
 }
 
+/// Terminal rows that `lines` take when written at `width`, wrapped as history is.
+pub(crate) fn physical_rows_of(lines: &[Line<'_>], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .flat_map(|line| wrap_history_line(line, width))
+        .map(|line| physical_row_count(&line, width))
+        .sum()
+}
+
 fn physical_row_count(line: &Line<'_>, width: usize) -> usize {
     line.width().max(1).div_ceil(width.max(1))
 }
@@ -76,7 +77,7 @@ fn physical_row_count(line: &Line<'_>, width: usize) -> usize {
 /// needs at least two rows above the viewport to form a valid DECSTBM region).
 pub fn insert_history_lines<B>(
     terminal: &mut crate::custom_terminal::Terminal<B>,
-    lines: Vec<Line>,
+    lines: &[Line<'_>],
 ) -> io::Result<bool>
 where
     B: Backend<Error = io::Error> + Write,
@@ -91,7 +92,7 @@ where
     let wrap_width = area.width.max(1) as usize;
     let mut wrapped = Vec::new();
     let mut wrapped_rows = 0usize;
-    for line in &lines {
+    for line in lines {
         let line_wrapped = wrap_history_line(line, wrap_width);
         wrapped_rows += line_wrapped
             .iter()
@@ -191,8 +192,7 @@ where
         queue!(writer, Clear(ClearType::UntilNewLine))?;
         // Merge line-level style into each span so that ANSI colors reflect
         // line styles (e.g., blockquotes with green fg).
-        let merged_spans = merged_line_spans(&line);
-        write_spans(writer, merged_spans.iter())?;
+        write_line_spans(writer, &line)?;
     }
 
     queue!(writer, ResetScrollRegion)?;
@@ -204,6 +204,7 @@ where
     if should_update_area {
         terminal.set_viewport_area(area);
     }
+    terminal.note_history_rows(wrapped_rows);
 
     Ok(true)
 }
@@ -288,13 +289,13 @@ where
             line.style.bg.unwrap_or(Color::Reset),
         )?;
         queue!(writer, Clear(ClearType::UntilNewLine))?;
-        let merged_spans = merged_line_spans(line);
-        write_spans(writer, merged_spans.iter())?;
+        write_line_spans(writer, line)?;
         row += physical_rows;
     }
 
     // Restore cursor position.
     queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+    terminal.note_history_rows(usize::from(total_rows));
 
     Ok(total_rows)
 }
@@ -406,17 +407,17 @@ impl ModifierDiff {
     }
 }
 
-fn write_spans<'a, I>(mut writer: &mut impl Write, content: I) -> io::Result<()>
-where
-    I: IntoIterator<Item = &'a Span<'a>>,
-{
+/// Write a line's spans with the line-level style merged into each span, so that ANSI colors
+/// reflect line styles (e.g., blockquotes with green fg). Span text is written by reference.
+fn write_line_spans(mut writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
     let mut fg = Color::Reset;
     let mut bg = Color::Reset;
     let mut last_modifier = Modifier::empty();
-    for span in content {
+    for span in &line.spans {
+        let style = span.style.patch(line.style);
         let mut modifier = Modifier::empty();
-        modifier.insert(span.style.add_modifier);
-        modifier.remove(span.style.sub_modifier);
+        modifier.insert(style.add_modifier);
+        modifier.remove(style.sub_modifier);
         if modifier != last_modifier {
             let diff = ModifierDiff {
                 from: last_modifier,
@@ -425,15 +426,15 @@ where
             diff.queue(&mut writer)?;
             last_modifier = modifier;
         }
-        let next_fg = span.style.fg.unwrap_or(Color::Reset);
-        let next_bg = span.style.bg.unwrap_or(Color::Reset);
+        let next_fg = style.fg.unwrap_or(Color::Reset);
+        let next_bg = style.bg.unwrap_or(Color::Reset);
         if next_fg != fg || next_bg != bg {
             queue_colors(&mut writer, next_fg, next_bg)?;
             fg = next_fg;
             bg = next_bg;
         }
 
-        queue!(writer, Print(span.content.clone()))?;
+        queue!(writer, Print(span.content.as_ref()))?;
     }
 
     queue!(
@@ -454,6 +455,17 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Color;
 
+    /// The spans of `line` with the line-level style merged in, as they are written.
+    fn merged_line_spans(line: &Line<'_>) -> Vec<Span<'static>> {
+        line.spans
+            .iter()
+            .map(|span| Span {
+                style: span.style.patch(line.style),
+                content: span.content.to_string().into(),
+            })
+            .collect()
+    }
+
     #[test]
     fn writes_bold_then_regular_spans() {
         use ratatui::style::Stylize;
@@ -461,7 +473,7 @@ mod tests {
         let spans = ["A".bold(), "B".into()];
 
         let mut actual: Vec<u8> = Vec::new();
-        write_spans(&mut actual, spans.iter()).unwrap();
+        write_line_spans(&mut actual, &Line::from(spans.to_vec())).unwrap();
 
         let mut expected: Vec<u8> = Vec::new();
         queue!(
@@ -547,7 +559,7 @@ mod tests {
             "agent history must keep the complete Stripe URL in one logical line: {display_lines:?}",
         );
 
-        insert_history_lines(&mut term, display_lines).expect("insert link history");
+        insert_history_lines(&mut term, &display_lines).expect("insert link history");
 
         let rows = term
             .backend()
@@ -636,7 +648,7 @@ mod tests {
         let line = Line::from(
             "see phrase before https://example.test/abcdefghijklmnopqrstuvwxyz tail words",
         );
-        insert_history_lines(&mut term, vec![line]).expect("insert mixed URL history");
+        insert_history_lines(&mut term, &[line]).expect("insert mixed URL history");
 
         let rows = term
             .backend()
@@ -717,7 +729,7 @@ mod tests {
 
         // Now try to insert history lines — there's no room above the viewport
         let line = Line::from("This should not corrupt the display");
-        insert_history_lines(&mut term, vec![line]).expect("insert");
+        insert_history_lines(&mut term, &[line]).expect("insert");
         Backend::flush(term.backend_mut()).expect("flush");
 
         // The viewport content must be unchanged
@@ -766,7 +778,7 @@ mod tests {
 
         // Insert a batch larger than the single row above the viewport.
         let lines: Vec<Line> = (0..8).map(|i| Line::from(format!("History {i}"))).collect();
-        insert_history_lines(&mut term, lines).expect("insert");
+        insert_history_lines(&mut term, &lines).expect("insert");
         Backend::flush(term.backend_mut()).expect("flush");
 
         let after: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();
@@ -794,7 +806,7 @@ mod tests {
         term.set_viewport_area(viewport);
 
         let lines: Vec<Line> = (0..8).map(|i| Line::from(format!("History {i}"))).collect();
-        let inserted = insert_history_lines(&mut term, lines).expect("insert");
+        let inserted = insert_history_lines(&mut term, &lines).expect("insert");
         assert!(
             !inserted,
             "insert_history_lines should return false when area.top() == 1"
@@ -830,7 +842,7 @@ mod tests {
         Backend::flush(term.backend_mut()).expect("flush");
 
         let inserted =
-            insert_history_lines(&mut term, vec![Line::from("History entry")]).expect("insert");
+            insert_history_lines(&mut term, &[Line::from("History entry")]).expect("insert");
         Backend::flush(term.backend_mut()).expect("flush");
 
         // With the viewport scrolled down to row 1, there is still no usable
@@ -894,13 +906,13 @@ mod tests {
         // First attempt: the viewport scrolls down to y=1 and the insert is
         // deferred (degenerate region).
         let first =
-            insert_history_lines(&mut term, vec![Line::from("History entry")]).expect("insert");
+            insert_history_lines(&mut term, &[Line::from("History entry")]).expect("insert");
         assert!(!first, "first insert should be deferred at y==1");
 
         // Retry with the same line, as Tui::draw does with retained pending
         // lines. The viewport scrolls to y=2, opening a valid region.
         let second =
-            insert_history_lines(&mut term, vec![Line::from("History entry")]).expect("insert");
+            insert_history_lines(&mut term, &[Line::from("History entry")]).expect("insert");
         Backend::flush(term.backend_mut()).expect("flush");
         assert!(second, "retried insert should succeed once room exists");
 
@@ -939,7 +951,7 @@ mod tests {
         term.set_viewport_area(viewport);
 
         let line = Line::from("This line has no room");
-        let inserted = insert_history_lines(&mut term, vec![line]).expect("insert");
+        let inserted = insert_history_lines(&mut term, &[line]).expect("insert");
         assert!(
             !inserted,
             "insert_history_lines should return false when area.top() == 0"
@@ -968,8 +980,7 @@ mod tests {
 
         // Insert a history line — it should succeed now.
         let line = Line::from("Recovered history entry");
-        let inserted =
-            insert_history_lines(&mut term, vec![line]).expect("insert after reposition");
+        let inserted = insert_history_lines(&mut term, &[line]).expect("insert after reposition");
         assert!(
             inserted,
             "insert_history_lines should succeed after viewport repositioned"
@@ -1013,7 +1024,7 @@ mod tests {
 
         // Insert a history line
         let line = Line::from("History entry");
-        insert_history_lines(&mut term, vec![line]).expect("insert");
+        insert_history_lines(&mut term, &[line]).expect("insert");
         Backend::flush(term.backend_mut()).expect("flush");
 
         let rows: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();

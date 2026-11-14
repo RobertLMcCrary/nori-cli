@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::acp;
 use crate::acp::v1::RequestId;
+use crate::subagent::SubagentWire;
 
 /// An event emitted by one Nori harness session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,10 @@ pub enum SessionEvent {
 #[allow(clippy::large_enum_variant)]
 pub enum AcpEvent {
     Notification(acp::v1::AgentNotification),
+    /// A `session/update` for a subagent's session, not the root's. It is raw ACP traffic like
+    /// any other notification, but kept apart so that nothing mistakes a child's text, tool
+    /// calls, idle state, or usage for the root's.
+    ChildNotification(acp::v1::SessionNotification),
     Request {
         request_id: RequestId,
         request: acp::v1::AgentRequest,
@@ -56,6 +61,8 @@ pub enum NoriEvent {
     PromptSummaryUpdated(PromptSummary),
     Notice(Notice),
     RequestFailed(RequestFailure),
+    /// A subagent session was announced, changed state, or exchanged a message.
+    Subagent(SubagentWire),
 }
 
 /// Persistent and agent-side identities established for a harness session.

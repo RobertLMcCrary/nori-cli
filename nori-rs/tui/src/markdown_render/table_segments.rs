@@ -13,19 +13,34 @@
 use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct MarkdownSegment {
-    pub(super) range: Range<usize>,
-    pub(super) is_table: bool,
+pub(crate) struct MarkdownSegment {
+    pub(crate) range: Range<usize>,
+    pub(crate) is_table: bool,
 }
 
 /// Split `input` into alternating prose and table segments, in source order.
-pub(super) fn markdown_segments(input: &str) -> Vec<MarkdownSegment> {
+pub(crate) fn markdown_segments(input: &str) -> Vec<MarkdownSegment> {
     let lines = source_lines(input);
 
     let mut segments = Vec::new();
     let mut prose_start = 0;
     let mut index = 0;
+    // A table never starts inside a fenced code block, however much its lines look like one.
+    let mut fence: Option<crate::markdown_stream::FenceOpener> = None;
     while index + 1 < lines.len() {
+        let line = input[lines[index].clone()].trim_end_matches('\n');
+        if let Some(opener) = &fence {
+            if opener.is_closed_by(line) {
+                fence = None;
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(opener) = crate::markdown_stream::FenceOpener::parse(line) {
+            fence = Some(opener);
+            index += 1;
+            continue;
+        }
         let header = input[lines[index].clone()].trim();
         let delimiter = input[lines[index + 1].clone()].trim();
         if !header.contains('|') || !is_table_delimiter(delimiter) {

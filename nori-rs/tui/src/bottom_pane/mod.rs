@@ -668,6 +668,10 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    pub(crate) fn has_queued_user_messages(&self) -> bool {
+        !self.queued_user_messages.messages.is_empty()
+    }
+
     pub(crate) fn is_task_running(&self) -> bool {
         self.is_task_running
     }
@@ -1087,6 +1091,7 @@ mod tests {
                     id: "experimental",
                     label: "Experimental",
                 }],
+                crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
             ),
         );
         let model_render = render_snapshot(&pane, Rect::new(0, 0, 100, 18));

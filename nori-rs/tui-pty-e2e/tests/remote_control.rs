@@ -212,13 +212,10 @@ fn startup_runtime_disable_reenable_and_agent_switch_share_one_remote_control_ow
         .wait_for_text("Select agent", Duration::from_secs(10))
         .expect("agent picker");
     session.send_key(Key::Down).expect("select alternate agent");
+    // An agent with no earlier sessions starts one at once, without a picker.
     session
         .send_key(Key::Enter)
         .expect("prepare alternate agent");
-    session
-        .wait_for_text("Start a new session", Duration::from_secs(10))
-        .expect("candidate session picker");
-    session.send_key(Key::Enter).expect("activate candidate");
     session
         .wait_for_text(
             "Started new conversation with agent: Mock ACP Alt",

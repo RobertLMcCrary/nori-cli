@@ -49,6 +49,13 @@ impl ChatWidget {
                 nori_protocol::acp::v1::AgentNotification::SessionNotification(notification),
             ) => {
                 // Classify live proactive activity before projecting the same update for display.
+                // Updates that belong to a subagent never reach the root's conversation, and the
+                // echo of a prompt painted at submit is not painted twice.
+                if self.route_root_update_to_subagents(&notification)
+                    || self.is_painted_echo(&notification.update)
+                {
+                    return;
+                }
                 if self.replay_source.is_none() {
                     self.handle_proactive_session_update(&notification.update);
                 }
@@ -63,10 +70,14 @@ impl ChatWidget {
                     }
                 }
             }
+            nori_protocol::AcpEvent::ChildNotification(notification) => {
+                self.handle_child_notification(&notification);
+            }
             nori_protocol::AcpEvent::Request {
                 request_id,
                 request: nori_protocol::acp::v1::AgentRequest::RequestPermissionRequest(request),
             } => {
+                let subagent = self.subagent_label_for(&request.session_id);
                 for event in self
                     .client_event_normalizer
                     .push_permission_request(&request)
@@ -76,6 +87,7 @@ impl ChatWidget {
                             approval,
                             request_id.clone(),
                             request.options.clone(),
+                            subagent.clone(),
                         );
                     }
                 }
@@ -323,6 +335,7 @@ impl ChatWidget {
                 self.flush_replay_message();
                 self.replay_source = None;
             }
+            nori_protocol::NoriEvent::Subagent(wire) => self.handle_subagent_wire(wire),
             nori_protocol::NoriEvent::Undo(_) | nori_protocol::NoriEvent::UserShell(_) => {}
             // TODO(#557): render forked-transcript lineage in the TUI history.
             nori_protocol::NoriEvent::SessionForked(forked) => {
@@ -359,6 +372,7 @@ impl ChatWidget {
             u64::try_from(event.history_log_id).unwrap_or_default(),
             usize::try_from(event.history_entry_count).unwrap_or_default(),
         );
+        self.subagents.set_root(event.acp_session_id.clone());
         self.conversation_id = event
             .transcript_id
             .as_deref()
@@ -382,12 +396,20 @@ impl ChatWidget {
             }
         }
         let show_welcome_banner = std::mem::take(&mut self.show_welcome_banner);
+        // A prompt painted before the session started stays below the session
+        // header it was typed ahead of.
+        let painted_prompt = self
+            .active_cell
+            .take_if(|cell| cell.as_any().is::<history_cell::UserHistoryCell>());
         self.add_to_history(history_cell::new_session_info(
             &self.config,
             self.config.active_agent.clone(),
             show_welcome_banner,
             self.live_status_view_model(),
         ));
+        if painted_prompt.is_some() {
+            self.active_cell.set(painted_prompt);
+        }
         if let Some(user_message) = self.initial_user_message.take() {
             self.bottom_pane
                 .record_local_history_submission(&user_message.text);
@@ -401,6 +423,7 @@ impl ChatWidget {
     }
 
     pub(super) fn flush_answer_stream_with_separator(&mut self) {
+        self.live_tail.set(None);
         if let Some(mut controller) = self.stream_controller.take() {
             let (cell, source) = controller.finalize();
             if let Some(cell) = cell {
@@ -417,7 +440,9 @@ impl ChatWidget {
 
     pub(super) fn set_status_header(&mut self, header: String) {
         self.current_status_header = header.clone();
-        self.bottom_pane.update_status_header(header);
+        let suffix = self.subagent_status_suffix();
+        self.bottom_pane
+            .update_status_header(format!("{header}{suffix}"));
     }
 
     pub(super) fn on_context_compacted(&mut self, summary: Option<String>) {
@@ -552,6 +577,7 @@ impl ChatWidget {
         self.bottom_pane.set_task_running(false);
         self.completed_client_tool_calls.clear();
         self.stream_controller = None;
+        self.live_tail.set(None);
     }
 
     pub(super) fn on_error(&mut self, message: String) {
@@ -661,25 +687,6 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    /// Periodic tick to commit at most one queued line to history with a small delay,
-    /// animating the output.
-    pub(crate) fn on_commit_tick(&mut self) {
-        if let Some(controller) = self.stream_controller.as_mut() {
-            let (cell, is_idle) = controller.on_commit_tick();
-            if let Some(cell) = cell {
-                // NOTE: Do NOT hide the status indicator here. The "Working (Xs)"
-                // message should remain visible until the conversational turn fully
-                // completes (when TaskComplete event arrives and set_task_running(false)
-                // is called). Hiding it during streaming commits causes the indicator
-                // to disappear prematurely while the agent is still processing.
-                self.add_boxed_history(cell);
-            }
-            if is_idle {
-                self.app_event_tx.send(AppEvent::StopCommitAnimation);
-            }
-        }
-    }
-
     pub(crate) fn has_active_agent_stream(&self) -> bool {
         self.stream_controller.is_some()
     }
@@ -704,10 +711,8 @@ impl ChatWidget {
                 self.last_rendered_width.get().map(|w| w.saturating_sub(2)),
             ));
         }
-        if let Some(controller) = self.stream_controller.as_mut()
-            && controller.push(&delta)
-        {
-            self.app_event_tx.send(AppEvent::StartCommitAnimation);
+        if let Some(controller) = self.stream_controller.as_mut() {
+            controller.push(&delta);
         }
         self.request_redraw();
     }
@@ -890,8 +895,10 @@ impl ChatWidget {
                     self.flush_active_cell();
                     self.session_stats.record_user_message();
                     self.active_user_message_id = message_delta.message_id;
-                    self.active_cell =
-                        Some(Box::new(history_cell::new_user_prompt(message_delta.delta)));
+                    self.active_cell
+                        .set(Some(Box::new(history_cell::new_user_prompt(
+                            message_delta.delta,
+                        ))));
                 }
                 self.needs_final_message_separator = false;
                 self.request_redraw();
@@ -982,6 +989,8 @@ impl ChatWidget {
             self.session_stats.record_assistant_message();
         }
         self.assistant_stream_seen_for_stats = false;
+        self.pending_echoes.clear();
+        self.subagents_turn_ended(interrupted);
         self.on_task_complete(completed.last_agent_message);
         if interrupted {
             self.add_to_history(history_cell::new_error_event(
@@ -1087,12 +1096,17 @@ impl ChatWidget {
         approval: crate::presentation::ApprovalRequest,
         request_id: nori_protocol::acp::v1::RequestId,
         options: Vec<nori_protocol::acp::v1::PermissionOption>,
+        subagent: Option<String>,
     ) {
-        let Some(request) =
+        let Some(mut request) =
             approval_request_from_client_event(approval, &self.config.cwd, request_id, options)
         else {
             return;
         };
+        // A subagent's request says whose it is.
+        if let Some(label) = subagent {
+            request.title = format!("[{label}] {}", request.title);
+        }
 
         self.flush_answer_stream_with_separator();
         self.notify(Notification::ExecApprovalRequested {
@@ -1222,7 +1236,7 @@ impl ChatWidget {
                     self.pending_client_tool_cells.insert(call_id, *boxed);
                 }
             } else {
-                self.active_cell = Some(active);
+                self.active_cell.set(Some(active));
                 self.flush_active_cell();
             }
         }
@@ -1240,7 +1254,7 @@ impl ChatWidget {
         if is_new_exploring {
             cell.mark_exploring();
         }
-        self.active_cell = Some(Box::new(cell));
+        self.active_cell.set(Some(Box::new(cell)));
         if should_flush {
             self.flush_active_cell();
         }

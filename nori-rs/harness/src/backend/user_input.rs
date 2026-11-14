@@ -104,31 +104,6 @@ impl AcpBackend {
             }
         }
 
-        // Create ghost snapshot before sending prompt to agent.
-        // This captures the working tree state so /undo can restore it.
-        let snapshot_cwd = self.cwd.clone();
-        let ghost_snapshots = Arc::clone(&self.ghost_snapshots);
-        let label_for_snapshot = display_text.clone();
-        match tokio::task::spawn_blocking(move || {
-            let options = codex_git::CreateGhostCommitOptions::new(&snapshot_cwd);
-            codex_git::create_ghost_commit(&options)
-        })
-        .await
-        {
-            Ok(Ok(snapshot)) => {
-                ghost_snapshots.push(snapshot, label_for_snapshot).await;
-            }
-            Ok(Err(codex_git::GitToolingError::NotAGitRepository { .. })) => {
-                debug!("Skipping ghost snapshot: not a git repository");
-            }
-            Ok(Err(err)) => {
-                warn!("Failed to create ghost snapshot: {err}");
-            }
-            Err(err) => {
-                warn!("Ghost snapshot task panicked: {err}");
-            }
-        }
-
         // Save prompt text for post_user_prompt hooks (before it gets moved)
         let prompt_text_for_hooks = display_text;
 

@@ -29,7 +29,7 @@ use crate::connection::acp_connection::AcpConnection;
 use crate::registry::get_agent_config;
 use crate::transcript::ContentBlock;
 use crate::transcript::TranscriptRecorder;
-use crate::undo::GhostSnapshotStack;
+use crate::undo::EditJournal;
 
 mod remote_control_ext;
 
@@ -172,6 +172,8 @@ pub struct AcpBackendConfig {
     pub auto_worktree_repo_root: Option<PathBuf>,
     /// Whether the first prompt should be summarized for the footer.
     pub prompt_summary_enabled: bool,
+    /// Advertise subagent support to the agent during `initialize`.
+    pub subagent_sessions: bool,
     /// Scripts to run when a session starts
     pub session_start_hooks: Vec<PathBuf>,
     /// Scripts to run when a session ends
@@ -298,8 +300,8 @@ pub struct AcpBackend {
     prompt_phase_gate: Arc<Mutex<Option<tokio::sync::watch::Receiver<bool>>>>,
     /// How long after idle before sending a notification
     notify_after_idle: crate::config::NotifyAfterIdle,
-    /// Stack of ghost commit snapshots for /undo support
-    ghost_snapshots: Arc<GhostSnapshotStack>,
+    /// Per-turn record of the file edits the agent reported, for /undo support
+    edit_journal: Arc<EditJournal>,
     /// Whether the first user prompt has been sent (for prompt summary)
     is_first_prompt: Arc<Mutex<bool>>,
     /// Whether the first prompt should be summarized for the footer.
@@ -399,6 +401,7 @@ pub use transcript::client_events_to_replay_client_events;
 pub use transcript::transcript_to_replay_client_events;
 pub use transcript::transcript_to_replay_session_events;
 pub use transcript::transcript_to_summary;
+mod child_edits;
 mod hooks;
 
 fn public_nori_capabilities(

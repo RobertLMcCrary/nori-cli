@@ -1,7 +1,6 @@
 use std::fmt;
 use std::io::IsTerminal;
 use std::io::Result;
-use std::io::Stdout;
 use std::io::stdin;
 use std::io::stdout;
 use std::panic;
@@ -13,7 +12,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crossterm::Command;
-use crossterm::SynchronizedUpdate;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
@@ -23,12 +21,15 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyboardEnhancementFlags;
 use crossterm::event::PopKeyboardEnhancementFlags;
 use crossterm::event::PushKeyboardEnhancementFlags;
+use crossterm::terminal::BeginSynchronizedUpdate;
+use crossterm::terminal::EndSynchronizedUpdate;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 use crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::execute;
+use ratatui::crossterm::queue;
 use ratatui::crossterm::terminal::disable_raw_mode;
 use ratatui::crossterm::terminal::enable_raw_mode;
 use ratatui::layout::Offset;
@@ -38,6 +39,7 @@ use tokio_stream::Stream;
 
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
+use crate::frame_writer::FrameWriter;
 #[cfg(unix)]
 use crate::tui::job_control::SUSPEND_KEY;
 #[cfg(unix)]
@@ -45,9 +47,10 @@ use crate::tui::job_control::SuspendContext;
 
 #[cfg(unix)]
 mod job_control;
+mod repaint;
 
 /// A type alias for the terminal type used in this application
-pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
+pub type Terminal = CustomTerminal<CrosstermBackend<FrameWriter>>;
 
 pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
@@ -152,11 +155,13 @@ pub fn init() -> Result<Terminal> {
             })?;
     }
     set_modes()?;
+    crate::startup_trace::mark("terminal_modes");
 
     set_panic_hook();
 
-    let backend = CrosstermBackend::new(stdout());
+    let backend = CrosstermBackend::new(FrameWriter::stdout()?);
     let tui = CustomTerminal::with_options(backend)?;
+    crate::startup_trace::mark("cursor_position");
     Ok(tui)
 }
 
@@ -180,6 +185,12 @@ pub struct Tui {
     draw_tx: tokio::sync::broadcast::Sender<()>,
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<Line<'static>>,
+    /// History to replay above the viewport on the next draw, set by a repaint request.
+    repaint_history: Option<Vec<Line<'static>>>,
+    /// The next draw repaints the whole (alternate) screen.
+    full_repaint: bool,
+    /// Whether a frame was drawn yet, for the startup trace.
+    first_frame_drawn: bool,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
@@ -224,15 +235,20 @@ impl Tui {
         // Detect keyboard enhancement support before any EventStream is created so the
         // crossterm poller can acquire its lock without contention.
         let enhanced_keys_supported = supports_keyboard_enhancement().unwrap_or(false);
+        crate::startup_trace::mark("keyboard_query");
         // Cache this to avoid contention with the event reader.
         supports_color::on_cached(supports_color::Stream::Stdout);
         let _ = crate::terminal_palette::default_colors();
+        crate::startup_trace::mark("color_query");
 
         Self {
             frame_schedule_tx,
             draw_tx,
             terminal,
             pending_history_lines: vec![],
+            repaint_history: None,
+            full_repaint: false,
+            first_frame_drawn: false,
             alt_saved_viewport: None,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
@@ -331,9 +347,10 @@ impl Tui {
     /// Enter alternate screen and expand the viewport to full terminal size, saving the current
     /// inline viewport for restoration when leaving.
     pub fn enter_alt_screen(&mut self) -> Result<()> {
-        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        self.terminal.backend_mut().writer_mut().begin_frame();
+        let _ = queue!(self.terminal.backend_mut(), EnterAlternateScreen);
         // Enable "alternate scroll" so terminals may translate wheel to arrows
-        let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
+        let _ = queue!(self.terminal.backend_mut(), EnableAlternateScroll);
         if let Ok(size) = self.terminal.size() {
             self.alt_saved_viewport = Some(self.terminal.viewport_area);
             self.terminal.set_viewport_area(ratatui::layout::Rect::new(
@@ -345,19 +362,20 @@ impl Tui {
             let _ = self.terminal.clear();
         }
         self.alt_screen_active.store(true, Ordering::Relaxed);
-        Ok(())
+        self.terminal.backend_mut().writer_mut().end_frame()
     }
 
     /// Leave alternate screen and restore the previously saved inline viewport, if any.
     pub fn leave_alt_screen(&mut self) -> Result<()> {
         // Disable alternate scroll when leaving alt-screen
-        let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        self.terminal.backend_mut().writer_mut().begin_frame();
+        let _ = queue!(self.terminal.backend_mut(), DisableAlternateScroll);
+        let _ = queue!(self.terminal.backend_mut(), LeaveAlternateScreen);
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }
         self.alt_screen_active.store(false, Ordering::Relaxed);
-        Ok(())
+        self.terminal.backend_mut().writer_mut().end_frame()
     }
 
     pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -410,7 +428,38 @@ impl Tui {
             }
         }
 
-        stdout().sync_update(|_| {
+        // The whole frame, including the synchronized-update markers, is collected and written
+        // with one syscall. The markers are closed and the buffer is sent on the error path too,
+        // so a failed frame cannot leave the terminal inside a synchronized update.
+        self.terminal.backend_mut().writer_mut().begin_frame();
+        let _ = queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate);
+        let result = self.draw_frame(
+            height,
+            draw_fn,
+            #[cfg(unix)]
+            prepared_resume.take(),
+            pending_viewport_area,
+        );
+        let _ = queue!(self.terminal.backend_mut(), EndSynchronizedUpdate);
+        let sent = self.terminal.backend_mut().writer_mut().end_frame();
+        if !self.first_frame_drawn {
+            self.first_frame_drawn = true;
+            crate::startup_trace::mark("first_frame");
+        }
+        result.and(sent)
+    }
+
+    fn draw_frame(
+        &mut self,
+        height: u16,
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+        #[cfg(unix)] prepared_resume: Option<job_control::PreparedResumeAction>,
+        mut pending_viewport_area: Option<ratatui::layout::Rect>,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        let mut prepared_resume = prepared_resume;
+        {
+            self.begin_repaint()?;
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 prepared.apply(&mut self.terminal)?;
@@ -483,7 +532,7 @@ impl Tui {
                 }
                 let inserted = crate::insert_history::insert_history_lines(
                     terminal,
-                    self.pending_history_lines.clone(),
+                    &self.pending_history_lines,
                 )?;
                 if inserted {
                     self.pending_history_lines.clear();
@@ -506,7 +555,19 @@ impl Tui {
             terminal.draw(|frame| {
                 draw_fn(frame);
             })
-        })?
+        }
+    }
+}
+
+/// The shortest time between two draws. Requests inside the window are deferred to its end,
+/// never dropped, so a burst of events costs one frame instead of one per event.
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
+
+/// When the next draw may fire, given the earliest requested time and when the last one fired.
+fn clamp_to_frame_interval(requested: Instant, last_draw: Option<Instant>) -> Instant {
+    match last_draw {
+        Some(last_draw) => requested.max(last_draw + MIN_FRAME_INTERVAL),
+        None => requested,
     }
 }
 
@@ -522,9 +583,11 @@ fn spawn_frame_scheduler(
 
         let mut rx = frame_schedule_rx;
         let mut next_deadline: Option<Instant> = None;
+        let mut last_draw: Option<Instant> = None;
 
         loop {
             let target = next_deadline
+                .map(|requested| clamp_to_frame_interval(requested, last_draw))
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(60 * 60 * 24 * 365));
             let sleep_fut = sleep_until(TokioInstant::from_std(target));
             tokio::pin!(sleep_fut);
@@ -547,6 +610,7 @@ fn spawn_frame_scheduler(
                 _ = &mut sleep_fut => {
                     if next_deadline.is_some() {
                         next_deadline = None;
+                        last_draw = Some(Instant::now());
                         let _ = draw_tx.send(());
                     }
                 }
@@ -574,5 +638,58 @@ impl Command for PostNotification {
     #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn a_request_inside_the_window_is_deferred_to_its_end() {
+        let last = Instant::now();
+        let requested = last + Duration::from_millis(2);
+        assert_eq!(
+            clamp_to_frame_interval(requested, Some(last)),
+            last + MIN_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn a_request_after_the_window_is_not_delayed() {
+        let last = Instant::now();
+        let requested = last + Duration::from_millis(50);
+        assert_eq!(clamp_to_frame_interval(requested, Some(last)), requested);
+    }
+
+    #[test]
+    fn the_first_draw_is_not_delayed() {
+        let requested = Instant::now();
+        assert_eq!(clamp_to_frame_interval(requested, None), requested);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_requests_draws_once_per_window() {
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (draw_tx, mut draw_rx) = tokio::sync::broadcast::channel(16);
+        spawn_frame_scheduler(frame_rx, draw_tx);
+
+        // A request every millisecond.
+        let started = Instant::now();
+        let mut draws = 0;
+        for _ in 0..100 {
+            let _ = frame_tx.send(Instant::now());
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            while draw_rx.try_recv().is_ok() {
+                draws += 1;
+            }
+        }
+        // One draw per window at most (the last one may still be pending), and at least one.
+        let windows = started.elapsed().as_millis() / MIN_FRAME_INTERVAL.as_millis() + 1;
+        assert!(
+            draws >= 1 && draws <= windows,
+            "{draws} draws in {windows} windows"
+        );
     }
 }

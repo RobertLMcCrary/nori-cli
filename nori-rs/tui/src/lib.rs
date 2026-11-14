@@ -47,6 +47,7 @@ mod effective_cwd_tracker;
 mod exec_cell;
 mod exec_command;
 mod file_search;
+pub mod frame_writer;
 mod frames;
 mod get_git_diff;
 mod git_marker;
@@ -71,6 +72,7 @@ mod session_log;
 pub mod session_stats;
 mod shimmer;
 mod slash_command;
+pub mod startup_trace;
 mod status;
 mod status_indicator_widget;
 #[cfg(feature = "storybook")]
@@ -127,6 +129,7 @@ pub async fn run_main(
     _codex_linux_sandbox_exe: Option<PathBuf>,
     analytics: Option<nori_installed::AnalyticsReporter>,
 ) -> std::io::Result<AppExitInfo> {
+    startup_trace::mark("run_main");
     // Pre-warm the ACP agent installation cache in a background thread.
     // This runs `which` commands early so the agent picker opens quickly.
     std::thread::spawn(|| {
@@ -176,7 +179,9 @@ pub async fn run_main(
         additional_writable_roots: additional_dirs,
         raw_overrides: cli_kv_overrides,
     };
+    startup_trace::mark("launch_tracked");
     let mut config = load_config_or_exit(overrides.clone());
+    startup_trace::mark("config_loaded");
 
     // Initialize the agent registry with custom agents from config plus any
     // caller-injected entries (e.g. `nori cloud`'s pinned handroll agent).
@@ -194,6 +199,7 @@ pub async fn run_main(
         tracing::warn!("Failed to initialize agent registry with custom agents: {e}");
     }
 
+    startup_trace::mark("registry_ready");
     let (pending_worktree_ask, worktree_blocked_reason) = {
         use nori_config::AutoWorktree;
         let auto_worktree = config.auto_worktree;
@@ -259,6 +265,7 @@ pub async fn run_main(
         }
     }
 
+    startup_trace::mark("worktree_checked");
     let log_dir = config.nori_home.join("log");
     std::fs::create_dir_all(&log_dir)?;
     // Open (or create) your log file, appending to it.
@@ -293,6 +300,7 @@ pub async fn run_main(
         .with_filter(env_filter());
 
     let _ = tracing_subscriber::registry().with(file_layer).try_init();
+    startup_trace::mark("tui_log_ready");
 
     run_ratatui_app(
         cli,
@@ -316,6 +324,7 @@ async fn run_ratatui_app(
     analytics: Option<nori_installed::AnalyticsReporter>,
 ) -> color_eyre::Result<AppExitInfo> {
     color_eyre::install()?;
+    startup_trace::mark("color_eyre");
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.
@@ -327,9 +336,11 @@ async fn run_ratatui_app(
         prev_hook(info);
     }));
     let mut terminal = tui::init()?;
+    startup_trace::mark("terminal_init");
     terminal.clear()?;
 
     let mut tui = Tui::new(terminal);
+    startup_trace::mark("tui_new");
 
     #[cfg(not(debug_assertions))]
     {
@@ -352,12 +363,14 @@ async fn run_ratatui_app(
 
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
+    startup_trace::mark("session_log");
 
     let auth_manager = AuthManager::shared(
         initial_config.nori_home.clone(),
         false,
         codex_login::AuthCredentialsStoreMode::File,
     );
+    startup_trace::mark("auth_manager");
     let should_show_trust_screen = should_show_trust_screen(&initial_config);
     let should_show_onboarding = !cli.cloud_mode
         && (should_show_trust_screen
@@ -426,6 +439,7 @@ async fn run_ratatui_app(
         config
     };
 
+    startup_trace::mark("onboarding_checked");
     let resume_agent_filter = cli.agent.as_deref();
     let transcript_loader = TranscriptLoader::new(config.nori_home.clone());
 
@@ -504,6 +518,7 @@ async fn run_ratatui_app(
         resume_picker::ResumeSelection::StartFresh
     };
 
+    startup_trace::mark("resume_selected");
     if let resume_picker::ResumeSelection::Resume(target) = &resume_selection
         && let Some(agent) = target.agent.as_ref()
     {
@@ -525,6 +540,7 @@ async fn run_ratatui_app(
     } = cli;
     let vertical_footer = config.vertical_footer;
 
+    startup_trace::mark("app_run");
     let app_result = App::run(
         &mut tui,
         auth_manager,

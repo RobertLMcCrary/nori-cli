@@ -64,6 +64,7 @@ image = { workspace = true, features = ["jpeg", "png"] }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 mcp-types = { workspace = true }
+memchr = { workspace = true }
 pathdiff = { workspace = true }
 pulldown-cmark = { workspace = true }
 rand = { workspace = true }
@@ -134,6 +135,7 @@ assert_matches = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
+proptest = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
 vt100 = { workspace = true }

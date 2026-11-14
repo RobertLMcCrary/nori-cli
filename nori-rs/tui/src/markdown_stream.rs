@@ -2,120 +2,326 @@ use std::path::PathBuf;
 
 use ratatui::text::Line;
 
-use crate::markdown;
 use crate::markdown_render::committable_prefix_len;
+use crate::markdown_render::markdown_segments;
+use crate::markdown_render::render_markdown_continuation;
+use crate::markdown_render::top_level_block_starts;
+use crate::render::line_utils::is_blank_line_spaces_only;
 
-/// Newline-gated accumulator that renders markdown and commits only fully
-/// completed logical lines.
+mod fence;
+
+pub(crate) use fence::FenceOpener;
+
+/// Incremental markdown renderer for a message that is still streaming.
+///
+/// Completed top-level blocks are frozen: rendered once, their lines handed out, and their source
+/// never parsed again. Only the open block (the last one, which more text can still change) is
+/// re-rendered, so handling a delta costs the delta plus the open block, not the message.
+///
+/// Within the open block, lines that end in a newline are committed (handed out once, for the
+/// scrollback), and the rest are the live tail: what the line being typed currently looks like.
+///
+/// A fenced code block is streamed by [`fence::OpenFence`] instead: each line is highlighted and
+/// committed once, so a long code block costs its length in total rather than on every frame.
 pub(crate) struct MarkdownStreamCollector {
     buffer: String,
-    committed_line_count: usize,
     width: Option<usize>,
     cwd: Option<PathBuf>,
+    /// Bytes of `buffer` that are frozen. The open block starts here.
+    frozen_len: usize,
+    /// The frozen text ends inside a prose segment, so the open block continues it.
+    prose_continues: bool,
+    /// Lines of the open block already handed out.
+    committed_in_open: usize,
+    /// Length of the open block's complete prefix that was last rendered.
+    complete_cache: Option<usize>,
+    live: Vec<Line<'static>>,
+    dirty: bool,
+    /// The open block is a fenced code block streamed line by line.
+    fence: Option<fence::OpenFence>,
+    /// Bytes handed to the markdown parser so far, for work-counting tests.
+    parsed_bytes: usize,
+    /// Bytes highlighted by fences that have closed, for work-counting tests.
+    highlighted_bytes: usize,
 }
 
 impl MarkdownStreamCollector {
     pub fn new(width: Option<usize>) -> Self {
-        Self {
-            buffer: String::new(),
-            committed_line_count: 0,
-            width,
-            cwd: None,
-        }
+        Self::with_cwd(width, None)
     }
 
     #[allow(dead_code)]
     pub fn new_with_cwd(width: Option<usize>, cwd: PathBuf) -> Self {
+        Self::with_cwd(width, Some(cwd))
+    }
+
+    fn with_cwd(width: Option<usize>, cwd: Option<PathBuf>) -> Self {
         Self {
             buffer: String::new(),
-            committed_line_count: 0,
             width,
-            cwd: Some(cwd),
+            cwd,
+            frozen_len: 0,
+            prose_continues: false,
+            committed_in_open: 0,
+            complete_cache: None,
+            live: Vec::new(),
+            dirty: false,
+            fence: None,
+            parsed_bytes: 0,
+            highlighted_bytes: 0,
         }
     }
 
     pub fn clear(&mut self) {
         self.buffer.clear();
-        self.committed_line_count = 0;
+        self.frozen_len = 0;
+        self.prose_continues = false;
+        self.committed_in_open = 0;
+        self.complete_cache = None;
+        self.live.clear();
+        self.dirty = false;
+        self.fence = None;
     }
 
+    /// Append a delta. Costs the length of the delta; rendering waits for [`Self::advance`].
     pub fn push_delta(&mut self, delta: &str) {
-        tracing::trace!("push_delta: {delta:?}");
         self.buffer.push_str(delta);
+        self.dirty = true;
     }
 
-    /// Render the full buffer and return only the newly completed logical lines
-    /// since the last commit. When the buffer does not end with a newline, the
-    /// final rendered line is considered incomplete and is not emitted.
+    /// The line being typed and anything else rendered but not yet committed, as of the last
+    /// [`Self::advance`].
+    pub fn live_tail(&self) -> &[Line<'static>] {
+        &self.live
+    }
+
+    /// Whether a delta arrived that [`Self::advance`] has not rendered yet.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Bytes handed to the markdown parser so far.
+    #[cfg(test)]
+    pub fn parsed_bytes(&self) -> usize {
+        self.parsed_bytes
+    }
+
+    /// Bytes of fenced code highlighted so far.
+    #[cfg(test)]
+    pub fn highlighted_bytes(&self) -> usize {
+        self.highlighted_bytes
+            + self
+                .fence
+                .as_ref()
+                .map_or(0, |fence| fence.highlighted_bytes)
+    }
+
+    /// Render `source` and count the bytes handed to the parser.
+    fn render(&mut self, range: std::ops::Range<usize>, preceded: bool) -> Vec<Line<'static>> {
+        self.parsed_bytes += range.len();
+        render_markdown_continuation(
+            &self.buffer[range],
+            self.width,
+            self.cwd.as_deref(),
+            preceded,
+        )
+    }
+
+    /// Render everything pushed since the last call. Returns the lines that became final since
+    /// then, oldest first, and refreshes the live tail.
     ///
-    /// Committing by line prefix assumes rendering is append-only, which markdown tables violate:
-    /// every body row feeds the column widths, so a new row rewrites the header, the header rule,
-    /// and each separator already emitted. An unfinished trailing table is therefore withheld until
-    /// it closes (see [`committable_prefix_len`]) rather than committed row by row.
-    pub fn commit_complete_lines(&mut self) -> Vec<Line<'static>> {
-        let source = self.buffer.clone();
-        let last_newline_idx = source.rfind('\n');
-        let source = if let Some(last_newline_idx) = last_newline_idx {
-            source[..=last_newline_idx].to_string()
-        } else {
+    /// Rendering is append-only for the committed prefix except for markdown tables, whose column
+    /// widths depend on every row: an unfinished trailing table is withheld (see
+    /// [`committable_prefix_len`]) and shown live instead.
+    pub fn advance(&mut self) -> Vec<Line<'static>> {
+        if !self.dirty {
             return Vec::new();
+        }
+        self.dirty = false;
+        let mut out = Vec::new();
+        loop {
+            if self.fence.is_none() && !self.open_fence(&mut out) {
+                self.freeze_completed_blocks(&mut out);
+                if !self.open_fence(&mut out) {
+                    break;
+                }
+            }
+            let Some(fence) = self.fence.as_mut() else {
+                break;
+            };
+            match fence.advance(&self.buffer, &mut out) {
+                fence::FenceProgress::Open => {
+                    self.live = fence.live(&self.buffer);
+                    return out;
+                }
+                fence::FenceProgress::Closed { end } => self.close_fence(end),
+            }
+        }
+
+        let open_start = self.frozen_len;
+        let preceded = self.prose_continues;
+        let open_len = self.buffer.len() - open_start;
+        let complete_len = match memchr::memrchr(b'\n', &self.buffer.as_bytes()[open_start..]) {
+            Some(newline) => {
+                committable_prefix_len(&self.buffer[open_start..=open_start + newline])
+            }
+            None => 0,
         };
-        let source = source[..committable_prefix_len(&source)].to_string();
-        let mut rendered: Vec<Line<'static>> = Vec::new();
-        markdown::append_markdown_with_cwd(&source, self.width, self.cwd.as_deref(), &mut rendered);
-        let mut complete_line_count = rendered.len();
-        if complete_line_count > 0
-            && crate::render::line_utils::is_blank_line_spaces_only(
-                &rendered[complete_line_count - 1],
-            )
-        {
-            complete_line_count -= 1;
+
+        if complete_len > 0 && self.complete_cache.is_none_or(|len| len != complete_len) {
+            let rendered = self.render(open_start..open_start + complete_len, preceded);
+            let mut count = rendered.len();
+            if count > 0 && is_blank_line_spaces_only(&rendered[count - 1]) {
+                count -= 1;
+            }
+            if count > self.committed_in_open {
+                out.extend(rendered[self.committed_in_open..count].iter().cloned());
+                self.committed_in_open = count;
+            }
+            self.complete_cache = Some(complete_len);
         }
 
-        if self.committed_line_count >= complete_line_count {
-            return Vec::new();
+        // The live tail is the open block as it stands now, past what was committed. Nothing is
+        // being typed when every byte of it is a committed line.
+        let mut live: Vec<Line<'static>> = if complete_len == open_len {
+            Vec::new()
+        } else {
+            self.render(open_start..self.buffer.len(), preceded)
+                .into_iter()
+                .skip(self.committed_in_open)
+                .collect()
+        };
+        while live.last().is_some_and(is_blank_line_spaces_only) {
+            live.pop();
         }
-
-        let out_slice = &rendered[self.committed_line_count..complete_line_count];
-
-        let out = out_slice.to_vec();
-        self.committed_line_count = complete_line_count;
+        self.live = live;
         out
     }
 
-    /// Finalize the stream: emit all remaining lines beyond the last commit.
-    /// If the buffer does not end with a newline, a temporary one is appended
-    /// for rendering. Optionally unwraps ```markdown language fences in
-    /// non-test builds.
-    pub fn finalize_and_drain(&mut self) -> (Vec<Line<'static>>, String) {
-        let raw_buffer = self.buffer.clone();
-        let mut source: String = raw_buffer.clone();
-        if !source.ends_with('\n') {
-            source.push('\n');
+    /// Start streaming the open block as a fenced code block if it is one: its first line with
+    /// content is a complete fence opener. The block's leading separator is rendered by the
+    /// renderer, so it is exactly what rendering the whole message gives.
+    fn open_fence(&mut self, out: &mut Vec<Line<'static>>) -> bool {
+        let open = &self.buffer[self.frozen_len..];
+        let mut offset = 0;
+        for line in open.split_inclusive('\n') {
+            let Some(content) = line.strip_suffix('\n') else {
+                return false;
+            };
+            offset += line.len();
+            if content.trim().is_empty() {
+                continue;
+            }
+            let Some(opener) = FenceOpener::parse(content) else {
+                return false;
+            };
+            let body_start = self.frozen_len + offset;
+            let opening = self.render(self.frozen_len..body_start, self.prose_continues);
+            out.extend(opening.into_iter().skip(self.committed_in_open));
+            self.committed_in_open = 0;
+            self.complete_cache = None;
+            self.fence = Some(fence::OpenFence::new(opener, body_start));
+            return true;
         }
-        tracing::debug!(
-            raw_len = raw_buffer.len(),
-            source_len = source.len(),
-            "markdown finalize (raw length: {}, rendered length: {})",
-            raw_buffer.len(),
-            source.len()
-        );
-        tracing::trace!("markdown finalize (raw source):\n---\n{source}\n---");
+        false
+    }
 
-        let mut rendered: Vec<Line<'static>> = Vec::new();
-        markdown::append_markdown_with_cwd(&source, self.width, self.cwd.as_deref(), &mut rendered);
+    /// The open fence closed at `end`: the next block starts after it, preceded by it.
+    fn close_fence(&mut self, end: usize) {
+        if let Some(fence) = self.fence.take() {
+            self.highlighted_bytes += fence.highlighted_bytes;
+        }
+        self.frozen_len = end;
+        self.prose_continues = true;
+        self.committed_in_open = 0;
+        self.complete_cache = None;
+        self.live.clear();
+    }
 
-        let out = if self.committed_line_count >= rendered.len() {
-            Vec::new()
-        } else {
-            rendered[self.committed_line_count..].to_vec()
+    /// Freeze every block that a later block has closed: render it, hand out its lines, and move
+    /// the open block's start past it.
+    fn freeze_completed_blocks(&mut self, out: &mut Vec<Line<'static>>) {
+        let tail = &self.buffer[self.frozen_len..];
+        // Only complete lines decide block structure; the line being typed can still change it.
+        let Some(stable_end) = memchr::memrchr(b'\n', tail.as_bytes()).map(|newline| newline + 1)
+        else {
+            return;
+        };
+        let stable = &tail[..stable_end];
+        let segments = markdown_segments(stable);
+        let Some(last) = segments.last() else {
+            return;
         };
 
-        // Reset collector state for next stream.
+        // Where the open block starts, relative to the tail.
+        let mut open_start = last.range.start;
+        let mut open_continues_prose = false;
+        if !last.is_table {
+            let starts = top_level_block_starts(&stable[last.range.clone()]);
+            self.parsed_bytes += last.range.len();
+            if starts.len() >= 2 {
+                open_start = last.range.start + starts[starts.len() - 1];
+                open_continues_prose = true;
+            }
+        }
+        if open_start == 0 {
+            return;
+        }
+
+        let from = self.frozen_len;
+        let frozen = self.render(from..from + open_start, self.prose_continues);
+        // The block that was open is the first thing frozen; its early lines were already
+        // handed out as they were committed.
+        out.extend(frozen.into_iter().skip(self.committed_in_open));
+        self.frozen_len += open_start;
+        self.prose_continues = open_continues_prose;
+        self.committed_in_open = 0;
+        self.complete_cache = None;
+    }
+
+    /// Finalize the stream: hand out everything still pending. If the buffer does not end with a
+    /// newline, a temporary one is appended for rendering. Returns the raw source unchanged.
+    pub fn finalize_and_drain(&mut self) -> (Vec<Line<'static>>, String) {
+        self.dirty = true;
+        let mut out = self.advance();
+        if let Some(fence) = self.fence.as_mut() {
+            // The message ended inside a code block, which ends it.
+            fence.finish(&self.buffer, &mut out);
+            let end = self.buffer.len();
+            self.close_fence(end);
+        }
+
+        let mut appended_newline = false;
+        if self.frozen_len < self.buffer.len() {
+            if !self.buffer.ends_with('\n') {
+                self.buffer.push('\n');
+                appended_newline = true;
+            }
+            tracing::debug!(raw_len = self.buffer.len(), "markdown finalize");
+            let rendered = self.render(self.frozen_len..self.buffer.len(), self.prose_continues);
+            out.extend(rendered.into_iter().skip(self.committed_in_open));
+        }
+
+        let mut raw = std::mem::take(&mut self.buffer);
+        // The temporary newline is not part of the message.
+        if appended_newline {
+            raw.pop();
+        }
         self.clear();
-        (out, raw_buffer)
+        (out, raw)
+    }
+
+    /// Advance and return only the newly committed lines. A convenience for tests that commit
+    /// after each delta.
+    #[cfg(test)]
+    pub fn commit_complete_lines(&mut self) -> Vec<Line<'static>> {
+        self.dirty = true;
+        self.advance()
     }
 }
+
+#[cfg(test)]
+mod incremental_tests;
 
 #[cfg(test)]
 pub(crate) fn simulate_stream_markdown_for_tests(

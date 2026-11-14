@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/subagents/block_tests.rs
+expression: shown
+---
+• Task number 0  general-purpose · 1 tool · 1m 05s
+  Read file
+• Task number 1  general-purpose · 1 tool · 1m 05s
+  Read file
+• Task number 2  general-purpose · 1 tool · 1m 05s
+  Read file
+• Task number 3  general-purpose · 1 tool · 1m 05s
+  Read file
+  +8 more running

@@ -520,6 +520,7 @@ async fn test_event_receiver_preserves_update_then_approval_order() {
             ConnectionEvent::Acp(_)
             | ConnectionEvent::SessionClosed
             | ConnectionEvent::SessionUpdate(_)
+            | ConnectionEvent::Subagent(_)
             | ConnectionEvent::ChildExited { .. } => {}
         }
     };
@@ -838,6 +839,7 @@ fn script_agent_config(dir: &std::path::Path, body: &str) -> crate::registry::Ac
         display_name: "Script Agent".to_string(),
         install_hint: "none".to_string(),
         model_injection: crate::registry::ModelInjection::None,
+        advertise_subagents: true,
     }
 }
 
@@ -1108,6 +1110,7 @@ async fn test_child_exit_emits_event_with_stderr_tail() {
             ConnectionEvent::Acp(_)
             | ConnectionEvent::SessionClosed
             | ConnectionEvent::SessionUpdate(_)
+            | ConnectionEvent::Subagent(_)
             | ConnectionEvent::DelegatedRequest(_) => {}
         }
     };

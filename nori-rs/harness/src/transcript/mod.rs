@@ -16,6 +16,7 @@
 
 mod context_timeline;
 mod loader;
+mod parse;
 mod project;
 mod recorder;
 mod session_event;

@@ -57,6 +57,76 @@ fn syntect_style_to_ratatui(style: syntect::highlighting::Style) -> Style {
     ratatui_style
 }
 
+/// Spans for one highlighted line, without its newline.
+fn region_spans(regions: Vec<(syntect::highlighting::Style, &str)>) -> Vec<Span<'static>> {
+    regions
+        .into_iter()
+        .filter_map(|(style, text)| {
+            // Strip the trailing newline since a Line represents a single line.
+            let text = text.strip_suffix('\n').unwrap_or(text);
+            (!text.is_empty())
+                .then(|| Span::styled(text.to_string(), syntect_style_to_ratatui(style)))
+        })
+        .collect()
+}
+
+/// Highlights a code block one line at a time, carrying the parser state from line to line, so a
+/// block that streams in is highlighted once in total instead of once per frame.
+///
+/// Lines come out exactly as [`highlight_code_to_lines`] produces them for the whole block, except
+/// that the size limits there do not apply: the cost here is linear however long the block is.
+pub(crate) struct LineHighlighter {
+    parse: syntect::parsing::ParseState,
+    highlight: syntect::highlighting::HighlightState,
+    highlighter: syntect::highlighting::Highlighter<'static>,
+}
+
+impl LineHighlighter {
+    /// `None` when the language is unknown; such blocks are shown plain.
+    pub(crate) fn for_lang(lang: &str) -> Option<Self> {
+        let syntax = syntax_set().find_syntax_by_token(lang)?;
+        let highlighter = syntect::highlighting::Highlighter::new(current_theme());
+        let highlight = syntect::highlighting::HighlightState::new(
+            &highlighter,
+            syntect::parsing::ScopeStack::new(),
+        );
+        Some(Self {
+            parse: syntect::parsing::ParseState::new(syntax),
+            highlight,
+            highlighter,
+        })
+    }
+
+    /// Spans for the next line of the block, given with its newline. `None` when the highlighter
+    /// fails, after which the block should continue plain.
+    pub(crate) fn highlight(&mut self, line: &str) -> Option<Vec<Span<'static>>> {
+        let ops = self.parse.parse_line(line, syntax_set()).ok()?;
+        let regions = syntect::highlighting::HighlightIterator::new(
+            &mut self.highlight,
+            &ops,
+            line,
+            &self.highlighter,
+        )
+        .collect();
+        Some(region_spans(regions))
+    }
+
+    /// Spans for a line still being typed, leaving the state for the line's final form.
+    pub(crate) fn preview(&self, partial: &str) -> Option<Vec<Span<'static>>> {
+        let mut parse = self.parse.clone();
+        let mut highlight = self.highlight.clone();
+        let ops = parse.parse_line(partial, syntax_set()).ok()?;
+        let regions = syntect::highlighting::HighlightIterator::new(
+            &mut highlight,
+            &ops,
+            partial,
+            &self.highlighter,
+        )
+        .collect();
+        Some(region_spans(regions))
+    }
+}
+
 fn plain_lines(text: &str) -> Vec<Line<'static>> {
     text.lines()
         .map(|l| Line::from(l.to_string()))
@@ -97,22 +167,7 @@ pub(crate) fn highlight_code_to_lines(code: &str, lang: &str) -> Vec<Line<'stati
             Ok(r) => r,
             Err(_) => return plain_lines(code),
         };
-
-        let spans: Vec<Span<'static>> = regions
-            .into_iter()
-            .map(|(style, text)| {
-                let ratatui_style = syntect_style_to_ratatui(style);
-                // Strip trailing newline from each region since Line represents a single line
-                let text = text.strip_suffix('\n').unwrap_or(text);
-                if text.is_empty() {
-                    return Span::from("".to_string());
-                }
-                Span::styled(text.to_string(), ratatui_style)
-            })
-            .filter(|s| !s.content.is_empty())
-            .collect();
-
-        result.push(Line::from(spans));
+        result.push(Line::from(region_spans(regions)));
     }
 
     if result.is_empty() {

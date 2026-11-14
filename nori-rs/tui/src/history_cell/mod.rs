@@ -44,6 +44,12 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     fn is_stream_continuation(&self) -> bool {
         false
     }
+
+    /// Whether the transcript overlay shows every line of this cell instead of collapsing a long
+    /// one. For cells that already are a collapsed form of something larger.
+    fn full_transcript(&self) -> bool {
+        false
+    }
 }
 
 impl Renderable for Box<dyn HistoryCell> {
@@ -213,6 +219,9 @@ impl HistoryCell for AgentMessageCell {
 pub(crate) struct AgentMarkdownCell {
     markdown_source: String,
     cwd: PathBuf,
+    /// The layout at the width it was last asked for. A cell is laid out again only when the
+    /// width changes, so replaying a transcript at an unchanged width costs a copy of the rows.
+    layout: std::sync::Mutex<Option<(u16, Vec<Line<'static>>)>>,
 }
 
 impl AgentMarkdownCell {
@@ -220,12 +229,22 @@ impl AgentMarkdownCell {
         Self {
             markdown_source,
             cwd: cwd.to_path_buf(),
+            layout: std::sync::Mutex::new(None),
         }
     }
 }
 
 impl HistoryCell for AgentMarkdownCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut layout = self
+            .layout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((laid_out_width, lines)) = layout.as_ref()
+            && *laid_out_width == width
+        {
+            return lines.clone();
+        }
         let mut lines = Vec::new();
         crate::markdown::append_markdown_with_cwd(
             &self.markdown_source,
@@ -233,7 +252,9 @@ impl HistoryCell for AgentMarkdownCell {
             Some(&self.cwd),
             &mut lines,
         );
-        prefix_lines(lines, "• ".dim(), "  ".into())
+        let lines = prefix_lines(lines, "• ".dim(), "  ".into());
+        *layout = Some((width, lines.clone()));
+        lines
     }
 }
 

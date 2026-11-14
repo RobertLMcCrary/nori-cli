@@ -1162,20 +1162,149 @@ fn proactive_turn_status_bounds_unowned_output_and_owned_prompt_broadcast_render
 ");
 }
 
+fn active_user_message(chat: &ChatWidget) -> Option<String> {
+    chat.active_cell.as_ref().and_then(|cell| {
+        cell.as_any()
+            .downcast_ref::<history_cell::UserHistoryCell>()
+            .map(|cell| cell.message.clone())
+    })
+}
+
 #[tokio::test]
-async fn local_submission_waits_for_the_harness_prompt_broadcast() {
+async fn local_submission_paints_the_prompt_before_the_harness_echo() {
     let session = start_mock_session().await;
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
     chat.harness_handle = Some(session.handle.clone());
+    let generation = chat.session_generation;
 
     chat.submit_user_message_text("render from fan-out".to_string());
 
-    assert!(
-        drain_insert_history(&mut rx).is_empty(),
-        "submitting frontend must not insert its own prompt"
+    assert_eq!(
+        active_user_message(&chat).as_deref(),
+        Some("render from fan-out")
+    );
+    assert!(chat.bottom_pane.is_task_running());
+    assert_eq!(chat.session_stats.user_messages, 1);
+
+    // The harness echo carries the prompt's id and is dropped whatever its chunking or text.
+    let echo = chat
+        .pending_echoes
+        .painted_ids()
+        .next()
+        .cloned()
+        .expect("painted prompt has an echo id");
+    for text in ["render ", "from fan-out", " (rewritten by a hook)"] {
+        chat.handle_session_event(
+            generation,
+            nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                nori_protocol::acp::v1::AgentNotification::SessionNotification(
+                    nori_protocol::acp::v1::SessionNotification::new(
+                        "s",
+                        nori_protocol::acp::v1::SessionUpdate::UserMessageChunk(
+                            nori_protocol::acp::v1::ContentChunk::new(
+                                nori_protocol::acp::v1::ContentBlock::Text(
+                                    nori_protocol::acp::v1::TextContent::new(text),
+                                ),
+                            )
+                            .message_id("echo")
+                            .meta(echo.to_meta()),
+                        ),
+                    ),
+                ),
+            )),
+        );
+    }
+    // The Prompt phase that follows continues the optimistic turn.
+    chat.handle_session_event(
+        generation,
+        nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::SessionPhaseChanged(
+            nori_protocol::SessionPhase::Prompting {
+                request_id: nori_protocol::acp::v1::RequestId::Str("req".to_string()),
+            },
+        )),
     );
 
+    assert_eq!(
+        active_user_message(&chat).as_deref(),
+        Some("render from fan-out")
+    );
+    assert_eq!(chat.session_stats.user_messages, 1);
+    chat.flush_active_cell();
+    let history = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    insta::assert_snapshot!(history, @r"
+› render from fan-out
+");
+
     session.handle.shutdown().await.expect("shutdown session");
+}
+
+#[tokio::test]
+async fn unmatched_user_echo_still_renders_after_a_local_echo() {
+    let session = start_mock_session().await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.harness_handle = Some(session.handle.clone());
+    let generation = chat.session_generation;
+
+    chat.submit_user_message_text("mine".to_string());
+    chat.handle_session_event(
+        generation,
+        replay_text_chunk(
+            crate::presentation::MessageStream::User,
+            "remote",
+            "from someone else",
+        ),
+    );
+    chat.flush_active_cell();
+
+    let history = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    assert!(history.contains("mine"), "{history}");
+    assert!(history.contains("from someone else"), "{history}");
+
+    session.handle.shutdown().await.expect("shutdown session");
+}
+
+#[test]
+fn busy_session_does_not_echo_locally() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane.set_task_running(true);
+    assert!(!chat.can_echo_locally());
+    chat.bottom_pane.set_task_running(false);
+    assert!(chat.can_echo_locally());
+}
+
+#[test]
+fn failed_submission_reverts_the_optimistic_turn_and_keeps_the_prompt() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let echo = chat.pending_echoes.issue();
+    chat.echo_submitted_prompt("will fail", 0, false, echo);
+    assert!(chat.bottom_pane.is_task_running());
+
+    chat.on_prompt_submit_failed("harness gone".to_string());
+
+    assert!(!chat.bottom_pane.is_task_running());
+    assert_eq!(active_user_message(&chat), None);
+    let history = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    assert!(history.contains("will fail"), "{history}");
+    assert!(history.contains("harness gone"), "{history}");
+}
+
+#[test]
+fn prompt_typed_before_the_session_exists_is_painted_at_once() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.submit_user_message_text("early prompt".to_string());
+
+    assert_eq!(active_user_message(&chat).as_deref(), Some("early prompt"));
+    assert!(chat.initial_echo_painted);
+    assert!(chat.initial_user_message.is_some());
 }
 
 #[test]
@@ -1777,6 +1906,7 @@ async fn config_value_selection_reopens_panel_focused_on_edited_option() {
         "Thought Level".to_string(),
         "High".to_string(),
         false,
+        crate::nori::session_config_picker::ConfigPickerOrigin::Panel,
     );
 
     let focus = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1793,6 +1923,42 @@ async fn config_value_selection_reopens_panel_focused_on_edited_option() {
     .expect("the config panel should reopen after a value is chosen");
 
     assert_eq!(focus, Some("thought_level".to_string()));
+}
+
+/// A value chosen from a picker opened for one setting (`/model`) closes it: the `/config` panel
+/// must not appear behind it.
+#[tokio::test]
+async fn model_picker_selection_does_not_open_the_config_panel() {
+    let session = start_mock_session().await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.harness_handle = Some(session.handle.clone());
+
+    chat.set_acp_session_config_option(
+        "thought_level".to_string(),
+        "high".to_string(),
+        "Thought Level".to_string(),
+        "High".to_string(),
+        false,
+        crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Some(AppEvent::AcpSessionConfigSetResult { success, .. }) => {
+                    assert!(success, "the set should succeed against the mock");
+                    break;
+                }
+                Some(AppEvent::OpenAcpSessionConfigPicker { .. }) => {
+                    panic!("a /model selection must not open the /config panel");
+                }
+                Some(_) => continue,
+                None => panic!("event channel closed before the set completed"),
+            }
+        }
+    })
+    .await
+    .expect("the set should complete");
 }
 
 /// Cycling the agent mode via its hotkey performs a real config set but must
@@ -1873,4 +2039,50 @@ fn session_forked_shows_resume_hint_for_previous_conversation() {
         rendered.contains("nori resume 11111111-1111-1111-1111-111111111111"),
         "fork hint should offer a copy-pasteable resume command for the previous conversation, got:\n{rendered}"
     );
+}
+
+fn render_event_sequence(events: Vec<nori_protocol::SessionEvent>) -> (String, String) {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    chat.last_rendered_width.set(Some(40));
+    for event in events {
+        chat.handle_session_event(generation, event);
+    }
+    chat.commit_stream_for_frame();
+    let live = chat
+        .live_tail
+        .as_ref()
+        .map(|cell| lines_to_single_string(&cell.display_lines(40)))
+        .unwrap_or_default();
+    chat.flush_answer_stream_with_separator();
+    chat.flush_active_cell();
+    let history = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    (history, live)
+}
+
+#[test]
+fn conflated_deltas_render_exactly_like_the_originals() {
+    let text = "Intro **bold** words\n\n- one\n- two with `code`\n\n```rust\nlet x = 1;\n```\n\nTail without newline";
+    let mut events = Vec::new();
+    for (index, piece) in text.chars().map(String::from).enumerate() {
+        let stream = if index % 11 == 5 {
+            crate::presentation::MessageStream::Reasoning
+        } else {
+            crate::presentation::MessageStream::Answer
+        };
+        events.push(replay_text_chunk(stream, "m", &piece));
+    }
+    // Cut the sequence at every point so partial lines and open blocks are covered.
+    for cut in (1..events.len()).step_by(7) {
+        let prefix = events[..cut].to_vec();
+        let conflated = super::conflate::conflate(prefix.clone());
+        assert_eq!(
+            render_event_sequence(prefix),
+            render_event_sequence(conflated),
+            "cut at {cut}"
+        );
+    }
 }

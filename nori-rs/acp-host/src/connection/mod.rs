@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 
 pub mod acp_connection;
 mod child_lifecycle;
+mod child_registry;
 pub mod mcp;
 mod wire_log;
 
@@ -24,6 +25,8 @@ pub enum ConnectionEvent {
     SessionClosed,
     /// Private reducer input paired with the preceding raw notification.
     SessionUpdate(acp::SessionUpdate),
+    /// A subagent announcement, decoded from the JSON envelope.
+    Subagent(nori_protocol::SubagentWire),
     DelegatedRequest(DelegatedRequest),
     /// The agent subprocess exited on its own. `status` is the exit code
     /// (`None` when killed by a signal); `stderr_tail` carries the child's

@@ -124,6 +124,9 @@ pub(crate) enum AppEvent {
     UndoSnapshotsLoaded(Vec<nori_harness::UndoSnapshot>),
     GoalLoaded(Option<nori_protocol::ThreadGoal>),
     HarnessActionFailed(String),
+    /// The prompt never reached the harness (encoding an attachment failed or
+    /// the harness is gone). The prompt was already painted optimistically.
+    PromptSubmitFailed(String),
 
     /// Kick off an asynchronous file search for the given query (text after
     /// the `@`). Previous searches may be cancelled by the app layer so there
@@ -162,10 +165,6 @@ pub(crate) enum AppEvent {
         source: String,
         cwd: PathBuf,
     },
-
-    StartCommitAnimation,
-    StopCommitAnimation,
-    CommitTick,
 
     /// Open the confirmation prompt before enabling full access mode.
     OpenFullAccessConfirmation {
@@ -274,6 +273,7 @@ pub(crate) enum AppEvent {
 
     /// Open the value picker for a specific ACP session config option.
     OpenAcpSessionConfigValuePicker {
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
         option: SessionConfigOption,
     },
 
@@ -281,6 +281,7 @@ pub(crate) enum AppEvent {
     OpenCustomModelInput {
         config_id: String,
         option_name: String,
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     },
 
     /// Set an ACP session config option value.
@@ -294,6 +295,8 @@ pub(crate) enum AppEvent {
         /// rejects can still be run by persisting it and restarting with the
         /// model injected at spawn.
         is_custom_model: bool,
+        /// Whether the `/config` panel reopens once the value is set.
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     },
 
     /// Result of setting an ACP session config option.
@@ -554,6 +557,11 @@ pub(crate) enum AppEvent {
         project_id: String,
         /// Session identifier to resume
         session_id: String,
+    },
+
+    /// The transcript of a session being resumed finished loading.
+    ResumeTranscriptLoaded {
+        transcript: Result<Box<nori_harness::transcript::Transcript>, String>,
     },
 
     /// Show the resume session picker sourced from the live agent's ACP

@@ -672,7 +672,10 @@ impl ChatWidget {
             .option_for_category(&nori_protocol::acp::v1::SessionConfigOptionCategory::Model)
             .map(|option| option.raw.clone());
         if let Some(option) = advertised_model {
-            self.open_acp_session_config_value_picker(option);
+            self.open_acp_session_config_value_picker(
+                option,
+                crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
+            );
             return;
         }
 
@@ -685,7 +688,10 @@ impl ChatWidget {
                             == Some(nori_protocol::acp::v1::SessionConfigOptionCategory::Model)
                     });
                     if let Some(option) = model_option {
-                        app_event_tx.send(AppEvent::OpenAcpSessionConfigValuePicker { option });
+                        app_event_tx.send(AppEvent::OpenAcpSessionConfigValuePicker {
+                            option,
+                            origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
+                        });
                         return;
                     }
                 }
@@ -750,6 +756,7 @@ impl ChatWidget {
     pub(crate) fn open_acp_session_config_value_picker(
         &mut self,
         option: nori_protocol::acp::v1::SessionConfigOption,
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     ) {
         let other_models = nori_harness::AgentKind::from_slug(&self.config.active_agent)
             .map(nori_harness::AgentKind::other_models)
@@ -757,14 +764,21 @@ impl ChatWidget {
         let params = crate::nori::session_config_picker::acp_session_config_value_picker_params(
             &option,
             other_models,
+            origin,
         );
         self.bottom_pane.show_selection_view(params);
     }
 
-    pub(crate) fn open_custom_model_input(&mut self, config_id: String, option_name: String) {
+    pub(crate) fn open_custom_model_input(
+        &mut self,
+        config_id: String,
+        option_name: String,
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
+    ) {
         let view = crate::nori::custom_model_input::CustomModelInputView::new(
             config_id,
             option_name,
+            origin,
             self.app_event_tx.clone(),
         );
         self.bottom_pane.show_view(Box::new(view));
@@ -778,6 +792,7 @@ impl ChatWidget {
         option_name: String,
         value_name: String,
         is_custom_model: bool,
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     ) {
         if let Some(handle) = self.harness_handle.clone() {
             let app_event_tx = self.app_event_tx.clone();
@@ -796,13 +811,18 @@ impl ChatWidget {
                                 &config_options,
                             ),
                         });
-                        // Return the user to the session config panel with the
-                        // just-edited option selected, so they can adjust
-                        // several settings without reopening `/config`.
-                        app_event_tx.send(AppEvent::OpenAcpSessionConfigPicker {
-                            config_options: config_options.clone(),
-                            focus_config_id: Some(config_id_for_result.clone()),
-                        });
+                        // A value chosen from the `/config` panel returns to the panel on the
+                        // edited option, so several settings can be changed in a row. A picker
+                        // opened for one setting (`/model`) is done.
+                        match origin {
+                            crate::nori::session_config_picker::ConfigPickerOrigin::Panel => {
+                                app_event_tx.send(AppEvent::OpenAcpSessionConfigPicker {
+                                    config_options: config_options.clone(),
+                                    focus_config_id: Some(config_id_for_result.clone()),
+                                });
+                            }
+                            crate::nori::session_config_picker::ConfigPickerOrigin::Direct => {}
+                        }
                         app_event_tx.send(AppEvent::AcpSessionConfigSetResult {
                             success: true,
                             agent,

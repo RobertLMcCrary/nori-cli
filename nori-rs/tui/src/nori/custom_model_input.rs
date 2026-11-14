@@ -25,16 +25,23 @@ use crate::style::user_message_style;
 pub(crate) struct CustomModelInputView {
     config_id: String,
     option_name: String,
+    origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     input_buffer: String,
     complete: bool,
     app_event_tx: AppEventSender,
 }
 
 impl CustomModelInputView {
-    pub fn new(config_id: String, option_name: String, app_event_tx: AppEventSender) -> Self {
+    pub fn new(
+        config_id: String,
+        option_name: String,
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
+        app_event_tx: AppEventSender,
+    ) -> Self {
         Self {
             config_id,
             option_name,
+            origin,
             input_buffer: String::new(),
             complete: false,
             app_event_tx,
@@ -52,6 +59,7 @@ impl CustomModelInputView {
             option_name: self.option_name.clone(),
             value_name: value,
             is_custom_model: true,
+            origin: self.origin,
         });
         self.complete = true;
     }
@@ -146,7 +154,12 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let sender = AppEventSender::new(tx);
-        let view = CustomModelInputView::new("model".to_string(), "Model".to_string(), sender);
+        let view = CustomModelInputView::new(
+            "model".to_string(),
+            "Model".to_string(),
+            crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
+            sender,
+        );
         (view, rx)
     }
 
@@ -177,6 +190,7 @@ mod tests {
                 option_name,
                 value_name,
                 is_custom_model,
+                ..
             } if config_id == "model"
                 && value == "claude-opus-4-8"
                 && option_name == "Model"

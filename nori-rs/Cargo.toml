@@ -142,10 +142,13 @@ openssl-sys = "*"
 os_info = "3.12.0"
 owo-colors = "4.2.0"
 path-absolutize = "3.1.1"
+gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
+memchr = "2.7.5"
 pathdiff = "0.2"
 portable-pty = "0.9.0"
 predicates = "3"
 pretty_assertions = "1.4.1"
+proptest = "1.7.0"
 pulldown-cmark = "0.10"
 rand = "0.9"
 ratatui = { version = "0.30.2", default-features = false, features = [
@@ -266,6 +269,14 @@ strip = "symbols"
 
 # See https://github.com/openai/codex/issues/1411 for details.
 codegen-units = 1
+
+# Fat-LTO release takes too long to iterate on; this is what the responsiveness
+# probe (scripts/perf/pty_probe.py) is measured against.
+[profile.perf]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = "none"
 
 [profile.ci-test]
 debug = 1         # Reduce debug symbol size

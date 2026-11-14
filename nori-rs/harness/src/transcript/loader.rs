@@ -173,8 +173,6 @@ pub struct TranscriptLoader {
     nori_home: PathBuf,
 }
 
-const TRANSCRIPT_LOAD_PROGRESS_BYTES: usize = 100 * 1024 * 1024;
-
 impl TranscriptLoader {
     /// Create a new TranscriptLoader.
     pub fn new(nori_home: PathBuf) -> Self {
@@ -600,10 +598,12 @@ async fn load_session_info(path: &Path, project_id: &str) -> io::Result<SessionI
 
     // Count entries (approximate - just count lines)
     let read_started = Instant::now();
-    let content = tokio::fs::read_to_string(path).await?;
+    let content = tokio::fs::read(path).await?;
     let read_elapsed_ms = read_started.elapsed().as_millis();
     let count_started = Instant::now();
-    let entry_count = content.lines().count();
+    // Approximate: every line is an entry. A trailing line without a newline counts too.
+    let entry_count = memchr::memchr_iter(b'\n', &content).count()
+        + usize::from(content.last().is_some_and(|last| *last != b'\n'));
     tracing::info!(
         target: "nori_resume",
         phase = "transcript_loader.load_session_info.done",
@@ -768,111 +768,61 @@ fn truncate_preview(content: &str) -> String {
 /// schema changes.
 async fn load_transcript_from_path(path: &Path) -> io::Result<Transcript> {
     let started = Instant::now();
-    let transcript_bytes = tokio::fs::metadata(path)
-        .await
-        .map(|metadata| metadata.len())
-        .ok();
+    let bytes = tokio::fs::read(path).await?;
+    let transcript_bytes = bytes.len();
     tracing::info!(
         target: "nori_resume",
         phase = "transcript_loader.load_transcript.start",
         path = %path.display(),
         transcript_bytes,
+        read_elapsed_ms = started.elapsed().as_millis(),
         "loading full transcript",
     );
 
-    let file = tokio::fs::File::open(path).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
-
-    let mut entries = Vec::new();
-    let mut meta: Option<SessionMetaEntry> = None;
-    let mut line_count = 0usize;
-    let mut skipped_count = 0usize;
-    let mut bytes_seen = 0usize;
-    let mut next_progress_bytes = TRANSCRIPT_LOAD_PROGRESS_BYTES;
-
-    while let Some(line) = lines.next_line().await? {
-        line_count += 1;
-        bytes_seen = bytes_seen.saturating_add(line.len() + 1);
-        if bytes_seen >= next_progress_bytes {
-            tracing::info!(
+    // Parsing is CPU work proportional to the file; it runs off the async workers, on every core.
+    let parsed = tokio::task::spawn_blocking(move || super::parse::parse_transcript(&bytes))
+        .await
+        .map_err(io::Error::other)?;
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(super::parse::ParseFailure::BeforeMeta(error)) => {
+            tracing::warn!(
                 target: "nori_resume",
-                phase = "transcript_loader.load_transcript.progress",
+                phase = "transcript_loader.load_transcript.first_line_error",
                 path = %path.display(),
-                line_count,
-                parsed_entry_count = entries.len(),
-                skipped_count,
-                bytes_seen,
-                transcript_bytes,
                 elapsed_ms = started.elapsed().as_millis(),
-                "still loading full transcript",
+                %error,
+                "failed to parse first transcript line",
             );
-            next_progress_bytes =
-                next_progress_bytes.saturating_add(TRANSCRIPT_LOAD_PROGRESS_BYTES);
+            return Err(io::Error::other(format!(
+                "failed to parse transcript line: {error}"
+            )));
         }
-
-        if line.trim().is_empty() {
-            continue;
+        Err(super::parse::ParseFailure::NoMeta) => {
+            return Err(io::Error::other(
+                "transcript does not contain session metadata",
+            ));
         }
-
-        let parsed: TranscriptLine = match serde_json::from_str(&line) {
-            Ok(entry) => entry,
-            Err(e) => {
-                // The first line must be valid session metadata; fail hard.
-                if meta.is_none() {
-                    tracing::warn!(
-                        target: "nori_resume",
-                        phase = "transcript_loader.load_transcript.first_line_error",
-                        path = %path.display(),
-                        line_count,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        error = %e,
-                        "failed to parse first transcript line",
-                    );
-                    return Err(io::Error::other(format!(
-                        "failed to parse transcript line: {e}"
-                    )));
-                }
-                // Skip unrecognized entries (e.g. removed or future event types).
-                skipped_count += 1;
-                tracing::debug!(
-                    path = %path.display(),
-                    error = %e,
-                    "skipping unrecognized transcript entry",
-                );
-                continue;
-            }
-        };
-
-        // Extract metadata from first entry
-        if meta.is_none()
-            && let TranscriptEntry::SessionMeta(ref m) = parsed.entry
-        {
-            meta = Some(m.clone());
-        }
-
-        entries.push(parsed);
-    }
-
-    let meta =
-        meta.ok_or_else(|| io::Error::other("transcript does not contain session metadata"))?;
+    };
 
     tracing::info!(
         target: "nori_resume",
         phase = "transcript_loader.load_transcript.done",
         path = %path.display(),
-        session_id = %meta.session_id,
-        agent = meta.agent.as_deref().unwrap_or("<unknown>"),
-        line_count,
-        parsed_entry_count = entries.len(),
-        skipped_count,
-        bytes_seen,
+        session_id = %parsed.meta.session_id,
+        agent = parsed.meta.agent.as_deref().unwrap_or("<unknown>"),
+        line_count = parsed.line_count,
+        parsed_entry_count = parsed.entries.len(),
+        skipped_count = parsed.skipped_count,
         transcript_bytes,
         elapsed_ms = started.elapsed().as_millis(),
         "loaded full transcript",
     );
 
-    Ok(Transcript { meta, entries })
+    Ok(Transcript {
+        meta: parsed.meta,
+        entries: parsed.entries,
+    })
 }
 
 #[cfg(test)]

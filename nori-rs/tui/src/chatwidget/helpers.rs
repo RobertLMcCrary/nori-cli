@@ -401,17 +401,50 @@ impl ChatWidget {
         });
     }
 
-    pub(crate) fn submit_prompt(&self, content: Vec<nori_protocol::acp::v1::ContentBlock>) {
+    /// Hand the prompt to the harness from a task, so reading and encoding image
+    /// attachments and waiting for the harness never block the UI.
+    pub(crate) fn submit_prompt(
+        &self,
+        text: String,
+        image_paths: Vec<PathBuf>,
+        echo: nori_protocol::PromptEchoId,
+    ) {
         let Some(handle) = self.harness_handle.clone() else {
-            self.app_event_tx.send(AppEvent::HarnessActionFailed(
+            self.app_event_tx.send(AppEvent::PromptSubmitFailed(
                 "No active harness session".to_string(),
             ));
             return;
         };
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle.prompt(content).await {
-                app_event_tx.send(AppEvent::HarnessActionFailed(error.to_string()));
+            let mut content = Vec::new();
+            if !text.is_empty() {
+                content.push(nori_protocol::acp::v1::ContentBlock::Text(
+                    nori_protocol::acp::v1::TextContent::new(text),
+                ));
+            }
+            if !image_paths.is_empty() {
+                let images = tokio::task::spawn_blocking(move || {
+                    image_paths
+                        .iter()
+                        .map(|path| super::user_input::local_image_content(path))
+                        .collect::<Result<Vec<_>, String>>()
+                })
+                .await;
+                match images {
+                    Ok(Ok(images)) => content.extend(images),
+                    Ok(Err(error)) => {
+                        app_event_tx.send(AppEvent::PromptSubmitFailed(error));
+                        return;
+                    }
+                    Err(error) => {
+                        app_event_tx.send(AppEvent::PromptSubmitFailed(error.to_string()));
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = handle.prompt_echoed(content, &echo).await {
+                app_event_tx.send(AppEvent::PromptSubmitFailed(error.to_string()));
             }
         });
     }
@@ -461,12 +494,26 @@ impl ChatWidget {
     pub(crate) fn clear_token_usage(&mut self) {}
 
     pub(super) fn as_renderable(&self) -> RenderableItem<'_> {
-        let active_cell_renderable = match &self.active_cell {
-            Some(cell) => RenderableItem::Borrowed(cell).inset(Insets::tlbr(1, 0, 0, 0)),
-            None => RenderableItem::Owned(Box::new(())),
+        let active_cell_renderable = if self.active_cell.is_some() {
+            RenderableItem::Borrowed(&self.active_cell).inset(Insets::tlbr(1, 0, 0, 0))
+        } else {
+            RenderableItem::Owned(Box::new(()))
         };
         let mut flex = FlexRenderable::new();
         flex.push(1, active_cell_renderable);
+        if self.live_tail.is_some() {
+            // The first line of a message sits under a blank separator, like its cell in history.
+            let separator = u16::from(self.live_tail_has_header);
+            flex.push(
+                1,
+                RenderableItem::Owned(Box::new(super::layout_cache::Capped {
+                    cell: &self.live_tail,
+                    bottom_pane: &self.bottom_pane,
+                    screen_rows: self.screen_rows.get(),
+                }))
+                .inset(Insets::tlbr(separator, 0, 0, 0)),
+            );
+        }
         // Pinned plan drawer: renders the latest plan state between the active
         // cell and the bottom pane. When no plan has been received yet, the
         // guard on `pinned_plan` being `Some` means the drawer contributes
@@ -493,6 +540,17 @@ impl ChatWidget {
                 }
                 PlanDrawerMode::Off => {}
             }
+        }
+        if self.subagents.has_running() {
+            flex.push(
+                0,
+                RenderableItem::Owned(Box::new(subagents::SubagentBlock {
+                    tree: &self.subagents,
+                    now: std::time::Instant::now(),
+                    screen_rows: self.screen_rows.get(),
+                }))
+                .inset(Insets::tlbr(1, 0, 0, 0)),
+            );
         }
         flex.push(
             0,
@@ -574,5 +632,6 @@ impl ChatWidget {
         if self.should_animate_terminal_title_spinner() {
             self.refresh_terminal_title();
         }
+        self.subagent_pre_draw_tick();
     }
 }

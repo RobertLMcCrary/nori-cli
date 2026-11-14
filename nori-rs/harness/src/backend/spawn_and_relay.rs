@@ -64,6 +64,14 @@ async fn forward_setup_event(
         // The public ACP notification immediately precedes this private
         // reducer projection. Reducer processing starts after setup.
         crate::connection::ConnectionEvent::SessionUpdate(_) => Ok(false),
+        crate::connection::ConnectionEvent::Subagent(wire) => {
+            forward_public_session_events(
+                backend_event_tx,
+                [SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(wire))],
+            )
+            .await?;
+            Ok(false)
+        }
         crate::connection::ConnectionEvent::DelegatedRequest(request) => {
             let _ = request
                 .response_tx
@@ -275,7 +283,7 @@ impl AcpBackend {
             prompt_result_tx: prompt_result_tx.clone(),
             prompt_phase_gate: Arc::new(Mutex::new(None)),
             notify_after_idle: config.notify_after_idle,
-            ghost_snapshots: Arc::new(GhostSnapshotStack::new()),
+            edit_journal: Arc::new(EditJournal::new()),
             is_first_prompt: Arc::new(Mutex::new(true)),
             prompt_summary_enabled: config.prompt_summary_enabled,
             agent_name: config.agent.clone(),
@@ -387,6 +395,7 @@ impl AcpBackend {
         let approval_policy_rx = approval_policy_rx;
         let mut relay_seq = 0_i64;
         let mut suppress_next_session_update = false;
+        let mut child_edits = super::child_edits::ChildEdits::default();
         loop {
             tokio::select! {
                 biased;
@@ -418,8 +427,20 @@ impl AcpBackend {
                                 ))
                                 .await;
                         }
+                        Some(crate::connection::ConnectionEvent::Subagent(wire)) => {
+                            backend.wait_for_prompt_phase().await;
+                            let _ = backend
+                                .backend_event_tx
+                                .send(BackendEvent::Public(SessionEvent::Nori(
+                                    nori_protocol::NoriEvent::Subagent(wire),
+                                )))
+                                .await;
+                        }
                         Some(crate::connection::ConnectionEvent::Acp(event)) => {
                             backend.wait_for_prompt_phase().await;
+                            if let nori_protocol::AcpEvent::ChildNotification(notification) = &*event {
+                                child_edits.observe(notification, &backend.edit_journal, &backend.cwd);
+                            }
                             suppress_next_session_update = if let Some(chunk) =
                                 user_message_chunk(&event)
                             {
@@ -561,6 +582,14 @@ impl AcpBackend {
                         None => {
                             while let Some(event) = event_rx.recv().await {
                                 match event {
+                                    crate::connection::ConnectionEvent::Subagent(wire) => {
+                                        let _ = backend
+                                            .backend_event_tx
+                                            .send(BackendEvent::Public(SessionEvent::Nori(
+                                                nori_protocol::NoriEvent::Subagent(wire),
+                                            )))
+                                            .await;
+                                    }
                                     crate::connection::ConnectionEvent::Acp(event) => {
                                         suppress_next_session_update = if let Some(chunk) =
                                             user_message_chunk(&event)

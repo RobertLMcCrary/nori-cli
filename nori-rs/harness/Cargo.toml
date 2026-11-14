@@ -24,6 +24,7 @@ codex-git = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-utils-string = { workspace = true }
 futures = { workspace = true }
+memchr = { workspace = true }
 nori-protocol = { workspace = true }
 oauth2 = "5"
 serde = { workspace = true, features = ["derive"] }

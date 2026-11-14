@@ -20,6 +20,7 @@ use ratatui::layout::Size;
 /// - getting the cursor position
 pub struct VT100Backend {
     crossterm_backend: CrosstermBackend<vt100::Parser>,
+    recording: Option<Vec<u8>>,
 }
 
 impl VT100Backend {
@@ -27,7 +28,30 @@ impl VT100Backend {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             crossterm_backend: CrosstermBackend::new(vt100::Parser::new(height, width, 0)),
+            recording: None,
         }
+    }
+
+    /// Like [`Self::new`], keeping `scrollback` rows of history that scrolled off the top.
+    pub fn with_scrollback(width: u16, height: u16, scrollback: usize) -> Self {
+        Self {
+            crossterm_backend: CrosstermBackend::new(vt100::Parser::new(height, width, scrollback)),
+            recording: None,
+        }
+    }
+
+    /// Start keeping a copy of every byte written to the backend.
+    pub fn start_recording(&mut self) {
+        self.recording = Some(Vec::new());
+    }
+
+    /// The bytes written since [`Self::start_recording`].
+    pub fn take_recording(&mut self) -> Vec<u8> {
+        self.recording.take().unwrap_or_default()
+    }
+
+    pub fn vt100_mut(&mut self) -> &mut vt100::Parser {
+        self.crossterm_backend.writer_mut()
     }
 
     pub fn vt100(&self) -> &vt100::Parser {
@@ -37,7 +61,11 @@ impl VT100Backend {
 
 impl Write for VT100Backend {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.crossterm_backend.writer_mut().write(buf)
+        let written = self.crossterm_backend.writer_mut().write(buf)?;
+        if let Some(recording) = self.recording.as_mut() {
+            recording.extend_from_slice(&buf[..written]);
+        }
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {

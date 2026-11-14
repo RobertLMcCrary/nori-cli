@@ -34,7 +34,6 @@ use crossterm::style::SetBackgroundColor;
 use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
 use crossterm::terminal::Clear;
-use derive_more::IsVariant;
 use ratatui::backend::Backend;
 use ratatui::backend::ClearType;
 use ratatui::buffer::Buffer;
@@ -151,6 +150,12 @@ where
     /// Last known position of the cursor. Used to find the new area when the viewport is inlined
     /// and the terminal resized.
     pub last_known_cursor_pos: Position,
+    /// The terminal may no longer show the previous buffer, so the next frame repaints every row
+    /// instead of only the rows that changed.
+    repaint_all: bool,
+    /// Rows of history this terminal has been asked to write since the screen was last cleared
+    /// or replayed. Those that are still on screen are the part of it that Nori owns.
+    history_rows_written: usize,
 }
 
 impl<B> Drop for Terminal<B>
@@ -186,6 +191,8 @@ where
             viewport_area: Rect::new(0, cursor_pos.y, 0, 0),
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
+            repaint_all: true,
+            history_rows_written: 0,
         })
     }
 
@@ -198,19 +205,9 @@ where
         }
     }
 
-    /// Gets the current buffer as a reference.
-    fn current_buffer(&self) -> &Buffer {
-        &self.buffers[self.current]
-    }
-
     /// Gets the current buffer as a mutable reference.
     fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current]
-    }
-
-    /// Gets the previous buffer as a reference.
-    fn previous_buffer(&self) -> &Buffer {
-        &self.buffers[1 - self.current]
     }
 
     /// Gets the previous buffer as a mutable reference.
@@ -231,12 +228,19 @@ where
     /// Obtains a difference between the previous and the current buffer and passes it to the
     /// current backend for drawing.
     pub fn flush(&mut self) -> io::Result<()> {
-        let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
-        let last_put_command = updates.iter().rfind(|command| command.is_put());
-        if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
-            self.last_known_cursor_pos = Position { x, y };
+        let repaint_all = std::mem::take(&mut self.repaint_all);
+        let mut sink = TerminalSink::new(&mut self.backend);
+        let last_put = diff_buffers(
+            &self.buffers[1 - self.current],
+            &self.buffers[self.current],
+            repaint_all,
+            &mut sink,
+        )?;
+        sink.finish()?;
+        if let Some(position) = last_put {
+            self.last_known_cursor_pos = position;
         }
-        draw(&mut self.backend, updates.into_iter())
+        Ok(())
     }
 
     /// Updates the Terminal so that internal buffers match the requested area.
@@ -253,6 +257,7 @@ where
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
+        self.repaint_all = true;
     }
 
     /// Queries the backend for size and resizes if it doesn't match the previous size.
@@ -398,6 +403,29 @@ where
         Ok(())
     }
 
+    /// Record that `rows` rows of history were written above the viewport.
+    pub(crate) fn note_history_rows(&mut self, rows: usize) {
+        self.history_rows_written = self.history_rows_written.saturating_add(rows);
+    }
+
+    /// Rows of history above the viewport that this terminal wrote and that are still on screen.
+    pub(crate) fn owned_history_rows(&self) -> usize {
+        self.history_rows_written
+            .min(usize::from(self.viewport_area.top()))
+    }
+
+    /// Forget that any history was written, e.g. after the screen was cleared.
+    pub(crate) fn reset_history_rows(&mut self) {
+        self.history_rows_written = 0;
+    }
+
+    /// The terminal no longer shows what the previous frame drew: the next frame repaints
+    /// every row.
+    pub(crate) fn invalidate(&mut self) {
+        self.previous_buffer_mut().reset();
+        self.repaint_all = true;
+    }
+
     /// Clear the terminal and force a full redraw on the next draw call.
     pub fn clear(&mut self) -> io::Result<()> {
         if self.viewport_area.is_empty() {
@@ -408,6 +436,7 @@ where
         self.backend.clear_region(ClearType::AfterCursor)?;
         // Reset the back buffer to make sure the next update will redraw everything.
         self.previous_buffer_mut().reset();
+        self.repaint_all = true;
         Ok(())
     }
 
@@ -420,6 +449,8 @@ where
         Write::flush(&mut self.backend)?;
         self.last_known_cursor_pos = Position { x: 0, y: 0 };
         self.previous_buffer_mut().reset();
+        self.repaint_all = true;
+        self.history_rows_written = 0;
         Ok(())
     }
 
@@ -438,22 +469,47 @@ where
 use ratatui::buffer::Cell;
 use unicode_width::UnicodeWidthStr;
 
-#[derive(Debug, IsVariant)]
-enum DrawCommand {
-    Put { x: u16, y: u16, cell: Cell },
-    ClearToEnd { x: u16, y: u16, bg: Color },
+/// Where the differences between two frames go.
+trait DiffSink {
+    fn put(&mut self, x: u16, y: u16, cell: &Cell) -> io::Result<()>;
+    fn clear_to_end(&mut self, x: u16, y: u16, bg: Color) -> io::Result<()>;
 }
 
-fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
+/// Display width of one buffer cell's symbol. Nearly every cell is a single ASCII character, which
+/// is one column; only the rest needs the Unicode tables.
+fn symbol_width(symbol: &str) -> usize {
+    match symbol.as_bytes() {
+        [byte] if (0x20..0x7f).contains(byte) => 1,
+        _ => symbol.width(),
+    }
+}
+
+/// Send the differences between `a` (what the terminal shows) and `b` (the frame to show) to
+/// `sink`, row by row. A row that did not change is skipped without looking at its cells, unless
+/// `repaint_all` says the terminal can no longer be trusted to show `a`.
+///
+/// Returns the position of the last cell that was put.
+fn diff_buffers(
+    a: &Buffer,
+    b: &Buffer,
+    repaint_all: bool,
+    sink: &mut impl DiffSink,
+) -> io::Result<Option<Position>> {
+    let width = a.area.width as usize;
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
+    let mut last_put = None;
+    if width == 0 {
+        return Ok(None);
+    }
 
-    let mut updates = vec![];
-    let mut last_nonblank_columns = vec![0; a.area.height as usize];
     for y in 0..a.area.height {
-        let row_start = y as usize * a.area.width as usize;
-        let row_end = row_start + a.area.width as usize;
-        let row = &next_buffer[row_start..row_end];
+        let row_start = y as usize * width;
+        let previous_row = &previous_buffer[row_start..row_start + width];
+        let row = &next_buffer[row_start..row_start + width];
+        if !repaint_all && previous_row == row {
+            continue;
+        }
         let bg = row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
 
         // Scan the row to find the rightmost column that still matters: any non-space glyph,
@@ -465,110 +521,124 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
         let mut column = 0usize;
         while column < row.len() {
             let cell = &row[column];
-            let width = cell.symbol().width();
+            let cell_width = symbol_width(cell.symbol());
             if cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
-                last_nonblank_column = column + (width.saturating_sub(1));
+                last_nonblank_column = column + (cell_width.saturating_sub(1));
             }
-            column += width.max(1); // treat zero-width symbols as width 1
+            column += cell_width.max(1); // treat zero-width symbols as width 1
         }
 
         if last_nonblank_column + 1 < row.len() {
             let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
-            updates.push(DrawCommand::ClearToEnd { x, y, bg });
+            sink.clear_to_end(x, y, bg)?;
         }
 
-        last_nonblank_columns[y as usize] = last_nonblank_column as u16;
-    }
-
-    // Cells invalidated by drawing/replacing preceding multi-width characters:
-    let mut invalidated: usize = 0;
-    // Cells from the current buffer to skip due to preceding multi-width characters taking
-    // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
-    let mut to_skip: usize = 0;
-    for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-        if !matches!(current.diff_option, CellDiffOption::Skip)
-            && (current != previous || invalidated > 0)
-            && to_skip == 0
-        {
-            let (x, y) = a.pos_of(i);
-            let row = i / a.area.width as usize;
-            if x <= last_nonblank_columns[row] {
-                updates.push(DrawCommand::Put {
-                    x,
-                    y,
-                    cell: next_buffer[i].clone(),
-                });
+        // Cells invalidated by drawing/replacing preceding multi-width characters:
+        let mut invalidated: usize = 0;
+        // Cells from the current buffer to skip due to preceding multi-width characters taking
+        // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
+        let mut to_skip: usize = 0;
+        for (column, (current, previous)) in row.iter().zip(previous_row.iter()).enumerate() {
+            if !matches!(current.diff_option, CellDiffOption::Skip)
+                && (current != previous || invalidated > 0)
+                && to_skip == 0
+                && column <= last_nonblank_column
+            {
+                let (x, y) = a.pos_of(row_start + column);
+                sink.put(x, y, current)?;
+                last_put = Some(Position { x, y });
             }
+
+            let current_width = symbol_width(current.symbol());
+            to_skip = current_width.saturating_sub(1);
+
+            let affected_width = std::cmp::max(current_width, symbol_width(previous.symbol()));
+            invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
         }
-
-        to_skip = current.symbol().width().saturating_sub(1);
-
-        let affected_width = std::cmp::max(current.symbol().width(), previous.symbol().width());
-        invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
     }
-    updates
+    Ok(last_put)
 }
 
-fn draw<I>(writer: &mut impl Write, commands: I) -> io::Result<()>
-where
-    I: Iterator<Item = DrawCommand>,
-{
-    let mut fg = Color::Reset;
-    let mut bg = Color::Reset;
-    let mut modifier = Modifier::empty();
-    let mut last_pos: Option<Position> = None;
-    for command in commands {
-        let (x, y) = match command {
-            DrawCommand::Put { x, y, .. } => (x, y),
-            DrawCommand::ClearToEnd { x, y, .. } => (x, y),
-        };
-        // Move the cursor if the previous location was not (x - 1, y)
-        if !matches!(last_pos, Some(p) if x == p.x + 1 && y == p.y) {
-            queue!(writer, MoveTo(x, y))?;
-        }
-        last_pos = Some(Position { x, y });
-        match command {
-            DrawCommand::Put { cell, .. } => {
-                if cell.modifier != modifier {
-                    let diff = ModifierDiff {
-                        from: modifier,
-                        to: cell.modifier,
-                    };
-                    diff.queue(writer)?;
-                    modifier = cell.modifier;
-                }
-                if cell.fg != fg || cell.bg != bg {
-                    queue!(
-                        writer,
-                        SetColors(Colors::new(
-                            crossterm_color(cell.fg),
-                            crossterm_color(cell.bg)
-                        ))
-                    )?;
-                    fg = cell.fg;
-                    bg = cell.bg;
-                }
+/// Writes diff commands as terminal escape sequences, moving the cursor only when the next cell
+/// is not right after the previous one.
+struct TerminalSink<'w, W: Write> {
+    writer: &'w mut W,
+    fg: Color,
+    bg: Color,
+    modifier: Modifier,
+    last_pos: Option<Position>,
+}
 
-                queue!(writer, Print(cell.symbol()))?;
-            }
-            DrawCommand::ClearToEnd { bg: clear_bg, .. } => {
-                queue!(writer, SetAttribute(crossterm::style::Attribute::Reset))?;
-                modifier = Modifier::empty();
-                queue!(writer, SetBackgroundColor(crossterm_color(clear_bg)))?;
-                bg = clear_bg;
-                queue!(writer, Clear(crossterm::terminal::ClearType::UntilNewLine))?;
-            }
+impl<'w, W: Write> TerminalSink<'w, W> {
+    fn new(writer: &'w mut W) -> Self {
+        Self {
+            writer,
+            fg: Color::Reset,
+            bg: Color::Reset,
+            modifier: Modifier::empty(),
+            last_pos: None,
         }
     }
 
-    queue!(
-        writer,
-        SetForegroundColor(crossterm::style::Color::Reset),
-        SetBackgroundColor(crossterm::style::Color::Reset),
-        SetAttribute(crossterm::style::Attribute::Reset),
-    )?;
+    fn move_to(&mut self, x: u16, y: u16) -> io::Result<()> {
+        // Move the cursor if the previous location was not (x - 1, y)
+        if !matches!(self.last_pos, Some(p) if x == p.x + 1 && y == p.y) {
+            queue!(self.writer, MoveTo(x, y))?;
+        }
+        self.last_pos = Some(Position { x, y });
+        Ok(())
+    }
 
-    Ok(())
+    /// Reset colors and attributes, as the end of a frame requires.
+    fn finish(self) -> io::Result<()> {
+        queue!(
+            self.writer,
+            SetForegroundColor(crossterm::style::Color::Reset),
+            SetBackgroundColor(crossterm::style::Color::Reset),
+            SetAttribute(crossterm::style::Attribute::Reset),
+        )
+    }
+}
+
+impl<W: Write> DiffSink for TerminalSink<'_, W> {
+    fn put(&mut self, x: u16, y: u16, cell: &Cell) -> io::Result<()> {
+        self.move_to(x, y)?;
+        if cell.modifier != self.modifier {
+            let diff = ModifierDiff {
+                from: self.modifier,
+                to: cell.modifier,
+            };
+            diff.queue(self.writer)?;
+            self.modifier = cell.modifier;
+        }
+        if cell.fg != self.fg || cell.bg != self.bg {
+            queue!(
+                self.writer,
+                SetColors(Colors::new(
+                    crossterm_color(cell.fg),
+                    crossterm_color(cell.bg)
+                ))
+            )?;
+            self.fg = cell.fg;
+            self.bg = cell.bg;
+        }
+        queue!(self.writer, Print(cell.symbol()))
+    }
+
+    fn clear_to_end(&mut self, x: u16, y: u16, bg: Color) -> io::Result<()> {
+        self.move_to(x, y)?;
+        queue!(
+            self.writer,
+            SetAttribute(crossterm::style::Attribute::Reset)
+        )?;
+        self.modifier = Modifier::empty();
+        queue!(self.writer, SetBackgroundColor(crossterm_color(bg)))?;
+        self.bg = bg;
+        queue!(
+            self.writer,
+            Clear(crossterm::terminal::ClearType::UntilNewLine)
+        )
+    }
 }
 
 /// The `ModifierDiff` struct is used to calculate the difference between two `Modifier`
@@ -746,6 +816,30 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    enum DrawCommand {
+        Put { x: u16, y: u16 },
+        ClearToEnd { x: u16, y: u16 },
+    }
+
+    impl DiffSink for Vec<DrawCommand> {
+        fn put(&mut self, x: u16, y: u16, _cell: &Cell) -> io::Result<()> {
+            self.push(DrawCommand::Put { x, y });
+            Ok(())
+        }
+
+        fn clear_to_end(&mut self, x: u16, y: u16, _bg: Color) -> io::Result<()> {
+            self.push(DrawCommand::ClearToEnd { x, y });
+            Ok(())
+        }
+    }
+
+    fn diff_commands(previous: &Buffer, next: &Buffer, repaint_all: bool) -> Vec<DrawCommand> {
+        let mut commands = Vec::new();
+        diff_buffers(previous, next, repaint_all, &mut commands).expect("diff");
+        commands
+    }
+
     #[test]
     fn diff_buffers_does_not_emit_clear_to_end_for_full_width_row() {
         let area = Rect::new(0, 0, 3, 2);
@@ -756,7 +850,7 @@ mod tests {
             .expect("cell should exist")
             .set_symbol("X");
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_commands(&previous, &next, false);
 
         let clear_count = commands
             .iter()
@@ -783,7 +877,7 @@ mod tests {
         previous.set_string(0, 0, "中文", Style::default());
         next.set_string(0, 0, "中", Style::default());
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_commands(&previous, &next, false);
         assert!(
             commands
                 .iter()
@@ -803,7 +897,7 @@ mod tests {
             .expect("clear terminal");
         crate::insert_history::insert_history_lines(
             &mut terminal,
-            vec![ratatui::text::Line::from("history after clear")],
+            &[ratatui::text::Line::from("history after clear")],
         )
         .expect("insert history");
 
@@ -813,5 +907,66 @@ mod tests {
             .expect("ordered resize-reflow clear sequence");
         let history = output.find("history after clear").expect("history bytes");
         assert!(clear < history);
+    }
+}
+
+#[cfg(test)]
+mod row_skip_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use ratatui::style::Style;
+
+    struct CountingSink {
+        puts: usize,
+        clears: usize,
+    }
+
+    impl DiffSink for CountingSink {
+        fn put(&mut self, _x: u16, _y: u16, _cell: &Cell) -> io::Result<()> {
+            self.puts += 1;
+            Ok(())
+        }
+
+        fn clear_to_end(&mut self, _x: u16, _y: u16, _bg: Color) -> io::Result<()> {
+            self.clears += 1;
+            Ok(())
+        }
+    }
+
+    fn diff(previous: &Buffer, next: &Buffer, repaint_all: bool) -> (usize, usize) {
+        let mut sink = CountingSink { puts: 0, clears: 0 };
+        diff_buffers(previous, next, repaint_all, &mut sink).expect("diff");
+        (sink.puts, sink.clears)
+    }
+
+    #[test]
+    fn identical_frames_emit_nothing() {
+        let area = Rect::new(0, 0, 20, 4);
+        let mut frame = Buffer::empty(area);
+        frame.set_string(0, 1, "stable row", Style::default());
+        assert_eq!(diff(&frame.clone(), &frame, false), (0, 0));
+    }
+
+    #[test]
+    fn only_the_changed_row_is_visited() {
+        let area = Rect::new(0, 0, 20, 4);
+        let mut previous = Buffer::empty(area);
+        previous.set_string(0, 0, "unchanged", Style::default());
+        previous.set_string(0, 2, "before", Style::default());
+        let mut next = previous.clone();
+        next.set_string(0, 2, "after!", Style::default());
+
+        // Five cells of the changed row differ (the sixth, `r`, is the same) and its trailing
+        // clear; the other rows cost nothing.
+        assert_eq!(diff(&previous, &next, false), (5, 1));
+    }
+
+    #[test]
+    fn repaint_all_visits_unchanged_rows_for_their_trailing_clear() {
+        let area = Rect::new(0, 0, 20, 2);
+        let mut frame = Buffer::empty(area);
+        frame.set_string(0, 0, "x", Style::default());
+        let (_, clears) = diff(&frame.clone(), &frame, true);
+        assert_eq!(clears, 2);
     }
 }

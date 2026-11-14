@@ -254,6 +254,16 @@ impl HarnessHandle {
         self.prompt_with_meta(content, None).await
     }
 
+    /// Submit a prompt whose user-message echo carries `echo`, so a client that already shows the
+    /// prompt can recognize the echo by id.
+    pub async fn prompt_echoed(
+        &self,
+        content: Vec<acp::v1::ContentBlock>,
+        echo: &nori_protocol::PromptEchoId,
+    ) -> anyhow::Result<acp::v1::RequestId> {
+        self.prompt_with_meta(content, Some(echo.to_meta())).await
+    }
+
     pub(crate) async fn prompt_with_meta(
         &self,
         content: Vec<acp::v1::ContentBlock>,
@@ -688,6 +698,7 @@ fn build_backend_config(spec: AgentPrepareSpec) -> AcpBackendConfig {
         auto_worktree,
         auto_worktree_repo_root,
         prompt_summary_enabled: config.footer_segment_config.prompt_summary,
+        subagent_sessions: config.subagent_sessions,
         session_start_hooks: config.session_start_hooks.clone(),
         session_end_hooks: config.session_end_hooks.clone(),
         pre_user_prompt_hooks: config.pre_user_prompt_hooks.clone(),

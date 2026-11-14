@@ -482,6 +482,30 @@ cells (`Arc<RwLock<…>>`); the fork swaps both to the child before emitting
 the recorder cell per event rather than capturing it once, so post-fork entries
 record into the child and never corrupt the frozen parent.
 
+#### Undo, subagents, and resume
+
+`/undo` restores from an `EditJournal` (`harness/src/undo.rs`) instead of git
+snapshots: per turn it records, for every file edit the agent reports as an
+ACP diff, what the file held before. Nothing runs on the submit path, and a
+missing original is read by a background task. Restoring unwinds newest
+first and skips a file that changed since. Edits the agent makes without
+reporting a diff, such as through shell commands, cannot be undone, and the
+undo result says so when the turn ran commands.
+
+`initialize` advertises `clientCapabilities.subagents` unless
+`subagent_sessions = false`. The connection recognizes `subagent_update`,
+`subagent_spawned`, `subagent_state_update` and `session_message[_chunk]`
+before the typed parser (`nori_protocol::parse_subagent_update`), routes a
+child's updates as `AcpEvent::ChildNotification`, and holds a bounded number
+of updates for a session until its announcement arrives. A child's file diffs
+are recorded in the root turn's journal.
+
+Resuming with the local transcript at hand prefers `session/resume`, which
+costs the same however long the session is, and paints the history from the
+transcript; `session/load` is used when there is no transcript. Transcripts
+are read in one pass, split with `memchr`, and parsed on every core
+(`transcript/parse.rs`), with the same rules for unparseable lines as before.
+
 #### Private reduction and transcripts
 
 ACP update reduction in `harness/src/normalized/` is private implementation

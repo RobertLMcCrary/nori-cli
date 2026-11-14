@@ -288,6 +288,10 @@ pub struct NoriConfigToml {
     /// External notifier command and arguments.
     pub notify: Option<Vec<String>>,
 
+    /// Tell agents that nori shows subagent sessions (`clientCapabilities.subagents`).
+    /// Turn this off for an adapter that misbehaves when it is advertised. Default: true.
+    pub subagent_sessions: Option<bool>,
+
     /// ACP wire proxy logging settings
     #[serde(default)]
     pub acp_proxy: AcpProxyConfigToml,
@@ -815,6 +819,8 @@ pub enum HotkeyAction {
     HistorySearch,
     /// Toggle the pinned plan drawer between collapsed and expanded.
     TogglePlanDrawer,
+    /// Repaint the visible screen from Nori's own model, leaving scrollback alone.
+    Redraw,
 }
 
 impl HotkeyAction {
@@ -837,6 +843,7 @@ impl HotkeyAction {
             Self::Yank => "Yank",
             Self::HistorySearch => "History Search",
             Self::TogglePlanDrawer => "Toggle Plan Drawer",
+            Self::Redraw => "Redraw Screen",
         }
     }
 
@@ -861,6 +868,7 @@ impl HotkeyAction {
             Self::TogglePlanDrawer => {
                 "Toggle the pinned plan drawer between collapsed and expanded"
             }
+            Self::Redraw => "Repaint the visible screen without touching scrollback",
         }
     }
 
@@ -883,6 +891,7 @@ impl HotkeyAction {
             Self::Yank => "yank",
             Self::HistorySearch => "history_search",
             Self::TogglePlanDrawer => "toggle_plan_drawer",
+            Self::Redraw => "redraw",
         }
     }
 
@@ -905,6 +914,7 @@ impl HotkeyAction {
             Self::Yank => "ctrl+y",
             Self::HistorySearch => "ctrl+r",
             Self::TogglePlanDrawer => "ctrl+o",
+            Self::Redraw => "ctrl+l",
         }
     }
 
@@ -927,6 +937,7 @@ impl HotkeyAction {
             Self::Yank,
             Self::HistorySearch,
             Self::TogglePlanDrawer,
+            Self::Redraw,
         ]
     }
 }
@@ -1046,6 +1057,8 @@ pub struct HotkeyConfigToml {
     pub history_search: Option<HotkeyBinding>,
     /// Hotkey for toggling the pinned plan drawer.
     pub toggle_plan_drawer: Option<HotkeyBinding>,
+    /// Hotkey for repainting the screen.
+    pub redraw: Option<HotkeyBinding>,
 }
 
 /// Resolved hotkey configuration with defaults applied.
@@ -1083,6 +1096,8 @@ pub struct HotkeyConfig {
     pub history_search: HotkeyBinding,
     /// Hotkey for toggling the pinned plan drawer.
     pub toggle_plan_drawer: HotkeyBinding,
+    /// Hotkey for repainting the screen.
+    pub redraw: HotkeyBinding,
 }
 
 impl Default for HotkeyConfig {
@@ -1130,6 +1145,7 @@ impl Default for HotkeyConfig {
             toggle_plan_drawer: HotkeyBinding::from_str(
                 HotkeyAction::TogglePlanDrawer.default_binding(),
             ),
+            redraw: HotkeyBinding::from_str(HotkeyAction::Redraw.default_binding()),
         }
     }
 }
@@ -1197,6 +1213,7 @@ impl HotkeyConfig {
                 .toggle_plan_drawer
                 .clone()
                 .unwrap_or(defaults.toggle_plan_drawer),
+            redraw: toml.redraw.clone().unwrap_or(defaults.redraw),
         }
     }
 
@@ -1219,6 +1236,7 @@ impl HotkeyConfig {
             HotkeyAction::Yank => &self.yank,
             HotkeyAction::HistorySearch => &self.history_search,
             HotkeyAction::TogglePlanDrawer => &self.toggle_plan_drawer,
+            HotkeyAction::Redraw => &self.redraw,
         }
     }
 
@@ -1241,6 +1259,7 @@ impl HotkeyConfig {
             HotkeyAction::Yank => self.yank = binding,
             HotkeyAction::HistorySearch => self.history_search = binding,
             HotkeyAction::TogglePlanDrawer => self.toggle_plan_drawer = binding,
+            HotkeyAction::Redraw => self.redraw = binding,
         }
     }
 
@@ -1269,6 +1288,7 @@ impl HotkeyConfig {
             (HotkeyAction::Yank, &self.yank),
             (HotkeyAction::HistorySearch, &self.history_search),
             (HotkeyAction::TogglePlanDrawer, &self.toggle_plan_drawer),
+            (HotkeyAction::Redraw, &self.redraw),
         ]
     }
 }
@@ -2093,6 +2113,9 @@ pub struct NoriConfig {
     /// External notifier command and arguments.
     pub notify: Option<Vec<String>>,
 
+    /// Advertise subagent support to agents during `initialize`.
+    pub subagent_sessions: bool,
+
     /// ACP wire proxy logging settings.
     pub acp_proxy: AcpProxyConfig,
 
@@ -2240,6 +2263,7 @@ impl Default for NoriConfig {
             history_persistence: HistoryPersistence::default(),
             browser_profile: BrowserProfileMode::default(),
             notify: None,
+            subagent_sessions: true,
             acp_proxy: AcpProxyConfig {
                 enabled: false,
                 log_dir: PathBuf::from(".nori/cli/acp-wire"),
