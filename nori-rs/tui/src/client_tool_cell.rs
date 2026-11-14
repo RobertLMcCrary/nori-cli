@@ -389,7 +389,7 @@ impl ClientToolCell {
             .artifacts
             .iter()
             .find_map(|artifact| match artifact {
-                crate::presentation::Artifact::Text { text } => {
+                crate::presentation::Artifact::Text { text, .. } => {
                     crate::presentation::delegation_outcome(text)
                 }
                 crate::presentation::Artifact::Diff(_) => None,
@@ -400,7 +400,8 @@ impl ClientToolCell {
         lines
     }
 
-    fn render_generic_lines(&self) -> Vec<Line<'static>> {
+    /// `full` shows declared markdown whole, as the transcript does; otherwise its first rows.
+    fn render_generic_lines(&self, width: u16, full: bool) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let bullet = if self.is_active() {
             spinner(self.start_time, self.animations_enabled)
@@ -437,7 +438,8 @@ impl ClientToolCell {
             details.push(error_text);
         }
 
-        if details.is_empty() {
+        let markdown = self.markdown_artifact_lines(width, full);
+        if details.is_empty() && markdown.is_empty() {
             if is_failed {
                 // For failed tools with absolutely no detail, show "(failed)" fallback
                 details.push("(failed)".to_string());
@@ -449,11 +451,56 @@ impl ClientToolCell {
             }
         }
 
+        let has_details = !details.is_empty();
         for (idx, detail) in details.into_iter().enumerate() {
             let prefix = if idx == 0 { "  └ " } else { "    " };
             lines.push(Line::from(vec![prefix.dim(), detail.dim()]));
         }
+        for (idx, line) in markdown.into_iter().enumerate() {
+            let prefix = if idx == 0 && !has_details {
+                "  └ "
+            } else {
+                "    "
+            };
+            let mut spans = vec![prefix.dim()];
+            spans.extend(line.spans);
+            lines.push(Line::from(spans));
+        }
 
+        lines
+    }
+
+    /// The tool's declared-markdown output, rendered: whole when `full`, else its first rows
+    /// and a note of how many more there are.
+    fn markdown_artifact_lines(&self, width: u16, full: bool) -> Vec<Line<'static>> {
+        const PREVIEW_ROWS: usize = 12;
+        let mut lines = Vec::new();
+        for artifact in &self.snapshot.artifacts {
+            let crate::presentation::Artifact::Text {
+                text,
+                format: crate::presentation::TextFormat::Markdown,
+            } = artifact
+            else {
+                continue;
+            };
+            let rendered = crate::markdown_render::render_markdown_text_with_width(
+                text,
+                Some(usize::from(width).saturating_sub(4).max(1)),
+            )
+            .lines;
+            let shown = if full {
+                rendered.len()
+            } else {
+                rendered.len().min(PREVIEW_ROWS)
+            };
+            let hidden = rendered.len() - shown;
+            lines.extend(rendered.into_iter().take(shown));
+            if hidden > 0 {
+                lines.push(Line::from(
+                    format!("… {hidden} more lines (ctrl+t for the full transcript)").dim(),
+                ));
+            }
+        }
         lines
     }
 
@@ -672,7 +719,7 @@ fn execute_output_text(snapshot: &crate::presentation::ToolSnapshot) -> Option<S
     // not stdout.
     if !is_active_phase(&snapshot.phase) {
         for artifact in &snapshot.artifacts {
-            if let crate::presentation::Artifact::Text { text } = artifact
+            if let crate::presentation::Artifact::Text { text, .. } = artifact
                 && !text.is_empty()
             {
                 return Some(strip_code_fences(text));
@@ -842,7 +889,7 @@ impl HistoryCell for ClientToolCell {
         ) {
             self.render_edit_lines(width)
         } else {
-            self.render_generic_lines()
+            self.render_generic_lines(width, false)
         }
     }
 
@@ -862,7 +909,7 @@ impl HistoryCell for ClientToolCell {
         ) {
             self.render_edit_lines(width)
         } else {
-            self.render_generic_lines()
+            self.render_generic_lines(width, true)
         }
     }
 }
@@ -958,6 +1005,7 @@ mod tests {
             "date --utc",
             vec![Artifact::Text {
                 text: "2026-03-30 05:45:34 UTC".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             Some(serde_json::json!({"exit_code": 0, "stdout": "2026-03-30 05:45:34 UTC"})),
         );
@@ -997,6 +1045,7 @@ mod tests {
             "cargo test",
             vec![Artifact::Text {
                 text: "error[E0308]: mismatched types".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             Some(serde_json::json!({"exit_code": 1, "stdout": "error[E0308]: mismatched types"})),
         );
@@ -1037,6 +1086,7 @@ mod tests {
             "cat big_file.txt",
             vec![Artifact::Text {
                 text: long_output.clone(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             Some(serde_json::json!({"exit_code": 0, "stdout": long_output})),
         );
@@ -1058,6 +1108,49 @@ mod tests {
         );
     }
 
+    /// Output a tool declares as markdown is rendered as markdown: no raw syntax, and only its
+    /// first rows until the transcript shows it all.
+    #[test]
+    fn declared_markdown_output_is_rendered() {
+        let body = std::iter::once("# Findings\n\n- **one** `a.rs`\n- two".to_owned())
+            .chain((0..20).map(|n| format!("\nline {n}")))
+            .collect::<String>();
+        let snapshot = ToolSnapshot {
+            call_id: "call-md".into(),
+            title: "Read report".into(),
+            kind: ToolKind::Fetch,
+            phase: ToolPhase::Completed,
+            locations: vec![],
+            invocation: None,
+            artifacts: vec![Artifact::Text {
+                text: body,
+                format: crate::presentation::TextFormat::Markdown,
+            }],
+            raw_input: None,
+            raw_output: None,
+            owner_request_id: None,
+        };
+        let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
+        let collapsed = render_lines(&cell.display_lines(80)).join("\n");
+        assert!(collapsed.contains("Findings"), "{collapsed}");
+        assert!(collapsed.contains("one a.rs"), "{collapsed}");
+        // Headings keep their marker, as the markdown renderer draws them; emphasis and code do
+        // not show their syntax.
+        assert!(
+            !collapsed.contains("**") && !collapsed.contains('`'),
+            "{collapsed}"
+        );
+        assert!(
+            collapsed.contains("more lines (ctrl+t for the full transcript)"),
+            "{collapsed}"
+        );
+        let full = render_lines(&cell.transcript_lines(80)).join("\n");
+        assert!(
+            full.contains("line 19") && !full.contains("more lines"),
+            "{full}"
+        );
+    }
+
     #[test]
     fn non_execute_non_exploring_tool_uses_generic_rendering() {
         // Fetch is not an exploring tool kind, so it should use generic rendering
@@ -1073,6 +1166,7 @@ mod tests {
             }),
             artifacts: vec![Artifact::Text {
                 text: "200 OK".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -1096,6 +1190,7 @@ mod tests {
             "uptime -p",
             vec![Artifact::Text {
                 text: "```console\nup 1 day, 20 hours\n```".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             Some(serde_json::json!({"exit_code": 0, "stdout": "up 1 day, 20 hours"})),
         );
@@ -1116,7 +1211,10 @@ mod tests {
         let snapshot = make_execute_snapshot(
             ToolPhase::Completed,
             "echo ok",
-            vec![Artifact::Text { text: "ok".into() }],
+            vec![Artifact::Text {
+                text: "ok".into(),
+                format: crate::presentation::TextFormat::Plain,
+            }],
             Some(serde_json::json!({"exit_code": 0, "stdout": "ok"})),
         );
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
@@ -1227,6 +1325,7 @@ mod tests {
             }),
             artifacts: vec![Artifact::Text {
                 text: "```rust\nfn main() {}\n```".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -1258,6 +1357,7 @@ mod tests {
             invocation: None,
             artifacts: vec![Artifact::Text {
                 text: "200 OK".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -1292,6 +1392,7 @@ mod tests {
             }),
             artifacts: vec![Artifact::Text {
                 text: "line one\nline two\nline three".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -1326,6 +1427,7 @@ mod tests {
             }),
             artifacts: vec![Artifact::Text {
                 text: "# README".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -1364,6 +1466,7 @@ mod tests {
             }),
             artifacts: vec![Artifact::Text {
                 text: "fn main() {}".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -1401,6 +1504,7 @@ mod tests {
             }),
             artifacts: vec![Artifact::Text {
                 text: "found 3 results".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -1427,6 +1531,7 @@ mod tests {
             "cat /home/user/project/README.md",
             vec![Artifact::Text {
                 text: "# Readme".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             Some(serde_json::json!({"exit_code": 0, "stdout": "# Readme"})),
         );
@@ -1504,6 +1609,7 @@ mod tests {
             }),
             artifacts: vec![Artifact::Text {
                 text: "# Title\nSome content".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -1651,6 +1757,7 @@ mod tests {
             "date --utc +\"%Y-%m-%d %H:%M:%S %Z\"",
             vec![Artifact::Text {
                 text: "Print current UTC date/time with format flags".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             None, // no raw_output yet (in-progress)
         );
@@ -1907,6 +2014,7 @@ mod tests {
             invocation: None,
             artifacts: vec![Artifact::Text {
                 text: "200 OK".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             raw_input: None,
             raw_output: None,
@@ -2459,6 +2567,7 @@ mod tests {
             "date --utc",
             vec![Artifact::Text {
                 text: "2026-03-30".into(),
+                format: crate::presentation::TextFormat::Plain,
             }],
             Some(serde_json::json!({"exit_code": 0, "stdout": "2026-03-30"})),
         );

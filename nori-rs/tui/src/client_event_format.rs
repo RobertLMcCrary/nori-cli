@@ -141,8 +141,13 @@ pub(crate) fn format_artifacts(artifacts: &[crate::presentation::Artifact]) -> V
         .iter()
         .filter_map(|artifact| match artifact {
             crate::presentation::Artifact::Diff(_) => None,
-            crate::presentation::Artifact::Text { text } if text.is_empty() => None,
-            crate::presentation::Artifact::Text { text } => {
+            crate::presentation::Artifact::Text { text, .. } if text.is_empty() => None,
+            // Markdown is rendered by the cell that shows it, not flattened to lines here.
+            crate::presentation::Artifact::Text {
+                format: crate::presentation::TextFormat::Markdown,
+                ..
+            } => None,
+            crate::presentation::Artifact::Text { text, .. } => {
                 let cleaned = strip_code_fences(text);
                 if cleaned.is_empty() {
                     return None;

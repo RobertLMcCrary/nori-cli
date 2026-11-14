@@ -391,6 +391,7 @@ mod nori_client_context;
 mod nori_client_mcp;
 pub(crate) mod orchestrator;
 pub use nori_client_mcp::set_stdio_bridge;
+pub use orchestrator::refresh_agent_catalog;
 pub mod prepared;
 mod session;
 mod session_defaults;

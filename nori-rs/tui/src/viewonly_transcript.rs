@@ -382,11 +382,11 @@ fn format_artifacts(artifacts: &[crate::presentation::Artifact]) -> Vec<String> 
         .iter()
         .filter_map(|artifact| match artifact {
             crate::presentation::Artifact::Diff(_) => None,
-            crate::presentation::Artifact::Text { text } if text.is_empty() => None,
-            crate::presentation::Artifact::Text { text } if text.contains('\n') => {
+            crate::presentation::Artifact::Text { text, .. } if text.is_empty() => None,
+            crate::presentation::Artifact::Text { text, .. } if text.contains('\n') => {
                 Some(format!("Output:\n{text}"))
             }
-            crate::presentation::Artifact::Text { text } => Some(format!("Output: {text}")),
+            crate::presentation::Artifact::Text { text, .. } => Some(format!("Output: {text}")),
         })
         .collect()
 }

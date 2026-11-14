@@ -110,6 +110,9 @@ pub(super) struct AgentEntry {
     /// Models the agent offered when Nori last ran it; empty when it has not run yet. Any model
     /// it offers can be passed; an unknown one fails with the list.
     pub(super) models: Vec<ModelEntry>,
+    /// How long ago, in seconds, Nori last read what the agent offers; absent when it never has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) read_seconds_ago: Option<i64>,
     /// The agent's other settings that `options` can set, with their values.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) settings: Vec<SettingEntry>,
@@ -159,6 +162,11 @@ impl Inner {
             .filter(|agent| agent.is_installed)
             .map(|agent| AgentEntry {
                 models: offered_models(&config.nori_home, &agent.agent_name),
+                read_seconds_ago: Some(
+                    super::catalog::remembered(&config.nori_home, &agent.agent_name).refreshed_at,
+                )
+                .filter(|refreshed_at| *refreshed_at > 0)
+                .map(|refreshed_at| super::catalog::now_seconds() - refreshed_at),
                 settings: super::catalog::remembered(&config.nori_home, &agent.agent_name)
                     .settings
                     .into_iter()

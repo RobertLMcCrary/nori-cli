@@ -2,6 +2,24 @@ use super::*;
 
 impl ChatWidget {
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+        // Starting to type a prompt is when delegation may soon be asked for: bring what each
+        // agent offers up to date, in the background, for agents not read in a while. Tests
+        // must never start the real agents installed on the machine.
+        #[cfg(not(test))]
+        if key_event.kind == KeyEventKind::Press
+            && matches!(key_event.code, KeyCode::Char(_))
+            && !key_event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && self.harness_handle.is_some()
+            && self.bottom_pane.composer_is_empty()
+            && !self.bottom_pane.has_active_view()
+        {
+            nori_harness::refresh_agent_catalog(
+                std::sync::Arc::new(self.config.clone()),
+                env!("CARGO_PKG_VERSION").to_string(),
+            );
+        }
         match key_event {
             KeyEvent {
                 code: KeyCode::Char(c),

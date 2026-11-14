@@ -409,7 +409,14 @@ the same `nori-client` server: `agent_capabilities`, `delegate_task`,
   list. Other select settings, such as reasoning effort, are set with
   `options`. A permission mode can be set only when the parent runs without
   approvals. What each agent offered is remembered across runs in
-  `<nori home>/agent-models.json` for `agent_capabilities`.
+  `<nori home>/agent-models.json` for `agent_capabilities`, and kept current
+  by probes (`orchestrator/probe.rs`): an installed agent is started in a
+  bare session (no hooks, MCP servers, or transcript), its advertised options
+  are read, and it is stopped. `agent_capabilities` re-reads agents not read in
+  two minutes, waiting up to 20 seconds, and reports each entry's age. The TUI
+  calls `refresh_agent_catalog` when the user starts typing, which re-reads
+  agents not read in ten minutes in the background. Each agent has at most one
+  probe at a time and three run at once.
 - **Progress.** While a task runs, its snapshot carries the child's latest tool
   call or line of text and its tool-call count. Once it ends, the snapshot
   lists the files the child's edit tools changed. Results that come in within

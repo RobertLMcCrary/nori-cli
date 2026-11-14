@@ -598,6 +598,14 @@ and read as sentences ("Delegated to codex: Review the parser",
 "task-1 running in the background") instead of raw JSON. A completion wake
 adds one info line naming the tasks whose results were handed over.
 
+Text a tool returns is plain unless its source says otherwise
+(`presentation::TextFormat`). An embedded resource whose MIME type is
+`text/markdown` (or `text/x-markdown`, with or without parameters), or which
+has no MIME type and a `.md`, `.markdown`, or `.mdx` URI, is markdown: the tool
+cell renders it with the markdown renderer, its first 12 rows collapsed and
+all of it in the transcript. In an agent message, a markdown resource joins
+the message, and any other text resource is shown in a code block.
+
 #### Lifecycle behavior
 
 Connection preparation is separate from session activation, but ordinary local

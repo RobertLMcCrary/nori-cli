@@ -27,6 +27,11 @@ pub(crate) const INSTRUCTIONS: &str = "Delegated tasks: `delegate_task` runs a t
      finishes, so never poll. Give each child everything it needs in `task`; it sees none of \
      your conversation. Tasks end with this session, and the user stopping you stops them.";
 
+/// `agent_capabilities` re-reads agents whose entry is older than this...
+const CAPABILITIES_FRESH_FOR: Duration = Duration::from_secs(120);
+/// ...waiting at most this long before answering with what it has.
+const CAPABILITIES_WAIT: Duration = Duration::from_secs(20);
+
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
@@ -117,7 +122,18 @@ impl NoriClientService {
         meta = always_load()
     )]
     async fn agent_capabilities(&self) -> Result<CallToolResult, McpError> {
-        Ok(json(&self.orchestrator().inner().capabilities()))
+        let inner = self.orchestrator().inner();
+        // Re-read agents not read in the last two minutes, for as long as an answer can wait.
+        let _ = tokio::time::timeout(
+            CAPABILITIES_WAIT,
+            super::probe::refresh(
+                Arc::clone(&inner.seed.config),
+                inner.seed.cli_version.clone(),
+                CAPABILITIES_FRESH_FOR,
+            ),
+        )
+        .await;
+        Ok(json(&inner.capabilities()))
     }
 
     #[tool(

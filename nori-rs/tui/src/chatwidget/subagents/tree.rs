@@ -454,7 +454,7 @@ fn snapshot_text(snapshot: &ToolSnapshot) -> String {
         .artifacts
         .iter()
         .find_map(|artifact| match artifact {
-            Artifact::Text { text } => Some(text.clone()),
+            Artifact::Text { text, .. } => Some(text.clone()),
             Artifact::Diff(_) => None,
         })
         .unwrap_or_default()

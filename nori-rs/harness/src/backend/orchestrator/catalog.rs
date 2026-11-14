@@ -26,6 +26,9 @@ pub(super) struct Offer {
     /// Its other select settings, such as reasoning effort or mode.
     #[serde(default)]
     pub(super) settings: Vec<Setting>,
+    /// When it was last read, in seconds since the Unix epoch.
+    #[serde(default)]
+    pub(super) refreshed_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -70,20 +73,15 @@ pub(crate) fn remember(home: &Path, agent: &str, options: &[acp::SessionConfigOp
                 values: setting.offered,
             })
             .collect(),
+        refreshed_at: now_seconds(),
     };
-    if offer == Offer::default() {
+    if offer.models.is_empty() && offer.settings.is_empty() {
         return;
     }
-    let changed = with_catalog(home, |agents| {
-        if agents.get(agent) == Some(&offer) {
-            return None;
-        }
+    let agents = with_catalog(home, |agents| {
         agents.insert(agent.to_owned(), offer);
-        Some(agents.clone())
+        agents.clone()
     });
-    let Some(agents) = changed else {
-        return;
-    };
     let path = home.join(FILE);
     let write = move || {
         let Ok(json) = serde_json::to_vec_pretty(&agents) else {
@@ -100,6 +98,12 @@ pub(crate) fn remember(home: &Path, agent: &str, options: &[acp::SessionConfigOp
         }
         Err(_) => write(),
     }
+}
+
+pub(super) fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
 /// What `agent` offered when it last ran.
@@ -140,6 +144,7 @@ mod tests {
                 name: "GPT-5.1".to_owned(),
             }]
         );
+        assert!(remembered(home.path(), "codex").refreshed_at > 0);
         assert_eq!(remembered(home.path(), "claude"), Offer::default());
     }
 }

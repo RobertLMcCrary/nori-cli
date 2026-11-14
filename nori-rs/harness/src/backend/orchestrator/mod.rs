@@ -21,6 +21,7 @@ mod child;
 mod launch;
 mod models;
 mod parent;
+mod probe;
 mod task;
 #[cfg(test)]
 mod tests;
@@ -120,6 +121,15 @@ impl Seed {
 pub(crate) struct WakeTurn {
     pub(crate) text: String,
     pub(crate) delivered: nori_protocol::TaskResultsDelivered,
+}
+
+/// Agents a typing user may soon delegate to are re-read when their entry is this old.
+const CATALOG_FRESH_FOR: Duration = Duration::from_secs(600);
+
+/// Re-read, in the background, what each installed agent offers, for agents not read in the last
+/// ten minutes: called as the user starts typing, so delegation sees current models.
+pub fn refresh_agent_catalog(config: Arc<crate::config::NoriConfig>, cli_version: String) {
+    tokio::spawn(probe::refresh(config, cli_version, CATALOG_FRESH_FOR));
 }
 
 /// What the orchestrator needs the parent's backend to do.

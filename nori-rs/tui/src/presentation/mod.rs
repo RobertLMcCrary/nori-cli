@@ -353,7 +353,49 @@ pub enum Invocation {
 #[serde(tag = "artifact_type", rename_all = "snake_case")]
 pub enum Artifact {
     Diff(FileChange),
-    Text { text: String },
+    Text {
+        text: String,
+        /// How the text is meant to be read, as its source declared it.
+        #[serde(default)]
+        format: TextFormat,
+    },
+}
+
+/// How a piece of text is meant to be read. Text is plain unless its source says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextFormat {
+    #[default]
+    Plain,
+    Markdown,
+}
+
+impl TextFormat {
+    /// The format an embedded resource declares: markdown when its MIME type is
+    /// `text/markdown` (or `text/x-markdown`, parameters aside), or when it has no MIME type and
+    /// its URI names a `.md`, `.markdown`, or `.mdx` file.
+    pub fn of_resource(mime_type: Option<&str>, uri: &str) -> Self {
+        if let Some(mime_type) = mime_type {
+            let essence = mime_type
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            return match essence.as_str() {
+                "text/markdown" | "text/x-markdown" => Self::Markdown,
+                _ => Self::Plain,
+            };
+        }
+        let path = uri.split(['?', '#']).next().unwrap_or_default();
+        let extension = path
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_lowercase());
+        match extension.as_deref() {
+            Some("md" | "markdown" | "mdx") => Self::Markdown,
+            _ => Self::Plain,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,7 +794,22 @@ fn artifacts_from_tool_call(tool_call: &acp::ToolCall) -> Vec<Artifact> {
             acp::ToolCallContent::Content(content) => match &content.content {
                 acp::ContentBlock::Text(text) if !text.text.is_empty() => Some(Artifact::Text {
                     text: text.text.clone(),
+                    format: TextFormat::Plain,
                 }),
+                acp::ContentBlock::Resource(resource) => match &resource.resource {
+                    acp::EmbeddedResourceResource::TextResourceContents(contents)
+                        if !contents.text.is_empty() =>
+                    {
+                        Some(Artifact::Text {
+                            text: contents.text.clone(),
+                            format: TextFormat::of_resource(
+                                contents.mime_type.as_deref(),
+                                &contents.uri,
+                            ),
+                        })
+                    }
+                    _ => None,
+                },
                 _ => None,
             },
             _ => None,
@@ -764,7 +821,10 @@ fn artifacts_from_tool_call(tool_call: &acp::ToolCall) -> Vec<Artifact> {
         .any(|artifact| matches!(artifact, Artifact::Text { .. }))
         && let Some(text) = raw_output_text(tool_call.raw_output.as_ref())
     {
-        artifacts.push(Artifact::Text { text });
+        artifacts.push(Artifact::Text {
+            text,
+            format: TextFormat::Plain,
+        });
     }
 
     artifacts
@@ -1074,6 +1134,23 @@ fn message_delta_from_chunk(
             format!(" [resource: {}]", resource.name)
         }
         (acp::ContentBlock::Resource(_), MessageStream::User) => " [embedded resource]".to_string(),
+        // An agent's message is markdown, so a markdown resource is part of it; other text is
+        // shown as it is, in a block of its own.
+        (acp::ContentBlock::Resource(resource), MessageStream::Answer) => {
+            match &resource.resource {
+                acp::EmbeddedResourceResource::TextResourceContents(contents)
+                    if !contents.text.is_empty() =>
+                {
+                    match TextFormat::of_resource(contents.mime_type.as_deref(), &contents.uri) {
+                        TextFormat::Markdown => format!("\n\n{}\n\n", contents.text.trim()),
+                        TextFormat::Plain => {
+                            format!("\n\n```\n{}\n```\n\n", contents.text.trim_end())
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
         _ => return None,
     };
     Some(MessageDelta {
@@ -1202,6 +1279,38 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn resources_say_whether_they_are_markdown() {
+        assert_eq!(
+            TextFormat::of_resource(Some("text/markdown"), "x"),
+            TextFormat::Markdown
+        );
+        assert_eq!(
+            TextFormat::of_resource(Some("Text/Markdown; charset=utf-8"), "x"),
+            TextFormat::Markdown
+        );
+        assert_eq!(
+            TextFormat::of_resource(Some("text/x-markdown"), "x"),
+            TextFormat::Markdown
+        );
+        assert_eq!(
+            TextFormat::of_resource(Some("text/plain"), "notes.md"),
+            TextFormat::Plain
+        );
+        assert_eq!(
+            TextFormat::of_resource(None, "file:///repo/README.MD"),
+            TextFormat::Markdown
+        );
+        assert_eq!(
+            TextFormat::of_resource(None, "docs/guide.mdx?raw=1"),
+            TextFormat::Markdown
+        );
+        assert_eq!(
+            TextFormat::of_resource(None, "src/main.rs"),
+            TextFormat::Plain
+        );
+    }
 
     fn sample_permission_options() -> Vec<acp::PermissionOption> {
         vec![
@@ -1420,6 +1529,7 @@ mod tests {
             snapshot.artifacts,
             vec![Artifact::Text {
                 text: "all green\n".into(),
+                format: crate::presentation::TextFormat::Plain,
             }]
         );
     }
@@ -1463,6 +1573,7 @@ mod tests {
             snapshot.artifacts,
             vec![Artifact::Text {
                 text: "On branch spec\n".into(),
+                format: crate::presentation::TextFormat::Plain,
             }]
         );
     }
