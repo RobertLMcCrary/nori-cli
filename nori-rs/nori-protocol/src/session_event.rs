@@ -63,6 +63,26 @@ pub enum NoriEvent {
     RequestFailed(RequestFailure),
     /// A subagent session was announced, changed state, or exchanged a message.
     Subagent(SubagentWire),
+    /// The results of tasks the session delegated were handed to its agent in a turn of
+    /// their own.
+    TaskResultsDelivered(TaskResultsDelivered),
+    /// A request the client was asked to answer no longer needs an answer, such as a delegated
+    /// task's permission request after the task ended.
+    RequestWithdrawn(RequestId),
+}
+
+/// Results of delegated tasks, handed to the agent that delegated them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskResultsDelivered {
+    pub tasks: Vec<DeliveredTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveredTask {
+    pub task_id: String,
+    pub title: String,
+    /// The display name of the agent the task ran on.
+    pub agent: String,
 }
 
 /// Persistent and agent-side identities established for a harness session.

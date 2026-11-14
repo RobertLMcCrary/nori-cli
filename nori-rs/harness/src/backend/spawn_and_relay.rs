@@ -154,6 +154,8 @@ impl AcpBackend {
         } = prepared.into_parts();
         let config = &config;
         let cwd = config.cwd.clone();
+        let (orchestrator, orchestrator_signals) =
+            orchestrator::Orchestrator::new(config.delegation.clone(), backend_event_tx.clone());
 
         let agent_config = get_agent_config(&config.agent)?;
         debug!(
@@ -176,6 +178,7 @@ impl AcpBackend {
             Arc::clone(&thread_goal_state),
             backend_event_tx.clone(),
             Arc::clone(&goal_mcp_connected),
+            orchestrator.clone(),
         )
         .await?;
         if let Some(server) = nori_client_server {
@@ -230,19 +233,24 @@ impl AcpBackend {
             crate::message_history::history_metadata(&config.nori_home).await;
 
         // Initialize transcript recorder (non-fatal if it fails).
-        let transcript_recorder = match TranscriptRecorder::new(
-            &config.nori_home,
-            &cwd,
-            Some(config.agent.clone()),
-            &config.cli_version,
-            Some(session_id.to_string()),
-        )
-        .await
-        {
-            Ok(recorder) => Some(Arc::new(recorder)),
-            Err(e) => {
-                warn!("Failed to initialize transcript recorder: {e}");
-                None
+        // A child keeps no transcript of its own: its parent's shows what it did.
+        let transcript_recorder = if config.delegation.is_child() {
+            None
+        } else {
+            match TranscriptRecorder::new(
+                &config.nori_home,
+                &cwd,
+                Some(config.agent.clone()),
+                &config.cli_version,
+                Some(session_id.to_string()),
+            )
+            .await
+            {
+                Ok(recorder) => Some(Arc::new(recorder)),
+                Err(e) => {
+                    warn!("Failed to initialize transcript recorder: {e}");
+                    None
+                }
             }
         };
         let transcript_id = transcript_recorder
@@ -307,6 +315,7 @@ impl AcpBackend {
             cancel_timeout_abort: Arc::new(Mutex::new(None)),
             runtime_task_abort: Arc::new(Mutex::new(None)),
             relay_task_abort: Arc::new(Mutex::new(None)),
+            orchestrator,
         };
 
         let runtime_backend = backend.clone();
@@ -331,6 +340,12 @@ impl AcpBackend {
             }
         });
         *backend.runtime_task_abort.lock().await = Some(runtime_task.abort_handle());
+        backend.orchestrator.bind(orchestrator::Binding {
+            session_id: backend.session_id().await,
+            approval_policy: backend.approval_policy_tx.subscribe(),
+        });
+        backend.serve_orchestrator(orchestrator_signals);
+        orchestrator::remember_models(&config.nori_home, &config.agent, &backend.config_options());
 
         // Execute session_start hooks
         run_session_start_hooks(

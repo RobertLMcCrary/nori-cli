@@ -106,6 +106,7 @@ impl ChatWidget {
                             option_name: "Mode".to_string(),
                             value_name,
                             is_custom_model: false,
+                            origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
                             config_options: Some(config_options),
                             error: None,
                         });
@@ -119,6 +120,7 @@ impl ChatWidget {
                             option_name: "Mode".to_string(),
                             value_name: value_name.clone(),
                             is_custom_model: false,
+                            origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
                             config_options: None,
                             error: Some(err.to_string()),
                         });
@@ -171,6 +173,7 @@ impl ChatWidget {
                         option_name: "Mode".to_string(),
                         value_name,
                         is_custom_model: false,
+                        origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
                         config_options: Some(config_options),
                         error: None,
                     });
@@ -184,6 +187,7 @@ impl ChatWidget {
                         option_name: "Mode".to_string(),
                         value_name: mode.next_label,
                         is_custom_model: false,
+                        origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
                         config_options: None,
                         error: Some(err.to_string()),
                     });

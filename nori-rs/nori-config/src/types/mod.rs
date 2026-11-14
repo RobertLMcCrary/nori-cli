@@ -821,6 +821,10 @@ pub enum HotkeyAction {
     TogglePlanDrawer,
     /// Repaint the visible screen from Nori's own model, leaving scrollback alone.
     Redraw,
+    /// Switch to the next model the agent offers.
+    NextModel,
+    /// Switch to the previous model the agent offers.
+    PreviousModel,
 }
 
 impl HotkeyAction {
@@ -844,6 +848,8 @@ impl HotkeyAction {
             Self::HistorySearch => "History Search",
             Self::TogglePlanDrawer => "Toggle Plan Drawer",
             Self::Redraw => "Redraw Screen",
+            Self::NextModel => "Next Model",
+            Self::PreviousModel => "Previous Model",
         }
     }
 
@@ -869,6 +875,8 @@ impl HotkeyAction {
                 "Toggle the pinned plan drawer between collapsed and expanded"
             }
             Self::Redraw => "Repaint the visible screen without touching scrollback",
+            Self::NextModel => "Switch to the next model the agent offers",
+            Self::PreviousModel => "Switch to the previous model the agent offers",
         }
     }
 
@@ -892,6 +900,8 @@ impl HotkeyAction {
             Self::HistorySearch => "history_search",
             Self::TogglePlanDrawer => "toggle_plan_drawer",
             Self::Redraw => "redraw",
+            Self::NextModel => "next_model",
+            Self::PreviousModel => "previous_model",
         }
     }
 
@@ -915,6 +925,8 @@ impl HotkeyAction {
             Self::HistorySearch => "ctrl+r",
             Self::TogglePlanDrawer => "ctrl+o",
             Self::Redraw => "ctrl+l",
+            Self::NextModel => "ctrl+n",
+            Self::PreviousModel => "ctrl+p",
         }
     }
 
@@ -938,6 +950,8 @@ impl HotkeyAction {
             Self::HistorySearch,
             Self::TogglePlanDrawer,
             Self::Redraw,
+            Self::NextModel,
+            Self::PreviousModel,
         ]
     }
 }
@@ -1059,6 +1073,10 @@ pub struct HotkeyConfigToml {
     pub toggle_plan_drawer: Option<HotkeyBinding>,
     /// Hotkey for repainting the screen.
     pub redraw: Option<HotkeyBinding>,
+    /// Hotkey for switching to the next model the agent offers.
+    pub next_model: Option<HotkeyBinding>,
+    /// Hotkey for switching to the previous model the agent offers.
+    pub previous_model: Option<HotkeyBinding>,
 }
 
 /// Resolved hotkey configuration with defaults applied.
@@ -1098,6 +1116,10 @@ pub struct HotkeyConfig {
     pub toggle_plan_drawer: HotkeyBinding,
     /// Hotkey for repainting the screen.
     pub redraw: HotkeyBinding,
+    /// Hotkey for switching to the next model the agent offers.
+    pub next_model: HotkeyBinding,
+    /// Hotkey for switching to the previous model the agent offers.
+    pub previous_model: HotkeyBinding,
 }
 
 impl Default for HotkeyConfig {
@@ -1146,6 +1168,8 @@ impl Default for HotkeyConfig {
                 HotkeyAction::TogglePlanDrawer.default_binding(),
             ),
             redraw: HotkeyBinding::from_str(HotkeyAction::Redraw.default_binding()),
+            next_model: HotkeyBinding::from_str(HotkeyAction::NextModel.default_binding()),
+            previous_model: HotkeyBinding::from_str(HotkeyAction::PreviousModel.default_binding()),
         }
     }
 }
@@ -1214,6 +1238,11 @@ impl HotkeyConfig {
                 .clone()
                 .unwrap_or(defaults.toggle_plan_drawer),
             redraw: toml.redraw.clone().unwrap_or(defaults.redraw),
+            next_model: toml.next_model.clone().unwrap_or(defaults.next_model),
+            previous_model: toml
+                .previous_model
+                .clone()
+                .unwrap_or(defaults.previous_model),
         }
     }
 
@@ -1237,6 +1266,8 @@ impl HotkeyConfig {
             HotkeyAction::HistorySearch => &self.history_search,
             HotkeyAction::TogglePlanDrawer => &self.toggle_plan_drawer,
             HotkeyAction::Redraw => &self.redraw,
+            HotkeyAction::NextModel => &self.next_model,
+            HotkeyAction::PreviousModel => &self.previous_model,
         }
     }
 
@@ -1260,6 +1291,8 @@ impl HotkeyConfig {
             HotkeyAction::HistorySearch => self.history_search = binding,
             HotkeyAction::TogglePlanDrawer => self.toggle_plan_drawer = binding,
             HotkeyAction::Redraw => self.redraw = binding,
+            HotkeyAction::NextModel => self.next_model = binding,
+            HotkeyAction::PreviousModel => self.previous_model = binding,
         }
     }
 
@@ -1289,6 +1322,8 @@ impl HotkeyConfig {
             (HotkeyAction::HistorySearch, &self.history_search),
             (HotkeyAction::TogglePlanDrawer, &self.toggle_plan_drawer),
             (HotkeyAction::Redraw, &self.redraw),
+            (HotkeyAction::NextModel, &self.next_model),
+            (HotkeyAction::PreviousModel, &self.previous_model),
         ]
     }
 }

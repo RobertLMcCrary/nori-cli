@@ -18,6 +18,9 @@ pub(crate) enum ConfigPickerOrigin {
     Panel,
     /// A command for one setting, such as `/model`: choosing a value closes the picker.
     Direct,
+    /// A key that steps to the next or previous model: no picker, and the footer shows the
+    /// change instead of a history line.
+    Cycle,
 }
 
 pub(crate) fn acp_session_config_picker_params(

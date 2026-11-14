@@ -710,6 +710,27 @@ impl BottomPane {
         }
     }
 
+    /// A request the agent asked about no longer needs an answer: stop asking it.
+    pub(crate) fn withdraw_approval_request(
+        &mut self,
+        request_id: &nori_protocol::acp::v1::RequestId,
+    ) {
+        let Some(index) = self
+            .view_stack
+            .iter_mut()
+            .rposition(|view| view.withdraw_approval_request(request_id))
+        else {
+            return;
+        };
+        if self.view_stack[index].is_complete() {
+            self.view_stack.remove(index);
+            if index == self.view_stack.len() {
+                self.on_active_view_complete();
+            }
+        }
+        self.request_redraw();
+    }
+
     /// Called when the agent requests user approval.
     pub fn push_approval_request(&mut self, request: ApprovalRequest) {
         let request = if let Some(view) = self.view_stack.last_mut() {
@@ -1377,6 +1398,29 @@ mod tests {
         pane.push_approval_request(exec_request());
 
         assert!(pane.has_active_overlay_or_popup());
+    }
+
+    /// A delegated task that ends takes its permission request with it: the modal moves on to
+    /// the next request, and closes when there is none.
+    #[test]
+    fn withdrawn_requests_leave_the_approval_modal() {
+        let mut pane = test_bottom_pane();
+        let second = ApprovalRequest {
+            request_id: "2".to_string().into(),
+            ..exec_request()
+        };
+        pane.push_approval_request(exec_request());
+        pane.push_approval_request(second);
+
+        pane.withdraw_approval_request(&"9".to_string().into());
+        assert!(pane.has_active_overlay_or_popup());
+        pane.withdraw_approval_request(&"1".to_string().into());
+        assert!(
+            pane.has_active_overlay_or_popup(),
+            "the second request is asked next"
+        );
+        pane.withdraw_approval_request(&"2".to_string().into());
+        assert!(!pane.has_active_overlay_or_popup());
     }
 
     #[test]

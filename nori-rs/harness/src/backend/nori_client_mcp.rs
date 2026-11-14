@@ -2,15 +2,18 @@
 //!
 //! This is Nori's harness-side channel to the external ACP agent: the single
 //! loopback MCP server through which Nori exposes harness-specific tooling that
-//! the ACP protocol itself does not (yet) provide. Today it carries the goal
-//! tools (`get_goal`/`create_goal`/`update_goal`); it is named `nori-client`
-//! rather than `nori-goal` because it is the general point of contact, not a
-//! goal-only surface.
+//! the ACP protocol itself does not (yet) provide. It carries the goal tools
+//! (`get_goal`/`create_goal`/`update_goal`) and the delegated-task tools (see
+//! [`super::orchestrator`]); it is named `nori-client` because it is the general
+//! point of contact, not a single-purpose surface.
 //!
-//! The transport is rmcp's spec-compliant streamable-HTTP server, served on a
-//! loopback port and protected by a per-session bearer token before requests
-//! reach rmcp. The tools are typed `#[tool]` handlers; there is no hand-rolled
-//! HTTP or JSON-RPC framing here.
+//! An agent that speaks HTTP MCP reaches it through rmcp's spec-compliant
+//! streamable-HTTP server, served on a loopback port and protected by a
+//! per-session bearer token before requests reach rmcp. Any other agent gets a
+//! stdio server: a command that relays its stdio to a unix socket in a private
+//! directory (`nori stdio-to-uds <socket>`, see [`set_stdio_bridge`]), where the
+//! same service is served. The tools are typed `#[tool]` handlers; there is no
+//! hand-rolled HTTP or JSON-RPC framing here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,6 +118,7 @@ pub(crate) struct NoriClientShared {
     agent_capabilities: crate::normalized::AgentCapabilitiesView,
     nori_client_advertised: bool,
     goal_ext_advertised: bool,
+    orchestrator: super::orchestrator::Orchestrator,
 }
 
 impl NoriClientShared {
@@ -125,6 +129,7 @@ impl NoriClientShared {
         agent_capabilities: crate::normalized::AgentCapabilitiesView,
         nori_client_advertised: bool,
         goal_ext_advertised: bool,
+        orchestrator: super::orchestrator::Orchestrator,
     ) -> Self {
         Self {
             thread_goal_state,
@@ -133,6 +138,7 @@ impl NoriClientShared {
             agent_capabilities,
             nori_client_advertised,
             goal_ext_advertised,
+            orchestrator,
         }
     }
 }
@@ -151,7 +157,7 @@ impl NoriClientService {
     fn new(shared: NoriClientShared) -> Self {
         Self {
             shared,
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router() + Self::task_tool_router(),
         }
     }
 
@@ -222,6 +228,13 @@ impl NoriClientService {
     }
 }
 
+impl NoriClientService {
+    /// The delegated tasks of the session this server belongs to.
+    pub(crate) fn orchestrator(&self) -> &super::orchestrator::Orchestrator {
+        &self.shared.orchestrator
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for NoriClientService {
     fn get_info(&self) -> ServerInfo {
@@ -238,8 +251,9 @@ impl ServerHandler for NoriClientService {
                 ..Default::default()
             },
             instructions: Some(format!(
-                "Use nori-client resources and prompts for Nori CLI harness context; use tools only for Nori-owned live state.\n\n{}",
-                thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS
+                "Use nori-client resources and prompts for Nori CLI harness context; use tools only for Nori-owned live state.\n\n{}\n\n{}",
+                thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS,
+                super::orchestrator::TASK_INSTRUCTIONS,
             )),
         }
     }
@@ -340,15 +354,97 @@ fn status_label(status: GoalStatus) -> &'static str {
     }
 }
 
+/// The command, and the arguments before the socket path, that relays an agent's stdio to the
+/// `nori-client` socket. Set once by the binary that can do it; without it, only agents that
+/// speak HTTP MCP get the server.
+static STDIO_BRIDGE: std::sync::OnceLock<(std::path::PathBuf, Vec<String>)> =
+    std::sync::OnceLock::new();
+
+/// Let agents without HTTP MCP reach the `nori-client` server by running `command args… <socket>`,
+/// which must relay its stdin and stdout to the unix socket it is given.
+pub fn set_stdio_bridge(command: std::path::PathBuf, args: Vec<String>) {
+    let _ = STDIO_BRIDGE.set((command, args));
+}
+
+/// Whether an agent can be given the `nori-client` server.
+fn reachable(connection: &AcpConnection) -> bool {
+    connection.capabilities().mcp_capabilities.http || (cfg!(unix) && STDIO_BRIDGE.get().is_some())
+}
+
 /// Loopback `nori-client` MCP server. Bound on first use and torn down on drop.
 pub(crate) struct NoriClientServer {
     url: String,
     authorization_header_value: String,
     task: tokio::task::JoinHandle<()>,
+    /// The stdio server for agents without HTTP MCP, when this agent needs it.
+    #[cfg(unix)]
+    socket: Option<SocketServer>,
+}
+
+/// The `nori-client` service on a unix socket in a directory only this user can enter.
+#[cfg(unix)]
+struct SocketServer {
+    directory: std::path::PathBuf,
+    path: std::path::PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl SocketServer {
+    fn spawn(shared: NoriClientShared) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "nori-mcp-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .context("failed to create the nori-client socket directory")?;
+        let path = directory.join("mcp.sock");
+        let listener = tokio::net::UnixListener::bind(&path)
+            .context("failed to bind the nori-client socket")?;
+        let task = tokio::spawn(async move {
+            // Dropping the set when the server is torn down ends every connection.
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let service = NoriClientService::new(shared.clone());
+                connections.spawn(async move {
+                    match rmcp::ServiceExt::serve(service, stream).await {
+                        Ok(running) => {
+                            let _ = running.waiting().await;
+                        }
+                        Err(err) => tracing::debug!("nori-client socket connection failed: {err}"),
+                    }
+                });
+            }
+        });
+        Ok(Self {
+            directory,
+            path,
+            task,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketServer {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
 }
 
 impl NoriClientServer {
-    pub(crate) async fn spawn(shared: NoriClientShared) -> Result<Self> {
+    /// The server, with a stdio entry point unless the agent speaks HTTP MCP.
+    pub(crate) async fn spawn(shared: NoriClientShared, http: bool) -> Result<Self> {
+        #[cfg(unix)]
+        let socket = if http {
+            None
+        } else {
+            Some(SocketServer::spawn(shared.clone())?)
+        };
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .context("failed to bind local nori-client MCP server")?;
@@ -383,6 +479,8 @@ impl NoriClientServer {
             url,
             authorization_header_value,
             task,
+            #[cfg(unix)]
+            socket,
         })
     }
 
@@ -396,6 +494,14 @@ impl NoriClientServer {
     }
 
     pub(super) fn as_mcp_server(&self) -> acp::McpServer {
+        #[cfg(unix)]
+        if let (Some(socket), Some((command, args))) = (&self.socket, STDIO_BRIDGE.get()) {
+            let mut args = args.clone();
+            args.push(socket.path.display().to_string());
+            return acp::McpServer::Stdio(
+                acp::McpServerStdio::new("nori-client", command.clone()).args(args),
+            );
+        }
         acp::McpServer::Http(
             acp::McpServerHttp::new("nori-client", self.url.clone())
                 .headers(vec![self.authorization_header()]),
@@ -454,7 +560,7 @@ pub(super) fn capabilities_update_for_session(
 ) -> crate::normalized::SessionCapabilitiesView {
     capabilities_update_for_nori_client(
         connection,
-        connection.capabilities().mcp_capabilities.http,
+        reachable(connection),
         connected.load(Ordering::Relaxed),
     )
 }
@@ -521,19 +627,25 @@ pub(super) async fn register_for_session(
     thread_goal_state: Arc<Mutex<thread_goal::ThreadGoalState>>,
     backend_event_tx: mpsc::Sender<BackendEvent>,
     connected: Arc<AtomicBool>,
+    orchestrator: super::orchestrator::Orchestrator,
 ) -> Result<Option<PendingNoriClientServer>> {
-    if !connection.capabilities().mcp_capabilities.http {
+    if !reachable(connection) {
         return Ok(None);
     }
 
-    let next_server = NoriClientServer::spawn(NoriClientShared::new(
-        thread_goal_state,
-        backend_event_tx,
-        Arc::clone(&connected),
-        agent_capabilities_view(connection),
-        true,
-        goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta()).is_some(),
-    ))
+    let next_server = NoriClientServer::spawn(
+        NoriClientShared::new(
+            thread_goal_state,
+            backend_event_tx,
+            Arc::clone(&connected),
+            agent_capabilities_view(connection),
+            true,
+            goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta())
+                .is_some(),
+            orchestrator,
+        ),
+        connection.capabilities().mcp_capabilities.http,
+    )
     .await?;
     let advertised_server = next_server.as_mcp_server();
     let previous_connected = connected.swap(false, Ordering::Relaxed);
@@ -583,6 +695,18 @@ mod tests {
         }));
     }
 
+    fn test_orchestrator() -> super::super::orchestrator::Orchestrator {
+        let (events, _events_rx) = mpsc::channel(8);
+        super::super::orchestrator::Orchestrator::new(
+            super::super::orchestrator::Seed::root(
+                Arc::new(crate::config::NoriConfig::default()),
+                "test".to_owned(),
+            ),
+            events,
+        )
+        .0
+    }
+
     fn service() -> NoriClientService {
         let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
         NoriClientService::new(NoriClientShared::new(
@@ -592,6 +716,7 @@ mod tests {
             test_agent_capabilities(),
             true,
             false,
+            test_orchestrator(),
         ))
     }
 
@@ -674,6 +799,7 @@ mod tests {
             test_agent_capabilities(),
             true,
             false,
+            test_orchestrator(),
         ));
 
         let create_result = create(&service, "Ship the ACP goal bridge").await;
@@ -744,6 +870,72 @@ mod tests {
     /// server over HTTP, exercising the streamable-HTTP transport, the
     /// `initialize` handshake (which must flip `connected`), tool discovery, and
     /// a `create_goal` round-trip, i.e. the path a real ACP agent takes.
+    /// An agent without HTTP MCP is given a stdio command that relays to a private unix socket;
+    /// the same service, task tools included, answers there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_socket_serves_the_same_tools_to_agents_without_http() {
+        use rmcp::ServiceExt;
+
+        set_stdio_bridge(
+            std::path::PathBuf::from("nori"),
+            vec!["stdio-to-uds".to_owned()],
+        );
+        let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
+        let server = NoriClientServer::spawn(
+            NoriClientShared::new(
+                Arc::new(Mutex::new(thread_goal::ThreadGoalState::default())),
+                backend_event_tx,
+                Arc::new(AtomicBool::new(false)),
+                test_agent_capabilities(),
+                true,
+                false,
+                test_orchestrator(),
+            ),
+            false,
+        )
+        .await
+        .expect("nori-client server should spawn");
+        let acp::McpServer::Stdio(stdio) = server.as_mcp_server() else {
+            panic!("an agent without HTTP MCP is given a stdio server");
+        };
+        let socket = stdio.args.last().cloned().expect("the socket path");
+        assert_eq!(stdio.args[0], "stdio-to-uds");
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect to the nori-client socket");
+        let client = ().serve(stream).await.expect("initialize over the socket");
+        let tools = client.list_all_tools().await.expect("list tools");
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        for tool in [
+            "delegate_task",
+            "task_status",
+            "task_wait",
+            "task_send",
+            "task_cancel",
+            "get_goal",
+        ] {
+            assert!(names.contains(&tool), "{tool} missing from {names:?}");
+        }
+        let delegate = tools
+            .iter()
+            .find(|tool| tool.name == "delegate_task")
+            .expect("delegate_task");
+        assert!(delegate.meta.as_ref().is_some_and(
+            |meta| meta.0.get("anthropic/alwaysLoad") == Some(&serde_json::Value::Bool(true))
+        ));
+        let _ = client.cancel().await;
+        let directory = std::path::Path::new(&socket)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .expect("socket directory");
+        drop(server);
+        assert!(
+            !directory.exists(),
+            "the socket directory is removed with the server"
+        );
+    }
+
     #[tokio::test]
     async fn real_mcp_client_round_trips_over_http() {
         use rmcp::ServiceExt;
@@ -752,14 +944,18 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
         let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
-        let server = NoriClientServer::spawn(NoriClientShared::new(
-            Arc::clone(&state),
-            backend_event_tx,
-            Arc::clone(&connected),
-            test_agent_capabilities(),
+        let server = NoriClientServer::spawn(
+            NoriClientShared::new(
+                Arc::clone(&state),
+                backend_event_tx,
+                Arc::clone(&connected),
+                test_agent_capabilities(),
+                true,
+                false,
+                test_orchestrator(),
+            ),
             true,
-            false,
-        ))
+        )
         .await
         .expect("nori-client server should spawn");
 
@@ -838,14 +1034,18 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
         let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
-        let server = NoriClientServer::spawn(NoriClientShared::new(
-            Arc::clone(&state),
-            backend_event_tx,
-            Arc::clone(&connected),
-            test_agent_capabilities(),
+        let server = NoriClientServer::spawn(
+            NoriClientShared::new(
+                Arc::clone(&state),
+                backend_event_tx,
+                Arc::clone(&connected),
+                test_agent_capabilities(),
+                true,
+                false,
+                test_orchestrator(),
+            ),
             true,
-            false,
-        ))
+        )
         .await
         .expect("nori-client server should spawn");
 
@@ -946,14 +1146,18 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
         let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
-        let server = NoriClientServer::spawn(NoriClientShared::new(
-            Arc::clone(&state),
-            backend_event_tx,
-            Arc::clone(&connected),
-            test_agent_capabilities(),
+        let server = NoriClientServer::spawn(
+            NoriClientShared::new(
+                Arc::clone(&state),
+                backend_event_tx,
+                Arc::clone(&connected),
+                test_agent_capabilities(),
+                true,
+                false,
+                test_orchestrator(),
+            ),
             true,
-            false,
-        ))
+        )
         .await
         .expect("nori-client server should spawn");
 

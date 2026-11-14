@@ -2,6 +2,7 @@
 
 mod browser_modify;
 mod context_usage;
+mod mcp_calls;
 mod runaway_search;
 mod stream_file;
 mod timeline;
@@ -107,6 +108,8 @@ struct MockState {
     context_prompt_index: AtomicI64,
     cancel_requested: AtomicBool,
     session_configs: Mutex<HashMap<String, MockSessionConfig>>,
+    /// The MCP servers the client gave each session.
+    mcp_servers: Mutex<HashMap<String, Vec<acp::McpServer>>>,
 }
 
 #[derive(Clone)]
@@ -294,6 +297,75 @@ impl MockAgent {
             .await
     }
 
+    /// Make the scripted MCP calls, each shown as a tool call, then end the turn with the last
+    /// call's text.
+    async fn run_mcp_calls(
+        &self,
+        session_id: acp::SessionId,
+        calls: Vec<mcp_calls::Call>,
+    ) -> Result<acp::PromptResponse, acp::Error> {
+        let servers = self
+            .state
+            .mcp_servers
+            .lock()
+            .unwrap()
+            .get(&session_id.to_string())
+            .cloned()
+            .unwrap_or_default();
+        let Some(server) = mcp_calls::Server::find(&servers) else {
+            self.send_text_chunk(session_id, "No nori-client MCP server was offered.")
+                .await?;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        };
+        let mut task_id: Option<String> = None;
+        let mut last = String::new();
+        for (index, mut call) in calls.into_iter().enumerate() {
+            mcp_calls::substitute(&mut call.arguments, task_id.as_deref());
+            let call_id = acp::ToolCallId::new(format!("mcp-call-{index}"));
+            self.send_tool_call(
+                session_id.clone(),
+                acp::ToolCall::new(call_id.clone(), format!("nori-client/{}", call.tool))
+                    .kind(acp::ToolKind::Other)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(call.arguments.clone()),
+            )
+            .await?;
+            let (text, failed) = match server.call(&call.tool, &call.arguments).await {
+                Ok(result) => result,
+                Err(error) => (error, true),
+            };
+            if let Some(id) = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("task_id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned)
+                })
+            {
+                task_id = Some(id);
+            }
+            self.send_tool_call_update(
+                session_id.clone(),
+                acp::ToolCallUpdate::new(
+                    call_id,
+                    acp::ToolCallUpdateFields::new()
+                        .status(if failed {
+                            acp::ToolCallStatus::Failed
+                        } else {
+                            acp::ToolCallStatus::Completed
+                        })
+                        .content(vec![acp::ToolCallContent::from(text.clone())]),
+                ),
+            )
+            .await?;
+            last = text;
+        }
+        self.send_text_chunk(session_id, &format!("MCP: {last}"))
+            .await?;
+        Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+    }
+
     async fn run_prompt(
         self,
         arguments: acp::PromptRequest,
@@ -383,9 +455,39 @@ impl MockAgent {
             std::process::exit(17);
         }
         let session_id = arguments.session_id.clone();
+        let prompt_text: String = arguments
+            .prompt
+            .iter()
+            .filter_map(|content| match content {
+                acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // MOCK_AGENT_PROMPT_LOG: every prompt, as a JSON line naming the agent and session.
+        if let Ok(log) = std::env::var("MOCK_AGENT_PROMPT_LOG") {
+            use std::io::Write as _;
+            let line = json!({
+                "agent": std::env::var("MOCK_AGENT_MODEL_NAME").unwrap_or_default(),
+                "pid": std::process::id(),
+                "session": session_id.to_string(),
+                "text": prompt_text,
+            });
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        }
 
         if let Some(result) = wire_replay::run(&self, &session_id).await {
             return result;
+        }
+
+        let calls = mcp_calls::scripted(&prompt_text);
+        if !calls.is_empty() {
+            return self.run_mcp_calls(session_id, calls).await;
         }
 
         if std::env::var("MOCK_AGENT_PROMPT_UNOWNED_USER_NOTIFICATION").is_ok() {
@@ -458,7 +560,7 @@ impl MockAgent {
         let request_permission = arguments.prompt.iter().any(|block| {
             matches!(
                 block,
-                acp::ContentBlock::Text(text) if text.text == "mock:request-permission"
+                acp::ContentBlock::Text(text) if text.text.contains("mock:request-permission")
             )
         });
         // Support configurable stderr output for testing stderr capture
@@ -1711,6 +1813,11 @@ async fn main() -> acp::Result<()> {
                         }
                     }
                     let session_key = session_id.to_string();
+                    state
+                        .mcp_servers
+                        .lock()
+                        .unwrap()
+                        .insert(session_key.clone(), arguments.mcp_servers.clone());
                     let session_config = default_session_config();
                     state
                         .session_configs

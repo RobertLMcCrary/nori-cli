@@ -51,6 +51,7 @@ pub use backend::AcpBackend;
 pub use backend::AcpBackendConfig;
 pub use backend::BackendEvent;
 pub use backend::SessionContext;
+pub use backend::set_stdio_bridge;
 pub use connection::acp_connection::AcpConnection;
 pub use registry::AcpAgentConfig;
 pub use registry::AcpAgentInfo;

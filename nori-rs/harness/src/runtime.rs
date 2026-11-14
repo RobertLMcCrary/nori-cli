@@ -682,6 +682,8 @@ fn build_backend_config(spec: AgentPrepareSpec) -> AcpBackendConfig {
         crate::config::AutoWorktree::Off
     };
     let agent = config.active_agent.clone();
+    let delegation =
+        crate::backend::orchestrator::Seed::root(Arc::clone(&config), cli_version.clone());
 
     AcpBackendConfig {
         agent: agent.clone(),
@@ -721,7 +723,20 @@ fn build_backend_config(spec: AgentPrepareSpec) -> AcpBackendConfig {
         session_context,
         mcp_servers: config.mcp_servers.clone(),
         mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::default(),
+        delegation,
     }
+}
+
+/// Prepare the agent of a delegated task's child, one level below `parent` in its tree.
+pub(crate) async fn prepare_delegated_agent(
+    spec: AgentPrepareSpec,
+    parent: &crate::backend::orchestrator::Seed,
+) -> anyhow::Result<PreparedAgent> {
+    let mut config = build_backend_config(spec);
+    config.delegation = parent.child(Arc::clone(&config.delegation.config));
+    PreparedAgent::prepare(config)
+        .await
+        .map_err(|failure| failure.error)
 }
 
 /// Activate a prepared ACP connection with the selected session directive.

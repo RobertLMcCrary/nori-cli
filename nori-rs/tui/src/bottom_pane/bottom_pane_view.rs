@@ -4,6 +4,7 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::render::renderable::Renderable;
 use codex_rmcp_client::McpAuthStatus;
 use crossterm::event::KeyEvent;
+use nori_protocol::acp::v1 as acp;
 
 use super::CancellationEvent;
 
@@ -42,6 +43,12 @@ pub(crate) trait BottomPaneView: Renderable {
         request: ApprovalRequest,
     ) -> Option<ApprovalRequest> {
         Some(request)
+    }
+
+    /// A request this view may be asking about no longer needs an answer; drop it. Returns
+    /// whether the view had it.
+    fn withdraw_approval_request(&mut self, _request_id: &acp::RequestId) -> bool {
+        false
     }
 
     /// Update MCP server auth statuses. Only meaningful for the MCP server

@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+mod delegation;
+
+pub use delegation::DelegationCall;
+pub(crate) use delegation::outcome as delegation_outcome;
 use std::path::PathBuf;
 
 use nori_protocol::acp::MaybeUndefined;
@@ -341,6 +345,8 @@ pub enum Invocation {
         input: Option<serde_json::Value>,
     },
     RawJson(serde_json::Value),
+    /// A call to one of Nori's delegated-task tools.
+    Delegation(DelegationCall),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -620,7 +626,11 @@ fn refine_edit_kind(kind: ToolKind, raw_input: &Option<serde_json::Value>) -> To
 
 fn tool_snapshot_from_tool_call(tool_call: &acp::ToolCall, phase: ToolPhase) -> ToolSnapshot {
     let artifacts = artifacts_from_tool_call(tool_call);
-    let invocation = invocation_from_tool_call(tool_call, &artifacts);
+    let invocation = match DelegationCall::recognize(&tool_call.title, tool_call.raw_input.as_ref())
+    {
+        Some(call) => Some(Invocation::Delegation(call)),
+        None => invocation_from_tool_call(tool_call, &artifacts),
+    };
 
     ToolSnapshot {
         call_id: tool_call.tool_call_id.to_string(),

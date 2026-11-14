@@ -36,6 +36,11 @@ impl GitFacts {
         })
     }
 
+    /// The repository's shared git directory: the main one's, for a linked worktree too.
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+
     /// Whether this is a linked worktree rather than the main working tree.
     pub fn is_linked_worktree(&self) -> bool {
         self.kind == gix::repository::Kind::LinkedWorkTree

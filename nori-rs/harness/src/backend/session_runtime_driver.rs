@@ -486,7 +486,9 @@ impl AcpBackend {
 
     async fn handle_completed_turn(&self, completed_turn: &CompletedTurn) {
         match completed_turn.prompt.kind {
-            QueuedPromptKind::User | QueuedPromptKind::GoalContinuation => {
+            QueuedPromptKind::User
+            | QueuedPromptKind::GoalContinuation
+            | QueuedPromptKind::TaskResults => {
                 if let Some(last_agent_message) = &completed_turn.last_agent_message
                     && !last_agent_message.is_empty()
                     && !self.post_agent_response_hooks.is_empty()
@@ -614,6 +616,9 @@ impl AcpBackend {
                 .await;
             }
         }
+        // Results that arrived while the turn ran are handed over now, unless the turn queued
+        // another.
+        self.deliver_task_results_if_idle().await;
     }
 
     async fn maybe_submit_goal_continuation(&self, completed_turn: &CompletedTurn) {
@@ -638,7 +643,7 @@ impl AcpBackend {
             .goal_mcp_connected
             .load(std::sync::atomic::Ordering::Relaxed);
         match completed_turn.prompt.kind {
-            QueuedPromptKind::User => {}
+            QueuedPromptKind::User | QueuedPromptKind::TaskResults => {}
             QueuedPromptKind::GoalContinuation if can_chain_continuation => {}
             QueuedPromptKind::GoalContinuation
             | QueuedPromptKind::Compact
@@ -735,6 +740,10 @@ impl AcpBackend {
                     QueuedPromptKind::GoalContinuation => {
                         self.edit_journal
                             .begin_turn("goal continuation".to_string());
+                    }
+                    QueuedPromptKind::TaskResults => {
+                        self.edit_journal
+                            .begin_turn("delegated task results".to_string());
                     }
                     QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact => {}
                 }
@@ -941,6 +950,10 @@ impl AcpBackend {
             QueuedPromptKind::GoalContinuation => {
                 (format!("Goal continuation failed: {err}"), false)
             }
+            QueuedPromptKind::TaskResults => (
+                format!("Delivering delegated task results failed: {err}"),
+                false,
+            ),
             QueuedPromptKind::User => {
                 let error_string = format!("{err:?}");
                 let AcpErrorDetails {

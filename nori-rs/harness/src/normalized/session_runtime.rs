@@ -188,6 +188,8 @@ pub enum QueuedPromptKind {
     /// and no summary re-injection.
     NativeCompact,
     GoalContinuation,
+    /// Results of delegated tasks, handed to the agent once it is idle.
+    TaskResults,
 }
 
 /// A user prompt waiting to be sent to ACP.

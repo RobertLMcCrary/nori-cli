@@ -221,6 +221,8 @@ pub struct AcpBackendConfig {
     pub mcp_servers: HashMap<String, McpServerConfig>,
     /// OAuth credentials store mode for MCP auth status computation
     pub mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode,
+    /// What the session's children start from, and where it sits among delegations.
+    pub(crate) delegation: orchestrator::Seed,
 }
 
 /// First-prompt product context selected from the agent's actual MCP support.
@@ -348,6 +350,8 @@ pub struct AcpBackend {
     runtime_task_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     /// Abort handle for the connection event relay task.
     relay_task_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    /// The tasks this session delegated to child sessions.
+    orchestrator: orchestrator::Orchestrator,
 }
 
 impl AcpBackend {
@@ -385,6 +389,8 @@ pub mod browser_session;
 mod goal_ext;
 mod nori_client_context;
 mod nori_client_mcp;
+pub(crate) mod orchestrator;
+pub use nori_client_mcp::set_stdio_bridge;
 pub mod prepared;
 mod session;
 mod session_defaults;

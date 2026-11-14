@@ -220,6 +220,22 @@ impl BottomPaneView for ApprovalOverlay {
         self.done
     }
 
+    fn withdraw_approval_request(&mut self, request_id: &acp::RequestId) -> bool {
+        if self
+            .current_request
+            .as_ref()
+            .is_some_and(|request| &request.request_id == request_id)
+        {
+            self.current_request = None;
+            self.advance_queue();
+            return true;
+        }
+        let queued = self.queue.len();
+        self.queue
+            .retain(|request| &request.request_id != request_id);
+        self.queue.len() != queued
+    }
+
     fn try_consume_approval_request(
         &mut self,
         request: ApprovalRequest,

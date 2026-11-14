@@ -74,6 +74,14 @@ impl ClientToolCell {
         &self.snapshot.kind
     }
 
+    /// Whether this is a call to one of Nori's delegated-task tools.
+    pub(crate) fn is_delegation(&self) -> bool {
+        matches!(
+            self.snapshot.invocation,
+            Some(crate::presentation::Invocation::Delegation(_))
+        )
+    }
+
     pub(crate) fn is_exploring(&self) -> bool {
         is_exploring_snapshot(&self.snapshot) || !self.exploring_snapshots.is_empty()
     }
@@ -354,6 +362,41 @@ impl ClientToolCell {
             lines.push(Line::from(vec![bullet, " ".into(), header.bold()]));
         }
 
+        lines
+    }
+
+    /// A delegated-task call: what it did and how it came out. The child's own work is shown
+    /// as its subagent, not here.
+    fn render_delegation_lines(
+        &self,
+        call: &crate::presentation::DelegationCall,
+    ) -> Vec<Line<'static>> {
+        let active = self.is_active();
+        let bullet = if active {
+            spinner(self.start_time, self.animations_enabled)
+        } else if self.snapshot.phase == crate::presentation::ToolPhase::Failed {
+            "•".red().bold()
+        } else {
+            "•".dim()
+        };
+        let mut lines = vec![Line::from(vec![
+            bullet,
+            " ".into(),
+            call.header(active).bold(),
+        ])];
+        let outcome = self
+            .snapshot
+            .artifacts
+            .iter()
+            .find_map(|artifact| match artifact {
+                crate::presentation::Artifact::Text { text } => {
+                    crate::presentation::delegation_outcome(text)
+                }
+                crate::presentation::Artifact::Diff(_) => None,
+            });
+        if let Some(outcome) = outcome {
+            lines.push(Line::from(vec!["  └ ".dim(), outcome.dim()]));
+        }
         lines
     }
 
@@ -784,7 +827,9 @@ fn create_contextual_patch(
 
 impl HistoryCell for ClientToolCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
+        if let Some(crate::presentation::Invocation::Delegation(call)) = &self.snapshot.invocation {
+            self.render_delegation_lines(call)
+        } else if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
             self.render_exploring_lines(width)
         } else if self.snapshot.kind == crate::presentation::ToolKind::Execute {
             self.render_execute_lines(width)
@@ -802,7 +847,9 @@ impl HistoryCell for ClientToolCell {
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
+        if let Some(crate::presentation::Invocation::Delegation(call)) = &self.snapshot.invocation {
+            self.render_delegation_lines(call)
+        } else if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
             self.render_exploring_lines(width)
         } else if self.snapshot.kind == crate::presentation::ToolKind::Execute {
             self.render_execute_transcript_lines(width)

@@ -11,6 +11,8 @@ impl AcpBackend {
     }
 
     pub(crate) async fn cancel(&self) -> Result<()> {
+        // Stopping a session stops the tasks it delegated.
+        self.orchestrator.stop().await;
         self.session_event_tx
             .send(session_runtime_driver::SessionRuntimeInput::Reducer(
                 session_reducer::InboundEvent::CancelSubmit,
@@ -29,6 +31,7 @@ impl AcpBackend {
     }
 
     pub(crate) async fn shutdown(&self, child_grace: std::time::Duration) -> Result<()> {
+        self.orchestrator.shutdown().await;
         self.teardown(true, Some(child_grace)).await;
         let _ = self
             .backend_event_tx
@@ -220,6 +223,8 @@ impl AcpBackend {
             let _ = response_tx.send(Err(anyhow::anyhow!("prompt content is empty")));
             return;
         }
+        // Results a stop held back are handed over once this turn ends.
+        self.orchestrator.release_held().await;
 
         if admission == PromptAdmission::RejectIfBusy {
             let (barrier_tx, barrier_rx) = oneshot::channel();

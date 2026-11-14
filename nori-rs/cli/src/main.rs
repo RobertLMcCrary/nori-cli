@@ -355,6 +355,10 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         subcommand,
     } = MultitoolCli::parse();
     nori_tui::startup_trace::mark("args_parsed");
+    // Agents without HTTP MCP reach Nori's own MCP server through this binary.
+    if let Ok(exe) = std::env::current_exe() {
+        nori_harness::set_stdio_bridge(exe, vec!["stdio-to-uds".to_owned()]);
+    }
 
     // Initialize ACP rolling file tracing in $NORI_HOME/log/ (non-critical, log warning on failure)
     // Logs are stored as daily rolling files like: ~/.nori/cli/log/nori-acp.2024-01-15.log

@@ -125,6 +125,7 @@ impl ChatWidget {
             session_close_in_flight: false,
             exiting: false,
             agent_config: crate::nori::agent_config_state::AgentConfigState::default(),
+            model_cycle: Default::default(),
             agent_status: crate::nori::session_header::AgentStatusHandle::new(
                 crate::nori::session_header::AgentStatus::new(&config.active_agent),
             ),
@@ -310,6 +311,7 @@ impl ChatWidget {
             session_close_in_flight: false,
             exiting: false,
             agent_config: crate::nori::agent_config_state::AgentConfigState::default(),
+            model_cycle: Default::default(),
             agent_status: crate::nori::session_header::AgentStatusHandle::new(
                 crate::nori::session_header::AgentStatus::new(&config.active_agent),
             ),

@@ -10,6 +10,7 @@ async fn session_mcp_servers(
     backend_event_tx: &mpsc::Sender<BackendEvent>,
     goal_mcp_connected: &Arc<std::sync::atomic::AtomicBool>,
     goal_mcp_http_server: &Arc<Mutex<Option<nori_client_mcp::NoriClientServer>>>,
+    orchestrator: &orchestrator::Orchestrator,
 ) -> Result<Vec<acp::McpServer>> {
     let mut mcp_servers = crate::connection::mcp::to_acp_mcp_servers(
         &config.mcp_servers,
@@ -21,6 +22,7 @@ async fn session_mcp_servers(
         Arc::clone(thread_goal_state),
         backend_event_tx.clone(),
         Arc::clone(goal_mcp_connected),
+        orchestrator.clone(),
     )
     .await?;
     if let Some(server) = nori_client_server {
@@ -146,6 +148,8 @@ impl AcpBackend {
         } = prepared.into_parts();
         let config = &config;
         let cwd = config.cwd.clone();
+        let (orchestrator, orchestrator_signals) =
+            orchestrator::Orchestrator::new(config.delegation.clone(), backend_event_tx.clone());
 
         debug!(
             "Resuming ACP session (acp_session_id={:?}) for agent: {}",
@@ -317,6 +321,7 @@ impl AcpBackend {
                 &backend_event_tx,
                 &goal_mcp_connected,
                 &goal_mcp_http_server,
+                &orchestrator,
             )
             .await?;
 
@@ -429,6 +434,7 @@ impl AcpBackend {
                         &backend_event_tx,
                         &goal_mcp_connected,
                         &goal_mcp_http_server,
+                        &orchestrator,
                     )
                     .await?;
                     let session_id = match connection.create_session(&cwd, mcp_servers).await {
@@ -500,6 +506,7 @@ impl AcpBackend {
                 &backend_event_tx,
                 &goal_mcp_connected,
                 &goal_mcp_http_server,
+                &orchestrator,
             )
             .await?;
 
@@ -546,6 +553,7 @@ impl AcpBackend {
                 &backend_event_tx,
                 &goal_mcp_connected,
                 &goal_mcp_http_server,
+                &orchestrator,
             )
             .await?;
             let session_id = match connection.create_session(&cwd, mcp_servers).await {
@@ -622,19 +630,24 @@ impl AcpBackend {
         let (history_log_id, history_entry_count) =
             crate::message_history::history_metadata(&config.nori_home).await;
 
-        let transcript_recorder = match TranscriptRecorder::new(
-            &config.nori_home,
-            &cwd,
-            Some(config.agent.clone()),
-            &config.cli_version,
-            Some(session_id.to_string()),
-        )
-        .await
-        {
-            Ok(recorder) => Some(Arc::new(recorder)),
-            Err(e) => {
-                warn!("Failed to initialize transcript recorder: {e}");
-                None
+        // A child keeps no transcript of its own: its parent's shows what it did.
+        let transcript_recorder = if config.delegation.is_child() {
+            None
+        } else {
+            match TranscriptRecorder::new(
+                &config.nori_home,
+                &cwd,
+                Some(config.agent.clone()),
+                &config.cli_version,
+                Some(session_id.to_string()),
+            )
+            .await
+            {
+                Ok(recorder) => Some(Arc::new(recorder)),
+                Err(e) => {
+                    warn!("Failed to initialize transcript recorder: {e}");
+                    None
+                }
             }
         };
         if let (Some(recorder), Some(transcript)) = (&transcript_recorder, transcript) {
@@ -707,6 +720,7 @@ impl AcpBackend {
             cancel_timeout_abort: Arc::new(Mutex::new(None)),
             runtime_task_abort: Arc::new(Mutex::new(None)),
             relay_task_abort: Arc::new(Mutex::new(None)),
+            orchestrator,
         };
 
         let runtime_backend = backend.clone();
@@ -731,6 +745,12 @@ impl AcpBackend {
             }
         });
         *backend.runtime_task_abort.lock().await = Some(runtime_task.abort_handle());
+        backend.orchestrator.bind(orchestrator::Binding {
+            session_id: backend.session_id().await,
+            approval_policy: backend.approval_policy_tx.subscribe(),
+        });
+        backend.serve_orchestrator(orchestrator_signals);
+        orchestrator::remember_models(&config.nori_home, &config.agent, &backend.config_options());
 
         // Execute session_start hooks
         run_session_start_hooks(

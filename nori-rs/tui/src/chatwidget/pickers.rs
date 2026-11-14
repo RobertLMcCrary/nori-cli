@@ -821,7 +821,8 @@ impl ChatWidget {
                                     focus_config_id: Some(config_id_for_result.clone()),
                                 });
                             }
-                            crate::nori::session_config_picker::ConfigPickerOrigin::Direct => {}
+                            crate::nori::session_config_picker::ConfigPickerOrigin::Direct
+                            | crate::nori::session_config_picker::ConfigPickerOrigin::Cycle => {}
                         }
                         app_event_tx.send(AppEvent::AcpSessionConfigSetResult {
                             success: true,
@@ -831,6 +832,7 @@ impl ChatWidget {
                             option_name: option_name_for_result,
                             value_name: value_name_for_result,
                             is_custom_model,
+                            origin,
                             config_options: Some(config_options),
                             error: None,
                         });
@@ -844,6 +846,7 @@ impl ChatWidget {
                             option_name: option_name_for_result,
                             value_name: value_name_for_result,
                             is_custom_model,
+                            origin,
                             config_options: None,
                             error: Some(err.to_string()),
                         });

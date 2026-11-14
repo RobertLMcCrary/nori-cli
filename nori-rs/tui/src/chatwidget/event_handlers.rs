@@ -287,6 +287,25 @@ impl ChatWidget {
                 self.on_prompt_summary(summary.summary);
             }
             nori_protocol::NoriEvent::Notice(notice) => self.on_warning(notice.message),
+            nori_protocol::NoriEvent::RequestWithdrawn(request_id) => {
+                self.bottom_pane.withdraw_approval_request(&request_id);
+            }
+            nori_protocol::NoriEvent::TaskResultsDelivered(delivered) => {
+                let count = delivered.tasks.len();
+                let titles = delivered
+                    .tasks
+                    .iter()
+                    .map(|task| format!("{} ({})", task.title, task.agent))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                self.add_info_message(
+                    match count {
+                        1 => "Handed the agent a delegated task's result:".to_owned(),
+                        count => format!("Handed the agent {count} delegated tasks' results:"),
+                    },
+                    Some(titles),
+                );
+            }
             nori_protocol::NoriEvent::RequestFailed(failure) => {
                 if !self.session_configured_received {
                     self.bottom_pane.hide_status_indicator();
@@ -1225,11 +1244,14 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
 
         // Buffer incomplete Execute ClientToolCells instead of flushing
-        // them to history with wrong content (description text as output).
+        // them to history with wrong content (description text as output),
+        // and incomplete delegations, which run in parallel and would stay
+        // "Delegating…" in the scrollback.
         if let Some(active) = self.active_cell.take() {
             if let Some(client_cell) = active.as_any().downcast_ref::<ClientToolCell>()
                 && client_cell.is_active()
-                && *client_cell.snapshot_kind() == crate::presentation::ToolKind::Execute
+                && (*client_cell.snapshot_kind() == crate::presentation::ToolKind::Execute
+                    || client_cell.is_delegation())
             {
                 let call_id = client_cell.call_id().to_owned();
                 if let Ok(boxed) = active.into_any().downcast::<ClientToolCell>() {

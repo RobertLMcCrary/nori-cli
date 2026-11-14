@@ -1223,6 +1223,9 @@ impl App {
                     origin,
                 );
             }
+            AppEvent::CycleModel(step) => {
+                self.chat_widget.cycle_model(step);
+            }
             AppEvent::AcpSessionConfigSetResult {
                 success,
                 agent,
@@ -1231,10 +1234,32 @@ impl App {
                 option_name,
                 value_name,
                 is_custom_model,
+                origin,
                 config_options,
                 error,
             } => {
-                if success {
+                let cycled =
+                    origin == crate::nori::session_config_picker::ConfigPickerOrigin::Cycle;
+                if cycled {
+                    // The footer already shows the model; only a refusal is worth a line.
+                    if success
+                        && let Err(err) = self
+                            .persist_default_model_selection(
+                                &agent,
+                                &config_id,
+                                &value,
+                                config_options.as_deref().unwrap_or_default(),
+                            )
+                            .await
+                    {
+                        tracing::error!(error = %err, "failed to persist default model selection");
+                    }
+                    self.chat_widget.on_model_cycle_result(if success {
+                        Ok(config_options)
+                    } else {
+                        Err(error.unwrap_or_else(|| "Unknown error".to_string()))
+                    });
+                } else if success {
                     let saved_as_default = match self
                         .persist_default_model_selection(
                             &agent,

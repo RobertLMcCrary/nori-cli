@@ -350,6 +350,7 @@ fn format_invocation(invocation: &Option<crate::presentation::Invocation>) -> Op
             None => Some(format!("Tool: {tool_name}")),
         },
         crate::presentation::Invocation::RawJson(value) => Some(format!("Input: {value}")),
+        crate::presentation::Invocation::Delegation(call) => Some(call.header(false)),
     }
 }
 

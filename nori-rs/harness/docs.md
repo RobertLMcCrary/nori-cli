@@ -364,6 +364,60 @@ with `update_goal` from the `nori-client` MCP server when complete or blocked,
 and verify the returned status. Native or unqualified `create_goal`, `get_goal`,
 and `update_goal` tools must not control Nori continuation.
 
+#### Delegated tasks
+
+Any agent Nori runs can delegate work to a child on any configured agent and
+model, so a Claude session can hand a task to Codex and the other way round.
+`backend/orchestrator/` owns this; the agent reaches it through task tools on
+the same `nori-client` server: `agent_capabilities`, `delegate_task`,
+`task_status`, `task_wait`, `task_send`, `task_cancel`, and `task_list`.
+
+- **Reaching the server.** An agent that speaks HTTP MCP gets the loopback HTTP
+  server. Any other agent gets a stdio server, `nori stdio-to-uds <socket>`,
+  which relays to the same service on a unix socket in a directory only the
+  user can enter (`set_stdio_bridge`, set by the CLI at startup).
+- **A child is a full harness session.** It has its own agent process,
+  approvals, and `nori-client` server, so it can delegate in turn. It starts
+  with the parent's current approval policy and never a broader one, and keeps
+  no transcript of its own. Its updates reach the parent's stream as
+  `NoriEvent::Subagent` and `AcpEvent::ChildNotification`, under a view
+  session id unique to each task. Its permission requests are asked in the
+  parent conversation and answered back to the child; they are withdrawn when
+  the task ends.
+- **Results come back once, without polling.** `delegate_task` returns at once
+  by default. When a task ends unread, the parent agent receives its result in
+  a hidden `QueuedPromptKind::TaskResults` turn as soon as it is idle, either
+  at once or when its current turn ends. That turn is the completion wake: one
+  wake carries every owed result, inlined up to 16 KiB, and the client sees
+  `NoriEvent::TaskResultsDelivered`. Reading a finished task with
+  `task_status` or `task_wait` delivers it instead.
+- **Waiting is bounded.** A blocking `task_wait` or `mode: wait` call returns
+  within 50 seconds (agents drop silent MCP calls; Codex after 60 seconds), or
+  sooner if a child needs approval. A timeout cancels nothing: the task wakes
+  the parent when it ends.
+- **Stopping and follow-ups.** The user stopping the parent cancels every
+  running task. Results that arrived before the stop are held until the user's
+  next turn ends. `task_send` starts a new task on the child of a finished
+  one, which keeps its whole conversation.
+- **Nested delegation.** A child whose turn ends while its own delegations
+  still run keeps its task open until they end and the turn that takes their
+  results ends.
+- **Limits.** At most 8 tasks run at once across a tree of delegations.
+  Delegations nest at most 3 deep.
+- **Models and settings.** A model is chosen by value or name from the agent's
+  model option. An agent that takes its model at spawn may run one it does not
+  list. Other select settings, such as reasoning effort, are set with
+  `options`. A permission mode can be set only when the parent runs without
+  approvals. What each agent offered is remembered across runs in
+  `<nori home>/agent-models.json` for `agent_capabilities`.
+- **Progress.** While a task runs, its snapshot carries the child's latest tool
+  call or line of text and its tool-call count. Once it ends, the snapshot
+  lists the files the child's edit tools changed. Results that come in within
+  600 ms of each other share one wake.
+- **Worktrees.** `isolation: worktree` adds a detached worktree under
+  `<repo>/.worktrees/` and lists `/.worktrees/` in the repository's local
+  exclude file. The worktree is kept afterwards: it holds the child's work.
+
 #### Request routing
 
 ACP permission requests that require a consumer decision are emitted as

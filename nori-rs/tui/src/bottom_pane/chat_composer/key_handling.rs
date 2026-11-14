@@ -733,6 +733,34 @@ impl ChatComposer {
                 self.app_event_tx.send(AppEvent::BeginExit);
                 (InputResult::None, true)
             }
+            // Next and previous model (Ctrl+N / Ctrl+P by default). With a popup open they move
+            // through its list instead; the popup handles them before this point.
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && matches_binding(
+                        self.textarea
+                            .hotkey_config()
+                            .binding_for(nori_config::HotkeyAction::NextModel),
+                        &key_event,
+                    ) =>
+            {
+                self.app_event_tx
+                    .send(AppEvent::CycleModel(crate::chatwidget::ModelStep::Next));
+                (InputResult::None, true)
+            }
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && matches_binding(
+                        self.textarea
+                            .hotkey_config()
+                            .binding_for(nori_config::HotkeyAction::PreviousModel),
+                        &key_event,
+                    ) =>
+            {
+                self.app_event_tx
+                    .send(AppEvent::CycleModel(crate::chatwidget::ModelStep::Previous));
+                (InputResult::None, true)
+            }
             // -------------------------------------------------------------
             // History navigation (Up / Down) – only when the composer is not
             // empty or when the cursor is at the correct position, to avoid
@@ -740,11 +768,6 @@ impl ChatComposer {
             // -------------------------------------------------------------
             KeyEvent {
                 code: KeyCode::Up | KeyCode::Down,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('p') | KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 if self
@@ -754,8 +777,6 @@ impl ChatComposer {
                     let replace_text = match key_event.code {
                         KeyCode::Up => self.history.navigate_up(&self.app_event_tx),
                         KeyCode::Down => self.history.navigate_down(&self.app_event_tx),
-                        KeyCode::Char('p') => self.history.navigate_up(&self.app_event_tx),
-                        KeyCode::Char('n') => self.history.navigate_down(&self.app_event_tx),
                         _ => unreachable!(),
                     };
                     if let Some(text) = replace_text {

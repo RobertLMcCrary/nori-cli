@@ -398,6 +398,15 @@ opened through the custom-model input to the set request, and only `Panel`
 reopens `/config`. Switching agents with `/agent` skips the resume picker when
 the new agent lists no sessions and starts a session at once.
 
+The Next Model and Previous Model hotkeys (default `ctrl+n` and `ctrl+p`) step
+through the models the agent offers without a picker (`chatwidget/model_cycle.rs`,
+origin `Cycle`). A press updates the advertised configuration in place, so the
+footer shows the new model at once and the agent's echo of the change adds no
+history line. One request is out at a time: presses made while it is out only
+move the target, which is sent when the request returns. A refusal restores the
+model from before the run and says why. Up and Down keep prompt-history recall;
+with a popup open, `ctrl+n` and `ctrl+p` move through its list.
+
 `/settings` is searchable through the shared-picker adapter. Each setting
 builds its search value from the displayed name and optional description before
 the panel opens, so filtering can match either the setting identity or its
@@ -580,6 +589,14 @@ overlay. The live block above the composer shows a header and an activity row
 per running child, capped at a third of the screen with a `+N more` row; a
 frame visits only the rows it shows. Permission requests from a child carry
 its label.
+
+Tasks an agent delegates through Nori's own task tools are shown the same
+way: each task is a subagent labelled with its title and its agent and model
+(`Codex · GPT-5.1`). The parent's calls to those tools are recognised whatever
+the agent names them (`presentation/delegation.rs`, `Invocation::Delegation`)
+and read as sentences ("Delegated to codex: Review the parser",
+"task-1 running in the background") instead of raw JSON. A completion wake
+adds one info line naming the tasks whose results were handed over.
 
 #### Lifecycle behavior
 

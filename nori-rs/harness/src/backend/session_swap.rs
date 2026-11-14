@@ -52,6 +52,7 @@ impl AcpBackend {
                 Arc::clone(&self.thread_goal_state),
                 self.backend_event_tx.clone(),
                 Arc::clone(&self.goal_mcp_connected),
+                self.orchestrator.clone(),
             )
             .await
             {
@@ -65,7 +66,8 @@ impl AcpBackend {
         let nori_client_advertised = mcp_servers.iter().any(|server| {
             matches!(
                 server,
-                acp::McpServer::Http(http) if http.name == "nori-client"
+                acp::McpServer::Http(acp::McpServerHttp { name, .. })
+                    | acp::McpServer::Stdio(acp::McpServerStdio { name, .. }) if name == "nori-client"
             )
         });
 
@@ -93,6 +95,10 @@ impl AcpBackend {
                 // nori-client loop can take the local goal back over.
                 self.stop_stale_ext_goal().await;
                 *self.session_id.write().await = new_session_id.clone();
+                self.orchestrator.bind(orchestrator::Binding {
+                    session_id: new_session_id.clone(),
+                    approval_policy: self.approval_policy_tx.subscribe(),
+                });
                 if matches!(mode, SessionSwapMode::ForkFromHead { .. }) {
                     self.fork_transcript(&new_session_id).await;
                 }

@@ -58,6 +58,8 @@ mod agent_status;
 mod conflate;
 mod layout_cache;
 mod local_echo;
+mod model_cycle;
+pub(crate) use model_cycle::ModelStep;
 mod stream_frame;
 pub(crate) mod subagents;
 pub(crate) use self::agent::HarnessHandle;
@@ -259,6 +261,8 @@ pub(crate) struct ChatWidget {
     /// Authoritative for `/config`, the mode footer, the config history lines,
     /// and the status card.
     agent_config: crate::nori::agent_config_state::AgentConfigState,
+    /// Model presses (Ctrl+N / Ctrl+P) still being applied.
+    model_cycle: model_cycle::ModelCycle,
     /// The agent identity and configuration as rendered by the status views.
     /// Shared with the welcome card so it fills in when the agent advertises
     /// its configuration after the card was already written to history.

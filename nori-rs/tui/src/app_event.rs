@@ -284,6 +284,9 @@ pub(crate) enum AppEvent {
         origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     },
 
+    /// Step to the next or previous model the agent offers.
+    CycleModel(crate::chatwidget::ModelStep),
+
     /// Set an ACP session config option value.
     SetAcpSessionConfigOption {
         config_id: String,
@@ -311,6 +314,8 @@ pub(crate) enum AppEvent {
         value_name: String,
         /// Whether the value came from the free-text custom model input.
         is_custom_model: bool,
+        /// Where the choice came from.
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
         config_options: Option<Vec<SessionConfigOption>>,
         error: Option<String>,
     },

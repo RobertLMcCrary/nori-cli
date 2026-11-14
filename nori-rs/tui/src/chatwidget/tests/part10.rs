@@ -1858,7 +1858,7 @@ fn user_cancellation_adds_interrupted_cell() {
 
 /// Launch a live mock-agent session and wait for it to start, returning its
 /// handle for driving session-config operations.
-async fn start_mock_session() -> nori_harness::runtime::LaunchedSession {
+pub(super) async fn start_mock_session() -> nori_harness::runtime::LaunchedSession {
     let temp = tempfile::tempdir().expect("create session directory");
     let config = nori_config::NoriConfig {
         active_agent: "mock-model".to_string(),
