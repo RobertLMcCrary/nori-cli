@@ -214,7 +214,7 @@ pub struct AcpBackendConfig {
     /// Used by fork to provide conversation history as context to the new session.
     pub initial_context: Option<String>,
     /// Optional session context injected into the first prompt without
-    /// `SUMMARY_PREFIX` framing. Used to provide product-level context
+    /// checkpoint framing. Used to provide product-level context
     /// (e.g. "you are running inside the nori CLI").
     pub session_context: Option<SessionContext>,
     /// MCP server configuration for listing via /mcp command
@@ -273,8 +273,10 @@ pub struct AcpBackend {
     conversation_id: Arc<RwLock<ConversationId>>,
     /// Sender for broadcasting approval policy updates to the handler
     approval_policy_tx: watch::Sender<AskForApproval>,
-    /// Stored summary from last /compact operation, to be prepended to next prompt
+    /// The checkpoint the next prompt opens with: left by `/compact`, a fork, or a resume.
     pending_compact_summary: Arc<Mutex<Option<String>>>,
+    /// The running compaction already reminded the agent of the summary template.
+    compact_nudged: Arc<AtomicBool>,
     /// Persistent goal for this ACP session.
     thread_goal_state: Arc<Mutex<thread_goal::ThreadGoalState>>,
     /// True after the active ACP agent has successfully opened the backend-owned
@@ -410,6 +412,7 @@ pub use transcript::transcript_to_replay_client_events;
 pub use transcript::transcript_to_replay_session_events;
 pub use transcript::transcript_to_summary;
 mod child_edits;
+mod compaction;
 mod hooks;
 
 fn public_nori_capabilities(

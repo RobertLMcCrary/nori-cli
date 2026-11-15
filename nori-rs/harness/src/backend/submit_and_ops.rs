@@ -299,23 +299,10 @@ impl AcpBackend {
             return Ok(());
         }
 
-        let _ = self
-            .session_event_tx
-            .send(session_runtime_driver::SessionRuntimeInput::Reducer(
-                session_reducer::InboundEvent::PromptSubmit(
-                    crate::normalized::session_runtime::QueuedPrompt {
-                        event_id: id.to_string(),
-                        kind: crate::normalized::session_runtime::QueuedPromptKind::Compact,
-                        text: SUMMARIZATION_PROMPT.to_string(),
-                        prompt_meta: None,
-                        original_content: Vec::new(),
-                        content: vec![acp::ContentBlock::Text(acp::TextContent::new(
-                            SUMMARIZATION_PROMPT,
-                        ))],
-                        display_text: None,
-                    },
-                ),
-            ))
+        // A new compaction starts with its reminder unused.
+        self.compact_nudged
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.submit_compaction_prompt(id, SUMMARIZATION_PROMPT)
             .await;
 
         Ok(())

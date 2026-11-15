@@ -784,8 +784,15 @@ async fn compact_session_swap_accepts_new_session_usage_live_and_after_reload() 
             "MOCK_AGENT_CONTEXT_SEQUENCE",
             r#"[[{"used":100,"size":1000}],[{"used":120,"size":1000}],[{"used":40,"size":1000}]]"#,
         );
+        std::env::set_var(
+            "MOCK_AGENT_SUMMARY_RESPONSE",
+            "## Objective\n- Check context usage",
+        );
     }
-    let _guard = EnvGuard(vec!["MOCK_AGENT_CONTEXT_SEQUENCE"]);
+    let _guard = EnvGuard(vec![
+        "MOCK_AGENT_CONTEXT_SEQUENCE",
+        "MOCK_AGENT_SUMMARY_RESPONSE",
+    ]);
     let dir = tempfile::tempdir().expect("session directory");
     let mut session = launch(dir.path(), nori_harness::runtime::SessionStart::New).await;
     let current = started(&mut session).await;

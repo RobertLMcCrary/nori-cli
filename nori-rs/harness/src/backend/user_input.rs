@@ -108,8 +108,8 @@ impl AcpBackend {
         let prompt_text_for_hooks = display_text;
 
         // Prepend any accumulated hook context (from ::context:: lines)
-        // This must happen before the compact summary prefix so that the
-        // SUMMARY_PREFIX framing instruction always comes first.
+        // This must happen before the checkpoint so that the checkpoint always
+        // comes first.
         let prompt_with_context = if let Some(ctx) = self.pending_hook_context.lock().await.take() {
             format!("{ctx}\n{prompt_text}")
         } else {
@@ -119,11 +119,10 @@ impl AcpBackend {
             .prepend_goal_context_to_prompt(prompt_with_context)
             .await;
 
-        // Check if we have a pending compact summary to prepend
-        let pending_summary = self.pending_compact_summary.lock().await.take();
-        let final_prompt_text = if let Some(summary) = pending_summary {
-            use crate::compact::SUMMARY_PREFIX;
-            format!("{SUMMARY_PREFIX}\n{summary}\n\n{prompt_with_goal_context}")
+        // A compaction, fork, or resume leaves a checkpoint for the first prompt to open with.
+        let pending_checkpoint = self.pending_compact_summary.lock().await.take();
+        let final_prompt_text = if let Some(checkpoint) = pending_checkpoint {
+            format!("{checkpoint}\n\n{prompt_with_goal_context}")
         } else {
             prompt_with_goal_context
         };

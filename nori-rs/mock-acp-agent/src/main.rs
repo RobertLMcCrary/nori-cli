@@ -485,6 +485,22 @@ impl MockAgent {
             return result;
         }
 
+        // MOCK_AGENT_SUMMARY_RESPONSE answers Nori's compaction prompt, and
+        // MOCK_AGENT_NUDGED_SUMMARY_RESPONSE the reminder sent when a summary skipped the template.
+        let summary_reply = if prompt_text.contains("You MUST summarize the conversation above") {
+            std::env::var("MOCK_AGENT_SUMMARY_RESPONSE").ok()
+        } else if prompt_text.contains("did not fill in the required summary template") {
+            std::env::var("MOCK_AGENT_NUDGED_SUMMARY_RESPONSE").ok()
+        } else {
+            None
+        };
+        if let Some(reply) = summary_reply {
+            // A summary turn reports its context usage like any other.
+            context_usage::emit(&self, &session_id).await?;
+            self.send_text_chunk(session_id, &reply).await?;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+
         let calls = mcp_calls::scripted(&prompt_text);
         if !calls.is_empty() {
             return self.run_mcp_calls(session_id, calls).await;

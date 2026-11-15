@@ -707,7 +707,10 @@ impl AcpBackend {
             acp_proxy: config.acp_proxy.clone(),
             conversation_id: Arc::new(RwLock::new(conversation_id)),
             approval_policy_tx,
-            pending_compact_summary: Arc::new(Mutex::new(pending_summary)),
+            compact_nudged: Arc::new(AtomicBool::new(false)),
+            pending_compact_summary: Arc::new(Mutex::new(
+                pending_summary.map(|summary| crate::compact::checkpoint(&summary, None)),
+            )),
             thread_goal_state,
             goal_mcp_connected,
             goal_mcp_http_server,

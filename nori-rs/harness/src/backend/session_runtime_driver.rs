@@ -579,33 +579,7 @@ impl AcpBackend {
                 self.maybe_submit_goal_continuation(completed_turn).await;
             }
             QueuedPromptKind::Compact => {
-                let Some(summary) = completed_turn.last_agent_message.clone() else {
-                    return;
-                };
-                *self.pending_compact_summary.lock().await = Some(summary.clone());
-
-                if let Err(err) = self
-                    .swap_active_session(session_swap::SessionSwapMode::NewAfterCompact)
-                    .await
-                {
-                    warn!("Failed to create new session after compact: {err}");
-                }
-
-                self.forward_client_event(ClientEvent::ContextCompacted(
-                    crate::normalized::ContextCompacted {
-                        summary: Some(summary),
-                    },
-                ))
-                .await;
-
-                let _ = self
-                    .backend_event_tx
-                    .send(BackendEvent::Public(SessionEvent::Nori(
-                        nori_protocol::NoriEvent::Notice(nori_protocol::Notice {
-                            message: "Heads up: Long conversations and multiple compactions can cause the model to be less accurate. Start a new conversation when possible to keep conversations small and targeted.".to_string(),
-                        }),
-                    )))
-                    .await;
+                self.finish_compaction(completed_turn).await;
             }
             QueuedPromptKind::NativeCompact => {
                 // Native compaction is an ordinary in-session turn: no session

@@ -280,7 +280,13 @@ impl AcpBackend {
             acp_proxy: config.acp_proxy.clone(),
             conversation_id: Arc::new(RwLock::new(conversation_id)),
             approval_policy_tx,
-            pending_compact_summary: Arc::new(Mutex::new(config.initial_context.clone())),
+            compact_nudged: Arc::new(AtomicBool::new(false)),
+            pending_compact_summary: Arc::new(Mutex::new(
+                config
+                    .initial_context
+                    .as_deref()
+                    .map(|context| crate::compact::checkpoint(context, None)),
+            )),
             thread_goal_state,
             goal_mcp_connected,
             goal_mcp_http_server,

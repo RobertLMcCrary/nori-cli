@@ -224,50 +224,113 @@ async fn native_compact_forwards_without_swapping_session() {
     assert_eq!(first_prompt_text(&prompts[2]), "hi");
 }
 
-#[tokio::test]
-#[serial]
-async fn compact_without_native_support_swaps_and_injects_summary() {
+/// Run `/compact` on a session that has had one prompt, and return the prompts the agent got and
+/// whether the compaction completed.
+#[expect(
+    clippy::expect_used,
+    reason = "test helpers fail with a focused boundary diagnostic"
+)]
+async fn compact_after_one_prompt(
+    summary: &str,
+    nudged_summary: &str,
+) -> (Vec<serde_json::Value>, String, bool) {
+    // SAFETY: mock-agent env-mutating tests run serially.
+    unsafe {
+        std::env::set_var("MOCK_AGENT_SUMMARY_RESPONSE", summary);
+        std::env::set_var("MOCK_AGENT_NUDGED_SUMMARY_RESPONSE", nudged_summary);
+    }
+    let _summary = EnvGuard("MOCK_AGENT_SUMMARY_RESPONSE");
+    let _nudged = EnvGuard("MOCK_AGENT_NUDGED_SUMMARY_RESPONSE");
     let (temp, wire) = temp_dirs();
     let mut session = launch_with_wire_log(temp.path(), &wire).await;
-
     let bootstrap_session_id = wait_for_started(&mut session).await;
+    let warm_up = submit_text(&session, "warm up").await;
+    drive_prompt_to_completion(&mut session, &warm_up).await;
 
     session.handle.compact().await.expect("compact");
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let compacted = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let SessionEvent::Nori(NoriEvent::ContextCompacted(_)) =
-                session.events.recv().await.expect("event stream closed")
-            {
-                return;
+            match session.events.recv().await.expect("event stream closed") {
+                SessionEvent::Nori(NoriEvent::ContextCompacted(_)) => return true,
+                SessionEvent::Nori(NoriEvent::Notice(notice))
+                    if notice.message.starts_with("Compaction failed") =>
+                {
+                    return false;
+                }
+                _ => {}
             }
         }
     })
     .await
-    .expect("fallback compact should emit ContextCompacted");
+    .expect("compaction should end");
 
     let follow_up = submit_text(&session, "hi").await;
     drive_prompt_to_completion(&mut session, &follow_up).await;
-
     session.handle.shutdown().await.expect("shutdown");
+    (recorded_prompts(&wire), bootstrap_session_id, compacted)
+}
 
-    let prompts = recorded_prompts(&wire);
+#[tokio::test]
+#[serial]
+async fn compact_without_native_support_swaps_and_injects_summary() {
+    let (prompts, bootstrap_session_id, compacted) =
+        compact_after_one_prompt("Here is what happened.", "## Objective\n- Say hi").await;
+
+    assert!(compacted);
     assert_eq!(
         prompts.len(),
-        2,
-        "summarization prompt and follow-up prompt should both reach the agent"
+        4,
+        "warm-up, summary, reminder, and follow-up prompts should all reach the agent"
     );
-    // The summarization prompt ran on the original session; the follow-up ran
-    // on a freshly created session (summarize-and-swap).
-    assert_eq!(prompt_session_id(&prompts[0]), bootstrap_session_id);
+    // The summary was asked for on the original session, and asked once more when it skipped the
+    // template; the follow-up ran on a freshly created session (summarize-and-swap).
+    assert!(
+        first_prompt_text(&prompts[1]).starts_with("You MUST summarize the conversation above")
+    );
+    assert_eq!(first_prompt_text(&prompts[2]), nori_harness::compact::NUDGE);
+    for params in &prompts[..3] {
+        assert_eq!(prompt_session_id(params), bootstrap_session_id);
+    }
     assert_ne!(
-        prompt_session_id(&prompts[1]),
+        prompt_session_id(&prompts[3]),
         bootstrap_session_id,
         "fallback compact should create and swap to a new session"
     );
+    let follow_up = first_prompt_text(&prompts[3]);
     assert!(
-        first_prompt_text(&prompts[1]).contains(nori_harness::compact::SUMMARY_PREFIX),
-        "fallback compact must inject the summary prefix into the next prompt"
+        follow_up.starts_with("<conversation-checkpoint>\n"),
+        "the next prompt opens with the checkpoint: {follow_up}"
     );
+    assert!(
+        follow_up.contains("<summary>\n## Objective\n- Say hi\n</summary>"),
+        "{follow_up}"
+    );
+    // The newest exchanges come along verbatim, the compaction itself not.
+    assert!(
+        follow_up.contains("<recent-context>\nUser: warm up\n"),
+        "{follow_up}"
+    );
+    assert!(!follow_up.contains("You MUST summarize"), "{follow_up}");
+    // The checkpoint is a block of its own ahead of the user's prompt.
+    assert!(
+        follow_up.ends_with("</conversation-checkpoint>\n\n"),
+        "{follow_up}"
+    );
+    assert_eq!(prompts[3]["prompt"][1]["text"].as_str(), Some("hi"));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_summary_that_never_fills_the_template_keeps_the_session() {
+    let (prompts, bootstrap_session_id, compacted) =
+        compact_after_one_prompt("Here is what happened.", "Still prose.").await;
+
+    assert!(!compacted);
+    assert_eq!(prompts.len(), 4);
+    for params in &prompts {
+        assert_eq!(prompt_session_id(params), bootstrap_session_id);
+    }
+    assert_eq!(first_prompt_text(&prompts[3]), "hi");
 }
 
 #[tokio::test]
