@@ -1192,7 +1192,7 @@ impl App {
                 agent_name,
                 display_name,
             } => {
-                self.begin_agent_candidate(agent_name, display_name);
+                self.switch_agent(tui, agent_name, display_name).await;
             }
             AppEvent::HighlightAgentCandidate {
                 agent_name,
@@ -1272,6 +1272,17 @@ impl App {
                     self.chat_widget.add_info_message(
                         "The agent hasn't listed its models yet; this applies as soon as it does."
                             .to_owned(),
+                        None,
+                    );
+                }
+            }
+            AppEvent::CycleEffort => {
+                if !self
+                    .chat_widget
+                    .cycle_effort(crate::chatwidget::ModelStep::Next)
+                {
+                    self.chat_widget.add_info_message(
+                        "The agent hasn't listed its options yet.".to_owned(),
                         None,
                     );
                 }
@@ -2158,6 +2169,16 @@ impl App {
                 if key_event.code != KeyCode::Esc && self.backtrack.primed {
                     self.reset_backtrack_state();
                 }
+                self.chat_widget.handle_key_event(key_event);
+            }
+            // A terminal that reports Shift only on the release of Shift+Space (see
+            // `ChatComposer::take_shift_space`).
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                modifiers: crossterm::event::KeyModifiers::SHIFT,
+                kind: KeyEventKind::Release,
+                ..
+            } => {
                 self.chat_widget.handle_key_event(key_event);
             }
             _ => {

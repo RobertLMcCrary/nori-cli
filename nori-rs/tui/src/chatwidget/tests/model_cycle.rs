@@ -179,6 +179,97 @@ fn ctrl_n_and_ctrl_p_in_the_composer_step_the_model() {
     }
 }
 
+fn effort_options(current: &str) -> Vec<acp::SessionConfigOption> {
+    vec![
+        acp::SessionConfigOption::select(
+            "effort",
+            "Effort",
+            current.to_owned(),
+            vec![
+                acp::SessionConfigSelectOption::new("low", "Low"),
+                acp::SessionConfigSelectOption::new("high", "High"),
+                acp::SessionConfigSelectOption::new("max", "Max"),
+            ],
+        )
+        .category(acp::SessionConfigOptionCategory::ThoughtLevel),
+    ]
+}
+
+fn effort_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> usize {
+    let mut count = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AppEvent::CycleEffort) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// A terminal without "report all keys" sends the press of Shift+Space as a plain space; only
+/// the release says Shift was held.
+#[test]
+fn shift_space_as_a_terminal_reports_it_takes_its_space_back_and_steps_the_effort() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    let _ = effort_events(&mut rx);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    let mut release = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT);
+    release.kind = crossterm::event::KeyEventKind::Release;
+    chat.handle_key_event(release);
+
+    assert_eq!(effort_events(&mut rx), 1);
+    assert_eq!(chat.composer_text(), "ab");
+
+    // A plain space, released without Shift, stays a space and steps nothing.
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    let mut release = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+    release.kind = crossterm::event::KeyEventKind::Release;
+    chat.handle_key_event(release);
+    assert_eq!(effort_events(&mut rx), 0);
+}
+
+/// A terminal that reports the press with Shift gets the same result from the press alone.
+#[test]
+fn shift_space_reported_on_the_press_steps_the_effort_and_types_nothing() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let _ = effort_events(&mut rx);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
+    let mut release = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT);
+    release.kind = crossterm::event::KeyEventKind::Release;
+    chat.handle_key_event(release);
+
+    assert_eq!(effort_events(&mut rx), 1);
+    assert!(
+        !chat.composer_text().contains(' '),
+        "{:?}",
+        chat.composer_text()
+    );
+}
+
+#[test]
+fn the_effort_steps_through_its_levels_and_shows_in_the_footer() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.sync_acp_session_config_snapshot(&models("sonnet"));
+    let mut options = models("sonnet");
+    options.extend(effort_options("low"));
+    chat.sync_acp_session_config_snapshot(&options);
+    assert!(screen(&chat).contains("Sonnet · Low"), "{}", screen(&chat));
+
+    assert!(chat.cycle_effort(ModelStep::Next));
+    assert!(screen(&chat).contains("Sonnet · High"), "{}", screen(&chat));
+    chat.cycle_effort(ModelStep::Next);
+    chat.cycle_effort(ModelStep::Next);
+    assert!(
+        screen(&chat).contains("Sonnet · Low"),
+        "wraps: {}",
+        screen(&chat)
+    );
+}
+
 /// Presses that come while a switch is out only move the target: the agent is asked for the
 /// first press's model and then for the last one, never for those in between.
 #[tokio::test]

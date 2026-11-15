@@ -1,6 +1,7 @@
-//! Next and previous model (Ctrl+N / Ctrl+P by default), without opening the picker.
+//! Next and previous model (Ctrl+N / Ctrl+P by default) and the next effort level (Shift+Space),
+//! without opening a picker.
 //!
-//! A press shows the new model at once: the agent's advertised configuration is updated in
+//! A press shows the new value at once: the agent's advertised configuration is updated in
 //! place, so the footer changes on the keypress and the agent's own echo of the change finds
 //! nothing new to report. The agent is told in the background, one request at a time: presses
 //! that come while a request is out only move the target, which is sent when the request
@@ -19,13 +20,43 @@ pub(crate) enum ModelStep {
     Previous,
 }
 
+/// What a press changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CycledOption {
+    #[default]
+    Model,
+    /// The reasoning effort or thought level.
+    Effort,
+}
+
+impl CycledOption {
+    /// Whether `option` is the agent's selector for this. Effort is the option the agent
+    /// declares as its thought level; an agent that declares no category for it is found by
+    /// the name it gives it.
+    fn selects(self, option: &acp::SessionConfigOption) -> bool {
+        match self {
+            Self::Model => option.category == Some(acp::SessionConfigOptionCategory::Model),
+            Self::Effort => crate::nori::agent_config_state::is_effort_option(option),
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Effort => "effort level",
+        }
+    }
+}
+
 /// A run of model presses still being applied.
 #[derive(Debug, Default)]
 pub(crate) struct ModelCycle {
     /// A request is out; its result settles it.
     in_flight: bool,
-    /// Where the presses since the request went out point.
-    queued: Option<Target>,
+    /// Where the presses since the request went out point, one target per option.
+    queued: Vec<Target>,
+    /// What the run changes, for the words shown if the agent refuses.
+    kind: CycledOption,
     /// The configuration before the run's first press, restored if the agent refuses.
     before: Option<Vec<acp::SessionConfigOption>>,
 }
@@ -98,16 +129,23 @@ impl ChatWidget {
     /// Step to the next or previous model. False, with nothing done, while the agent has not
     /// listed its options yet.
     pub(crate) fn cycle_model(&mut self, step: ModelStep) -> bool {
+        self.cycle_option(CycledOption::Model, step)
+    }
+
+    /// Step to the next or previous effort level, as [`Self::cycle_model`] does for models.
+    pub(crate) fn cycle_effort(&mut self, step: ModelStep) -> bool {
+        self.cycle_option(CycledOption::Effort, step)
+    }
+
+    fn cycle_option(&mut self, kind: CycledOption, step: ModelStep) -> bool {
         if self.agent_config().is_empty() {
             return false;
         }
+        let noun = kind.noun();
         let mut options = self.agent_config().raw_options();
-        let Some(option) = options
-            .iter_mut()
-            .find(|option| option.category == Some(acp::SessionConfigOptionCategory::Model))
-        else {
+        let Some(option) = options.iter_mut().find(|option| kind.selects(option)) else {
             self.add_info_message(
-                "This agent doesn't offer a choice of model.".to_owned(),
+                format!("This agent doesn't offer a choice of {noun}."),
                 None,
             );
             return true;
@@ -132,7 +170,7 @@ impl ChatWidget {
             _ => Vec::new(),
         };
         if offered.len() < 2 {
-            self.add_info_message("This agent offers one model.".to_owned(), None);
+            self.add_info_message(format!("This agent offers one {noun}."), None);
             return true;
         }
         let current = select.current_value.to_string();
@@ -157,8 +195,13 @@ impl ChatWidget {
             option_name,
             value_name,
         };
+        self.model_cycle.kind = kind;
         if self.model_cycle.in_flight {
-            self.model_cycle.queued = Some(target);
+            // The newest target for an option replaces an older one; another option's stays.
+            self.model_cycle
+                .queued
+                .retain(|queued| queued.config_id != target.config_id);
+            self.model_cycle.queued.push(target);
         } else {
             self.send_model_target(target);
         }
@@ -184,7 +227,8 @@ impl ChatWidget {
         &mut self,
         result: Result<Option<Vec<acp::SessionConfigOption>>, String>,
     ) {
-        if let Some(target) = self.model_cycle.queued.take() {
+        if !self.model_cycle.queued.is_empty() {
+            let target = self.model_cycle.queued.remove(0);
             self.send_model_target(target);
             return;
         }
@@ -197,7 +241,11 @@ impl ChatWidget {
                 if let Some(before) = before {
                     self.sync_acp_session_config_snapshot(&before);
                 }
-                self.add_info_message(format!("Couldn't switch models: {error}"), None);
+                let message = match self.model_cycle.kind {
+                    CycledOption::Model => format!("Couldn't switch models: {error}"),
+                    CycledOption::Effort => format!("Couldn't change the effort level: {error}"),
+                };
+                self.add_info_message(message, None);
             }
         }
         self.request_redraw();

@@ -819,12 +819,14 @@ pub enum HotkeyAction {
     HistorySearch,
     /// Toggle the pinned plan drawer between collapsed and expanded.
     TogglePlanDrawer,
-    /// Repaint the visible screen from Nori's own model, leaving scrollback alone.
+    /// Hide everything above the prompt, leaving scrollback alone.
     Redraw,
     /// Switch to the next model the agent offers.
     NextModel,
     /// Switch to the previous model the agent offers.
     PreviousModel,
+    /// Step to the next effort level (reasoning effort) the agent offers.
+    NextEffort,
 }
 
 impl HotkeyAction {
@@ -847,9 +849,10 @@ impl HotkeyAction {
             Self::Yank => "Yank",
             Self::HistorySearch => "History Search",
             Self::TogglePlanDrawer => "Toggle Plan Drawer",
-            Self::Redraw => "Redraw Screen",
+            Self::Redraw => "Clear Screen",
             Self::NextModel => "Next Model",
             Self::PreviousModel => "Previous Model",
+            Self::NextEffort => "Next Effort Level",
         }
     }
 
@@ -874,9 +877,10 @@ impl HotkeyAction {
             Self::TogglePlanDrawer => {
                 "Toggle the pinned plan drawer between collapsed and expanded"
             }
-            Self::Redraw => "Repaint the visible screen without touching scrollback",
+            Self::Redraw => "Hide everything above the prompt without touching scrollback",
             Self::NextModel => "Switch to the next model the agent offers",
             Self::PreviousModel => "Switch to the previous model the agent offers",
+            Self::NextEffort => "Step to the next effort level the agent offers",
         }
     }
 
@@ -902,6 +906,7 @@ impl HotkeyAction {
             Self::Redraw => "redraw",
             Self::NextModel => "next_model",
             Self::PreviousModel => "previous_model",
+            Self::NextEffort => "next_effort",
         }
     }
 
@@ -927,6 +932,7 @@ impl HotkeyAction {
             Self::Redraw => "ctrl+l",
             Self::NextModel => "ctrl+n",
             Self::PreviousModel => "ctrl+p",
+            Self::NextEffort => "shift+space",
         }
     }
 
@@ -952,6 +958,7 @@ impl HotkeyAction {
             Self::Redraw,
             Self::NextModel,
             Self::PreviousModel,
+            Self::NextEffort,
         ]
     }
 }
@@ -1077,6 +1084,8 @@ pub struct HotkeyConfigToml {
     pub next_model: Option<HotkeyBinding>,
     /// Hotkey for switching to the previous model the agent offers.
     pub previous_model: Option<HotkeyBinding>,
+    /// Hotkey for stepping to the next effort level the agent offers.
+    pub next_effort: Option<HotkeyBinding>,
 }
 
 /// Resolved hotkey configuration with defaults applied.
@@ -1120,6 +1129,8 @@ pub struct HotkeyConfig {
     pub next_model: HotkeyBinding,
     /// Hotkey for switching to the previous model the agent offers.
     pub previous_model: HotkeyBinding,
+    /// Hotkey for stepping to the next effort level the agent offers.
+    pub next_effort: HotkeyBinding,
 }
 
 impl Default for HotkeyConfig {
@@ -1170,6 +1181,7 @@ impl Default for HotkeyConfig {
             redraw: HotkeyBinding::from_str(HotkeyAction::Redraw.default_binding()),
             next_model: HotkeyBinding::from_str(HotkeyAction::NextModel.default_binding()),
             previous_model: HotkeyBinding::from_str(HotkeyAction::PreviousModel.default_binding()),
+            next_effort: HotkeyBinding::from_str(HotkeyAction::NextEffort.default_binding()),
         }
     }
 }
@@ -1243,6 +1255,7 @@ impl HotkeyConfig {
                 .previous_model
                 .clone()
                 .unwrap_or(defaults.previous_model),
+            next_effort: toml.next_effort.clone().unwrap_or(defaults.next_effort),
         }
     }
 
@@ -1268,6 +1281,7 @@ impl HotkeyConfig {
             HotkeyAction::Redraw => &self.redraw,
             HotkeyAction::NextModel => &self.next_model,
             HotkeyAction::PreviousModel => &self.previous_model,
+            HotkeyAction::NextEffort => &self.next_effort,
         }
     }
 
@@ -1293,6 +1307,7 @@ impl HotkeyConfig {
             HotkeyAction::Redraw => self.redraw = binding,
             HotkeyAction::NextModel => self.next_model = binding,
             HotkeyAction::PreviousModel => self.previous_model = binding,
+            HotkeyAction::NextEffort => self.next_effort = binding,
         }
     }
 
@@ -1324,6 +1339,7 @@ impl HotkeyConfig {
             (HotkeyAction::Redraw, &self.redraw),
             (HotkeyAction::NextModel, &self.next_model),
             (HotkeyAction::PreviousModel, &self.previous_model),
+            (HotkeyAction::NextEffort, &self.next_effort),
         ]
     }
 }

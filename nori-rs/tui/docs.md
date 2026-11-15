@@ -426,6 +426,16 @@ opened through the custom-model input to the set request, and only `Panel`
 reopens `/config`. Switching agents with `/agent` skips the resume picker when
 the new agent lists no sessions and starts a session at once.
 
+The Next Effort Level hotkey (default `shift+space`) steps the agent's effort option
+(the one it declares as its thought level, or named for effort or reasoning) through the
+same path, and the footer's model segment shows both (`Sonnet 5.5 · High`). A terminal
+that does not report every key as an escape code sends the press of Shift+Space as a plain
+space and only the release carries Shift, so the composer takes back the space it just
+typed when that release arrives (`ChatComposer::take_shift_space`); a terminal that
+reports the press with Shift is handled by the ordinary hotkey arm. Enabling
+"report all keys" would fix this at the source, but crossterm cannot read the associated
+text it needs for layouts that compose characters.
+
 The Next Model and Previous Model hotkeys (default `ctrl+n` and `ctrl+p`) step
 through the models the agent offers without a picker (`chatwidget/model_cycle.rs`,
 origin `Cycle`). A press updates the advertised configuration in place, so the
@@ -851,27 +861,24 @@ the switch. On `SessionStarted`, only the active-agent identity is committed
 into `App`, so other current settings are never overwritten by candidate-era
 state.
 
-Agent switching is transactional. While the `/agent` picker is open, a cursor
-that rests on a row for 250 ms starts warming that agent as a *speculative*
-candidate (`HighlightAgentCandidate` -> `WarmAgentCandidate`; the component
-picker fires a row's `on_highlight` when the selection changes). A speculative
-candidate that becomes ready only waits; nothing follows it. Choosing its row
-takes it over (no "Preparing" line, no second spawn), moving to another row
-replaces it, and closing the picker without a choice (`DiscardWarmAgentCandidate`)
-shuts it down. A warming failure is silent, since choosing the agent tries
-again and reports what goes wrong. Selecting an `/agent` row immediately starts
-a live candidate without changing the active `ChatWidget`; the private
-`CandidateAgent` state records preparation, picker-ready, and activation
-phases. The current and candidate subprocesses coexist while the candidate
-initializes and while its session picker is open. Choosing a session activates
-the candidate in a separate widget, and `SessionStarted` is the commit event:
-only then does `App` swap widgets, persist the selected agent, and shut down the
-replaced process. Until that event, positional or deferred input remains owned
-by the current widget; after commit it transfers to the candidate and is
-submitted once. Preparation failure, activation failure, picker dismissal,
-supersession, or application exit tears down only the candidate and leaves the
-current session promptable. Prompt submission always targets the current
-widget; there is no pending switch-on-next-prompt state.
+Agent switching takes no time. Choosing an `/agent` row replaces the conversation
+at once with an empty one for the new agent (`App::switch_agent`): the choice is
+persisted, the widget is the same sessionless one a launch starts with, and the agent's
+connection is prepared behind it. What is typed meanwhile is queued until the connection
+is ready, as at startup (`PendingSessionActivation::New`), and a failure to prepare
+reports the error and opens the agent picker again. The picker makes the wait
+vanish when it can: a cursor that rests on a row for 250 ms starts warming that agent
+as a *speculative* candidate (`HighlightAgentCandidate` -> `WarmAgentCandidate`; the
+component picker fires a row's `on_highlight` when the selection changes). A warmed
+candidate that becomes ready only waits; choosing its row hands the connection to the
+new conversation (`prepared_agent`, then `NewSession`), so the first prompt needs no
+preparation at all. Moving to another row replaces the warm candidate, and closing the
+picker without a choice (`DiscardWarmAgentCandidate`) shuts it down. A warming failure
+is silent, since choosing the agent prepares it again and reports what goes wrong. The
+agent's own session list is not offered on a switch; `/resume` lists it.
+
+The candidate machinery below (preparing, picker-ready, and activating phases that keep
+the current widget until `SessionStarted`) remains for the flows that still use it.
 
 Candidate activation classifies hidden candidate events in
 [`App`](src/app/event_handling.rs) before they reach the candidate widget. An

@@ -294,7 +294,7 @@ fn test_hotkey_action_default_bindings() {
 #[test]
 fn test_hotkey_action_all_actions() {
     let actions = HotkeyAction::all_actions();
-    assert_eq!(actions.len(), 19);
+    assert_eq!(actions.len(), 20);
     assert_eq!(actions[0], HotkeyAction::OpenTranscript);
     assert_eq!(actions[1], HotkeyAction::OpenEditor);
     assert_eq!(actions[2], HotkeyAction::MoveBackwardChar);
@@ -314,8 +314,7 @@ fn test_hotkey_action_all_actions() {
     assert_eq!(actions[16], HotkeyAction::Redraw);
     assert_eq!(actions[17], HotkeyAction::NextModel);
     assert_eq!(actions[18], HotkeyAction::PreviousModel);
-    assert_eq!(actions[17], HotkeyAction::NextModel);
-    assert_eq!(actions[18], HotkeyAction::PreviousModel);
+    assert_eq!(actions[19], HotkeyAction::NextEffort);
 }
 
 #[test]
@@ -393,7 +392,7 @@ fn test_hotkey_config_set_binding() {
 fn test_hotkey_config_all_bindings() {
     let config = HotkeyConfig::default();
     let bindings = config.all_bindings();
-    assert_eq!(bindings.len(), 19);
+    assert_eq!(bindings.len(), 20);
     assert_eq!(bindings[0].0, HotkeyAction::OpenTranscript);
     assert_eq!(bindings[1].0, HotkeyAction::OpenEditor);
 }
@@ -630,6 +629,7 @@ fn test_hotkey_config_from_toml_editing_overrides() {
         redraw: None,
         next_model: None,
         previous_model: None,
+        next_effort: None,
     };
     let config = HotkeyConfig::from_toml(&toml);
     assert_eq!(
@@ -674,6 +674,7 @@ fn test_hotkey_config_from_toml_editing_unbind() {
         redraw: None,
         next_model: None,
         previous_model: None,
+        next_effort: None,
     };
     let config = HotkeyConfig::from_toml(&toml);
     assert!(config.move_backward_char.is_none());
@@ -685,7 +686,7 @@ fn test_hotkey_config_from_toml_editing_unbind() {
 fn test_hotkey_config_all_bindings_includes_editing() {
     let config = HotkeyConfig::default();
     let bindings = config.all_bindings();
-    assert_eq!(bindings.len(), 19);
+    assert_eq!(bindings.len(), 20);
     // First two are app-level actions
     assert_eq!(bindings[0].0, HotkeyAction::OpenTranscript);
     assert_eq!(bindings[1].0, HotkeyAction::OpenEditor);

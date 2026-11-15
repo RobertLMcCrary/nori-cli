@@ -149,6 +149,8 @@ pub(crate) struct ChatComposer {
     approval_mode_label: Option<String>,
     acp_mode_label: Option<String>,
     model_label: Option<String>,
+    /// The key before was a plain space, for `shift+space` (see `take_shift_space`).
+    space_just_typed: bool,
     /// Cloud session id shown in the footer when attached to a cloud session.
     cloud_session: Option<String>,
     vim_enter_behavior: nori_config::VimEnterBehavior,
@@ -226,6 +228,7 @@ impl ChatComposer {
             approval_mode_label: None,
             acp_mode_label: None,
             model_label: None,
+            space_just_typed: false,
             cloud_session: None,
             vim_enter_behavior: nori_config::VimEnterBehavior::Off,
             vertical_footer: false,

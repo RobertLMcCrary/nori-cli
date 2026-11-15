@@ -85,6 +85,18 @@ impl AgentConfigOption {
     }
 }
 
+/// Whether `option` is the agent's reasoning effort: the option it declares as its thought level,
+/// or, for an agent that declares no category for it, the one named for effort or reasoning.
+pub(crate) fn is_effort_option(option: &acp::SessionConfigOption) -> bool {
+    match &option.category {
+        Some(category) => *category == acp::SessionConfigOptionCategory::ThoughtLevel,
+        None => {
+            let id = option.id.to_string().to_lowercase();
+            id.contains("effort") || id.contains("thought") || id.contains("reasoning")
+        }
+    }
+}
+
 /// The agent's advertised session configuration, in advertised order.
 ///
 /// Empty until the agent advertises its options; callers must treat the empty
@@ -130,6 +142,13 @@ impl AgentConfigState {
         self.options
             .iter()
             .find(|option| option.is_category(category))
+    }
+
+    /// The agent's effort option, if it has one.
+    pub(crate) fn effort_option(&self) -> Option<&AgentConfigOption> {
+        self.options
+            .iter()
+            .find(|option| is_effort_option(&option.raw))
     }
 
     /// The mode cycle derived from the agent's mode selector, used by the

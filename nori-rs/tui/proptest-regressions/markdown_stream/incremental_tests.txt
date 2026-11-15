@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 4f8d606fc9e782617ed2b0c057e7603ef7373d2ab9823bbb135f4d107d4da04b # shrinks to doc = "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n", cuts = []
+cc 266a8e82a3e86fb5026c5c992aad9924ff30b215af02a6b0f6f348b078e7327b # shrinks to words = 500, markup = [(243, "https://x.io/a-b "), (155, ")")], cuts = [38616], width = 24, trailing = ""

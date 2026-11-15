@@ -19,7 +19,7 @@ use ratatui::widgets::Widget;
 
 const MODE_INDICATOR_LABEL_MAX_CHARS: usize = 20;
 /// Model names are short ("Opus 5.5"), but agents can advertise long ids.
-const MODEL_LABEL_MAX_CHARS: usize = 24;
+const MODEL_LABEL_MAX_CHARS: usize = 34;
 /// Minimum blank columns between the left and right footer groups before the
 /// right group starts shedding segments.
 const FOOTER_GROUP_MIN_GAP_COLS: u16 = 2;

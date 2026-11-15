@@ -136,41 +136,73 @@ impl App {
         Ok(Some(agent))
     }
 
-    /// Start preparing a switch candidate immediately. Replacing this state
-    /// drops and tears down any older candidate without touching the active session.
-    pub(crate) fn begin_agent_candidate(&mut self, agent_name: String, display_name: String) {
+    /// Switch to `agent_name` now. The conversation is replaced at once by an empty one for the
+    /// new agent, whose connection is prepared behind it; what is typed meanwhile is queued
+    /// until it is ready, exactly as at startup. An agent already warmed for the picker row is
+    /// used as it is, and the switch takes no time at all.
+    pub(crate) async fn switch_agent(
+        &mut self,
+        tui: &mut crate::tui::Tui,
+        agent_name: String,
+        display_name: String,
+    ) {
         self.cancel_warm_pause();
-        // An agent already warming for this very row is taken over, not started again.
-        match self.candidate_agent.as_mut() {
+        let warm = match &self.candidate_agent {
             Some(CandidateAgent::Prepared {
-                agent_name: warm,
-                speculative,
+                agent_name: warmed,
+                speculative: true,
                 ..
-            }) if *speculative && *warm == agent_name => {
-                *speculative = false;
-                self.chat_widget.set_login_agent_override(Some(agent_name));
-                self.follow_up_prepared_candidate();
-                return;
-            }
-            Some(CandidateAgent::Preparing {
-                agent_name: warm,
-                speculative,
-                ..
-            }) if *speculative && *warm == agent_name => {
-                *speculative = false;
-                self.chat_widget.set_login_agent_override(Some(agent_name));
-                self.chat_widget
-                    .add_info_message(format!("Preparing {display_name}…"), None);
-                return;
-            }
-            _ => {}
-        }
+            }) if *warmed == agent_name => match self.candidate_agent.take() {
+                Some(CandidateAgent::Prepared { agent, .. }) => Some(*agent),
+                _ => None,
+            },
+            _ => None,
+        };
         self.discard_candidate();
-        self.chat_widget
-            .set_login_agent_override(Some(agent_name.clone()));
-        self.chat_widget
-            .add_info_message(format!("Preparing {display_name}…"), None);
-        self.start_candidate_preparation(agent_name, display_name, false);
+        self.cancel_primary_agent_preparation();
+        if let Some(stale) = self.prepared_agent.take() {
+            tokio::spawn(stale.shutdown());
+        }
+        self.prepared_agent_initial_context = None;
+
+        self.config.active_agent = agent_name.clone();
+        self.config.agent = agent_name.clone();
+        if let Err(error) = ConfigEditsBuilder::new(&self.config.nori_home)
+            .set_agent(&self.config.active_agent)
+            .apply()
+            .await
+        {
+            tracing::error!(%error, "failed to persist the selected agent");
+        }
+
+        self.pending_session_activation = Some(PendingSessionActivation::New);
+        self.deferred_spawn_pending = false;
+        let (initial_prompt, initial_images) = self.chat_widget.take_initial_input();
+        let composer_draft = self.chat_widget.take_composer_draft();
+        self.shutdown_current_conversation();
+        let init = self.chat_widget_init(
+            tui.frame_requester(),
+            initial_prompt,
+            initial_images,
+            None,
+            true,
+            None,
+        );
+        self.chat_widget = ChatWidget::new(init);
+        self.configure_new_chat_widget();
+        self.chat_widget.restore_composer_draft(composer_draft);
+        self.chat_widget.add_info_message(
+            format!("Started new conversation with agent: {display_name}"),
+            None,
+        );
+        match warm {
+            Some(agent) => {
+                self.prepared_agent = Some(agent);
+                self.app_event_tx.send(AppEvent::NewSession);
+            }
+            None => self.begin_agent_preparation(crate::app_event::AgentPrepareIntent::Idle),
+        }
+        tui.frame_requester().schedule_frame();
     }
 
     fn start_candidate_preparation(
