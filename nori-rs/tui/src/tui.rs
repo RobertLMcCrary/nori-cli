@@ -124,6 +124,8 @@ pub fn restore() -> Result<()> {
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     execute!(stdout(), DisableBracketedPaste)?;
     let _ = execute!(stdout(), DisableFocusChange);
+    // Captured only while the transcript overlay is open, which an exit may cut short.
+    let _ = execute!(stdout(), crossterm::event::DisableMouseCapture);
     disable_raw_mode()?;
     let _ = execute!(stdout(), crossterm::cursor::Show);
     Ok(())
@@ -177,6 +179,8 @@ fn set_panic_hook() {
 pub enum TuiEvent {
     Key(KeyEvent),
     Paste(String),
+    /// Clicks and the wheel, reported only while an overlay captures the mouse.
+    Mouse(crossterm::event::MouseEvent),
     Draw,
 }
 
@@ -310,6 +314,9 @@ impl Tui {
                             Event::Paste(pasted) => {
                                 yield TuiEvent::Paste(pasted);
                             }
+                            Event::Mouse(mouse) => {
+                                yield TuiEvent::Mouse(mouse);
+                            }
                             Event::FocusGained => {
                                 terminal_focused.store(true, Ordering::Relaxed);
                                 crate::terminal_palette::requery_default_colors();
@@ -318,7 +325,6 @@ impl Tui {
                             Event::FocusLost => {
                                 terminal_focused.store(false, Ordering::Relaxed);
                             }
-                            _ => {}
                         }
                     }
                     result = draw_rx.recv() => {
@@ -359,6 +365,25 @@ impl Tui {
             let _ = self.terminal.clear();
         }
         self.alt_screen_active.store(true, Ordering::Relaxed);
+        self.terminal.backend_mut().writer_mut().end_frame()
+    }
+
+    /// Report clicks and the wheel as [`TuiEvent::Mouse`] while `capture` is set. The terminal
+    /// then selects text only with a modifier (Shift on most), so it is set only for the
+    /// transcript overlay.
+    pub fn set_mouse_capture(&mut self, capture: bool) -> Result<()> {
+        self.terminal.backend_mut().writer_mut().begin_frame();
+        let _ = if capture {
+            queue!(
+                self.terminal.backend_mut(),
+                crossterm::event::EnableMouseCapture
+            )
+        } else {
+            queue!(
+                self.terminal.backend_mut(),
+                crossterm::event::DisableMouseCapture
+            )
+        };
         self.terminal.backend_mut().writer_mut().end_frame()
     }
 

@@ -680,6 +680,9 @@ impl ChatWidget {
     }
 
     pub(crate) fn on_undo_snapshots_loaded(&mut self, snapshots: Vec<nori_harness::UndoSnapshot>) {
+        if self.offer_rewind(&snapshots) {
+            return;
+        }
         if snapshots.is_empty() {
             self.add_info_message("No undo snapshots available.".to_string(), None);
             return;
@@ -834,9 +837,11 @@ impl ChatWidget {
         match event {
             crate::presentation::ClientEvent::ApprovalRequest(_) => {}
             crate::presentation::ClientEvent::ToolSnapshot(tool_snapshot) => {
+                self.note_agent_output();
                 self.handle_client_tool_snapshot(tool_snapshot);
             }
             crate::presentation::ClientEvent::MessageDelta(message_delta) => {
+                self.note_agent_output();
                 self.handle_client_message_delta(message_delta);
             }
             crate::presentation::ClientEvent::PlanSnapshot(plan_snapshot) => {
@@ -1046,6 +1051,7 @@ impl ChatWidget {
             ));
             self.request_redraw();
         }
+        self.note_turn_end(completed.stop_reason, completed.failure.is_some());
     }
 
     fn handle_client_replay_entry(&mut self, replay_entry: crate::presentation::ReplayEntry) {

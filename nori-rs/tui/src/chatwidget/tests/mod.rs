@@ -125,6 +125,7 @@ fn make_chatwidget_manual_for_mode(
 mod agent_status;
 mod burst;
 mod context;
+mod continue_and_rewind;
 mod model_cycle;
 mod part10;
 mod part8;

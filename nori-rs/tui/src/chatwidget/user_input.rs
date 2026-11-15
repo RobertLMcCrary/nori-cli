@@ -210,6 +210,7 @@ impl ChatWidget {
         if painted_already || self.can_echo_locally() {
             self.echo_submitted_prompt(&text, image_paths.len(), painted_already, echo.clone());
         }
+        self.note_turn_prompt(&text);
         self.submit_prompt(text.clone(), image_paths, echo);
 
         // Persist the text to cross-session message history.

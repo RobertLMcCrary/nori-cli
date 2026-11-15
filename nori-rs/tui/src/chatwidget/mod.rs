@@ -65,10 +65,12 @@ pub(crate) mod subagents;
 pub(crate) use self::agent::HarnessHandle;
 use self::agent::spawn_acp_agent_resume;
 use self::agent::spawn_agent;
+pub(crate) use rewind::Rewind;
 
 mod approvals;
 mod constructors;
 mod context;
+mod continue_turn;
 pub(crate) use context::ContextSnapshot;
 mod event_handlers;
 mod goal;
@@ -78,6 +80,7 @@ mod login;
 mod pickers;
 mod remote_control;
 mod replay;
+mod rewind;
 mod session_config_mode;
 mod user_input;
 use crate::nori::session_header::CloudSessionInfo;
@@ -197,6 +200,13 @@ pub(crate) struct ChatWidget {
     subagents: subagents::SubagentTree,
     /// How many running subagents the status line currently names.
     subagents_running_shown: usize,
+    /// A rewind waiting for the edit journal (see `rewind`).
+    pending_rewind: Option<rewind::Rewind>,
+    /// The prompt of the turn running now, and whether the agent has answered it yet.
+    turn_prompt: Option<String>,
+    turn_reached_agent: bool,
+    /// The last turn, when it did not finish (see `continue_turn`).
+    unfinished: Option<continue_turn::Unfinished>,
     active_user_message_id: Option<String>,
     config: Config,
     auth_manager: Arc<AuthManager>,

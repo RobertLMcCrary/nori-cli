@@ -155,10 +155,15 @@ hide_full_access_warning = true
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
             .expect("inspect descendant process state");
-        String::from_utf8_lossy(&output.stdout)
+        match String::from_utf8_lossy(&output.stdout)
             .split_whitespace()
             .next()
-            .is_some_and(|state| !state.starts_with('Z'))
+        {
+            Some(state) => !state.starts_with('Z'),
+            // A sandboxed `ps` can list a process without reporting its state; then whether it
+            // exists decides.
+            None => Self::child_is_alive(pid),
+        }
     }
 }
 

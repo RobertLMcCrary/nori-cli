@@ -239,6 +239,9 @@ impl ChatWidget {
                     None,
                 );
             }
+            SlashCommand::Continue => {
+                self.continue_unfinished_turn();
+            }
             SlashCommand::Undo => {
                 self.app_event_tx.send(AppEvent::HarnessAction(
                     crate::app_event::HarnessAction::LoadUndoSnapshots,

@@ -212,6 +212,7 @@ mod config_persistence;
 mod event_handling;
 mod frame;
 mod history_replay;
+mod message_actions;
 mod resize_reflow;
 mod session_setup;
 

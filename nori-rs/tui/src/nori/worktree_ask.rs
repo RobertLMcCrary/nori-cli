@@ -35,7 +35,7 @@ pub(crate) async fn run_worktree_blocked_popup(tui: &mut Tui, reason: &str) -> R
         if let Some(event) = events.next().await {
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
-                TuiEvent::Paste(_) => {}
+                TuiEvent::Paste(_) | TuiEvent::Mouse(_) => {}
                 TuiEvent::Draw => {
                     tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
@@ -64,7 +64,7 @@ pub(crate) async fn run_worktree_ask_popup(tui: &mut Tui) -> Result<bool> {
         if let Some(event) = events.next().await {
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
-                TuiEvent::Paste(_) => {}
+                TuiEvent::Paste(_) | TuiEvent::Mouse(_) => {}
                 TuiEvent::Draw => {
                     tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());

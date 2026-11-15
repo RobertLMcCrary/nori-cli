@@ -32,52 +32,44 @@ pub(crate) struct BacktrackState {
 
 impl App {
     /// Route overlay events when transcript overlay is active.
-    /// - If backtrack preview is active: Esc steps selection; Enter confirms.
+    /// - While a message's actions are open, the overlay takes every event.
+    /// - If backtrack preview is active: Esc steps selection; Enter (in the overlay) opens the
+    ///   selected message's actions.
     /// - Otherwise: Esc begins preview; all other events forward to overlay.
-    ///   interactions (Esc to step target, Enter to confirm) and overlay lifecycle.
+    ///
+    /// An action chosen in the overlay is carried out once the event that chose it is handled.
     pub(crate) async fn handle_backtrack_overlay_event(
         &mut self,
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
-        if self.backtrack.overlay_preview_active {
-            match event {
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Esc,
-                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                    ..
-                }) => {
-                    self.overlay_step_backtrack(tui, event)?;
-                    Ok(true)
-                }
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Enter,
-                    kind: KeyEventKind::Press,
-                    ..
-                }) => {
-                    self.overlay_confirm_backtrack(tui);
-                    Ok(true)
-                }
-                // Catchall: forward any other events to the overlay widget.
-                _ => {
-                    self.overlay_forward_event(tui, event)?;
-                    Ok(true)
-                }
-            }
-        } else if let TuiEvent::Key(KeyEvent {
-            code: KeyCode::Esc,
-            kind: KeyEventKind::Press | KeyEventKind::Repeat,
-            ..
-        }) = event
-        {
+        let menu_open =
+            matches!(&self.overlay, Some(Overlay::Transcript(transcript)) if transcript.has_menu());
+        let is_esc = matches!(
+            event,
+            TuiEvent::Key(KeyEvent {
+                code: KeyCode::Esc,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            })
+        );
+        if menu_open || !is_esc {
+            self.overlay_forward_event(tui, event)?;
+        } else if self.backtrack.overlay_preview_active {
+            self.overlay_step_backtrack(tui, event)?;
+        } else {
             // First Esc in transcript overlay: begin backtrack preview at latest user message.
             self.begin_overlay_backtrack_preview(tui);
-            Ok(true)
-        } else {
-            // Not in backtrack mode: forward events to the overlay widget.
-            self.overlay_forward_event(tui, event)?;
-            Ok(true)
         }
+        let chosen = match &mut self.overlay {
+            Some(Overlay::Transcript(transcript)) => transcript.take_chosen(),
+            Some(Overlay::Static(_)) | None => None,
+        };
+        if let Some(action) = chosen {
+            self.reset_backtrack_state();
+            self.on_message_action(tui, action);
+        }
+        Ok(true)
     }
 
     /// Handle global Esc presses for backtracking when no overlay is present.
@@ -117,12 +109,15 @@ impl App {
     /// Open transcript overlay (enters alternate screen and shows full transcript).
     pub(crate) fn open_transcript_overlay(&mut self, tui: &mut tui::Tui) {
         let _ = tui.enter_alt_screen();
+        // Clicks select messages and the wheel scrolls while it is open.
+        let _ = tui.set_mouse_capture(true);
         self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
         tui.frame_requester().schedule_frame();
     }
 
     /// Close transcript overlay and restore normal UI.
     pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) {
+        let _ = tui.set_mouse_capture(false);
         let _ = tui.leave_alt_screen();
         let was_backtrack = self.backtrack.overlay_preview_active;
         if self.transcript_reflow.has_pending_reflow() {
@@ -188,6 +183,15 @@ impl App {
         if count == 0 {
             return;
         }
+        // A message selected in the overlay itself (`[`, `]`, a click) is where stepping goes on
+        // from: the prompt before it is next.
+        if let Some(Overlay::Transcript(transcript)) = &self.overlay
+            && let Some(selected) = transcript.selected_cell()
+        {
+            self.backtrack.nth_user_message = user_positions_iter(&self.transcript_cells)
+                .filter(|index| *index < selected)
+                .count();
+        }
 
         let last_index = count.saturating_sub(1);
         let next_selection = if self.backtrack.nth_user_message == usize::MAX {
@@ -230,21 +234,6 @@ impl App {
             }
         }
         Ok(())
-    }
-
-    /// Handle Enter in overlay backtrack preview: confirm selection and reset state.
-    fn overlay_confirm_backtrack(&mut self, tui: &mut tui::Tui) {
-        let nth_user_message = self.backtrack.nth_user_message;
-        if let Some(base_id) = self.backtrack.base_id {
-            let prefill = nth_user_position(&self.transcript_cells, nth_user_message)
-                .and_then(|idx| self.transcript_cells.get(idx))
-                .and_then(|cell| cell.as_any().downcast_ref::<UserHistoryCell>())
-                .map(|c| c.message.clone())
-                .unwrap_or_default();
-            self.close_transcript_overlay(tui);
-            self.request_backtrack(prefill, base_id, nth_user_message);
-        }
-        self.reset_backtrack_state();
     }
 
     /// Handle Esc in overlay backtrack preview: step selection if armed, else forward.

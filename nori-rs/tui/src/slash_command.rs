@@ -39,6 +39,7 @@ pub enum SlashCommand {
     Init,
     Compact,
     Undo,
+    Continue,
     Browse,
     Diff,
     Mention,
@@ -69,6 +70,7 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Nori",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Undo => "ask Nori to undo a turn",
+            SlashCommand::Continue => "continue the last turn where it stopped",
             SlashCommand::Quit | SlashCommand::Exit => "exit Nori",
             SlashCommand::Browse => "open a file manager to browse and edit files",
             SlashCommand::Diff => "show git diff (including untracked files)",
@@ -109,6 +111,7 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Undo
+            | SlashCommand::Continue
             | SlashCommand::Model
             | SlashCommand::Config
             | SlashCommand::Approvals
@@ -158,6 +161,7 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Undo
+            | SlashCommand::Continue
             | SlashCommand::Mention
             | SlashCommand::Status
             | SlashCommand::Context

@@ -120,6 +120,8 @@ impl App {
                 TuiEvent::Paste(pasted) => {
                     self.chat_widget.handle_paste(pasted);
                 }
+                // The mouse is captured only while the transcript overlay is open.
+                TuiEvent::Mouse(_) => {}
                 TuiEvent::Draw => {
                     self.chat_widget.pre_draw_tick();
                     self.chat_widget.maybe_post_pending_notification(tui);
@@ -2056,9 +2058,7 @@ impl App {
         if key_event.kind == KeyEventKind::Press && !self.chat_widget.has_active_popup() {
             let transcript_binding = self.hotkey_config.binding_for(HotkeyAction::OpenTranscript);
             if matches_binding(transcript_binding, &key_event) {
-                let _ = tui.enter_alt_screen();
-                self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
-                tui.frame_requester().schedule_frame();
+                self.open_transcript_overlay(tui);
                 return;
             }
 

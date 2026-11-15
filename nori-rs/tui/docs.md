@@ -364,6 +364,34 @@ the active session. The remaining picker entries are the earlier user messages
 and drive the unchanged rewind-to-message local fork path; agents without fork
 support see only those.
 
+The transcript overlay (Ctrl+T) captures the mouse while it is open
+(`Tui::set_mouse_capture`, released when it closes and by `tui::restore`), so
+the wheel scrolls it and clicks reach it; the terminal then selects text only
+with its modifier (Shift on most). A click selects the cell under it, mapped
+through the pager's row index for the last frame's width and scroll
+(`PagerView::item_at`), and a second click on the same cell within 400 ms opens
+that message's actions (`pager_overlay/message_menu.rs`). `[` and `]` step the
+selection between messages (prompts and the first cell of each answer) and
+Enter opens the actions; Esc keeps stepping back through prompts, from the
+selection, as before. A prompt offers "Edit this prompt" (`ForkToMessage` before
+it, with its text in the composer) and "Rewind here and restore files"; any
+other message offers "Fork from here", which is the agent's own
+`session/fork` when nothing was said after it and the agent supports it, and
+otherwise `ForkToMessage` at the end of the message (the summary-context fork
+the `/fork` picker uses). Every action is refused while a turn runs. A rewind
+loads the edit journal and matches its undoable turns to the prompts from the
+selected one on, newest first (`chatwidget/rewind.rs::turns_to_undo`; turns
+the harness opens without a prompt go with the prompt before them); the
+confirmation names those turns and either restores them with `undo_to` and
+then forks before the prompt, or only forks. Prompts from an earlier process
+have no journal, so nothing is restored for them.
+
+`/continue` takes up the last turn when it ended cancelled, failed, or stopped
+by `max_tokens` or `max_turn_requests` (`chatwidget/continue_turn.rs`): if the
+agent had sent no text, reasoning, or tool call for it, the prompt is sent
+again; otherwise "Continue where you left off." is. Such a turn ends with an
+info line saying so.
+
 When an ACP permission request arrives, the overlay renders the ACP subject and
 options, then calls `respond_to_agent(request_id, response)` with the exact ID
 from the request. Filesystem requests do not enter this path because the host

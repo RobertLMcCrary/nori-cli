@@ -332,7 +332,7 @@ pub(crate) async fn run_nori_onboarding_app(
                 TuiEvent::Key(key_event) => {
                     onboarding_screen.handle_key_event(key_event);
                 }
-                TuiEvent::Paste(_) => {
+                TuiEvent::Paste(_) | TuiEvent::Mouse(_) => {
                     // Paste not handled in Nori onboarding
                 }
                 TuiEvent::Draw => {

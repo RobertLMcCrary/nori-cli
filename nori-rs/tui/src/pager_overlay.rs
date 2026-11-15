@@ -3,13 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::history_cell::HistoryCell;
-use crate::history_cell::UserHistoryCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
-use crate::render::Insets;
-use crate::render::renderable::InsetRenderable;
 use crate::render::renderable::Renderable;
-use crate::style::user_message_style;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crossterm::event::KeyCode;
@@ -26,6 +22,15 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
+
+mod message_menu;
+mod transcript;
+#[cfg(test)]
+mod transcript_tests;
+
+pub(crate) use message_menu::MessageAction;
+pub(crate) use message_menu::MessageChoice;
+pub(crate) use transcript::TranscriptOverlay;
 
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
@@ -164,6 +169,8 @@ struct PagerView {
     last_rendered_height: Option<usize>,
     /// If set, on next render ensure this chunk is visible.
     pending_scroll_chunk: Option<usize>,
+    /// Where the last frame drew the items, to find the item under a click.
+    last_content_area: Option<Rect>,
 }
 
 impl PagerView {
@@ -176,6 +183,7 @@ impl PagerView {
             last_content_height: None,
             last_rendered_height: None,
             pending_scroll_chunk: None,
+            last_content_area: None,
         }
     }
 
@@ -234,6 +242,7 @@ impl PagerView {
         self.scroll_offset = self
             .scroll_offset
             .min(content_height.saturating_sub(content_area.height as usize));
+        self.last_content_area = Some(content_area);
 
         self.render_content(content_area, buf);
 
@@ -366,6 +375,40 @@ impl PagerView {
 }
 
 impl PagerView {
+    /// The item the last frame drew at screen row `y`, if any.
+    fn item_at(&self, y: u16) -> Option<usize> {
+        let area = self.last_content_area?;
+        if y < area.y || y >= area.bottom() {
+            return None;
+        }
+        let index = self
+            .index
+            .as_ref()
+            .filter(|index| index.width == area.width)?;
+        let row = self.scroll_offset.saturating_add(usize::from(y - area.y));
+        (row < index.total()).then(|| index.item_at_row(row))
+    }
+
+    /// The screen rows the last frame drew `item` on, top and bottom (exclusive), cut to the
+    /// content area.
+    fn item_rows(&self, item: usize) -> Option<(u16, u16)> {
+        let area = self.last_content_area?;
+        let index = self
+            .index
+            .as_ref()
+            .filter(|index| index.width == area.width && item < index.items())?;
+        let on_screen = |row: usize| {
+            let row = row
+                .saturating_sub(self.scroll_offset)
+                .min(usize::from(area.height));
+            area.y + u16::try_from(row).unwrap_or(area.height)
+        };
+        Some((
+            on_screen(index.top_of(item)),
+            on_screen(index.top_of(item + 1)),
+        ))
+    }
+
     fn is_scrolled_to_bottom(&self) -> bool {
         if self.scroll_offset == usize::MAX {
             return true;
@@ -472,164 +515,6 @@ impl Renderable for CellRenderable {
 
     fn desired_height(&self, width: u16) -> u16 {
         transcript_overlay_height(self.cell.as_ref(), width)
-    }
-}
-
-pub(crate) struct TranscriptOverlay {
-    view: PagerView,
-    cells: Vec<Arc<dyn HistoryCell>>,
-    highlight_cell: Option<usize>,
-    is_done: bool,
-}
-
-impl TranscriptOverlay {
-    pub(crate) fn new(transcript_cells: Vec<Arc<dyn HistoryCell>>) -> Self {
-        Self {
-            view: PagerView::new(
-                Self::render_cells(&transcript_cells, None),
-                "T R A N S C R I P T".to_string(),
-                usize::MAX,
-            ),
-            cells: transcript_cells,
-            highlight_cell: None,
-            is_done: false,
-        }
-    }
-
-    fn render_cells(
-        cells: &[Arc<dyn HistoryCell>],
-        highlight_cell: Option<usize>,
-    ) -> Vec<Box<dyn Renderable>> {
-        Self::render_cells_from(cells, 0, highlight_cell)
-    }
-
-    /// The renderables of `cells[start..]`.
-    fn render_cells_from(
-        cells: &[Arc<dyn HistoryCell>],
-        start: usize,
-        highlight_cell: Option<usize>,
-    ) -> Vec<Box<dyn Renderable>> {
-        cells
-            .iter()
-            .enumerate()
-            .skip(start)
-            .map(|(i, c)| Self::cell_renderable(c, i, highlight_cell))
-            .collect()
-    }
-
-    fn cell_renderable(
-        c: &Arc<dyn HistoryCell>,
-        i: usize,
-        highlight_cell: Option<usize>,
-    ) -> Box<dyn Renderable> {
-        let mut cell_renderable = if c.as_any().is::<UserHistoryCell>() {
-            Box::new(CachedRenderable::new(CellRenderable {
-                cell: c.clone(),
-                style: if highlight_cell == Some(i) {
-                    user_message_style().reversed()
-                } else {
-                    user_message_style()
-                },
-            })) as Box<dyn Renderable>
-        } else {
-            Box::new(CachedRenderable::new(CellRenderable {
-                cell: c.clone(),
-                style: Style::default(),
-            })) as Box<dyn Renderable>
-        };
-        if !c.is_stream_continuation() && i > 0 {
-            cell_renderable = Box::new(InsetRenderable::new(
-                cell_renderable,
-                Insets::tlbr(1, 0, 0, 0),
-            ));
-        }
-        cell_renderable
-    }
-
-    pub(crate) fn insert_cell(&mut self, cell: Arc<dyn HistoryCell>) {
-        let follow_bottom = self.view.is_scrolled_to_bottom();
-        let index = self.cells.len();
-        let renderable = Self::cell_renderable(&cell, index, self.highlight_cell);
-        self.cells.push(cell);
-        self.view.push_renderable(renderable);
-        if follow_bottom {
-            self.view.scroll_offset = usize::MAX;
-        }
-    }
-
-    pub(crate) fn replace_cells(
-        &mut self,
-        range: std::ops::Range<usize>,
-        replacement: Arc<dyn HistoryCell>,
-    ) {
-        let follow_bottom = self.view.is_scrolled_to_bottom();
-        let start = range.start;
-        self.cells.splice(range, std::iter::once(replacement));
-        // Items before the replaced range keep their layout; only the tail is rebuilt.
-        let tail = Self::render_cells_from(&self.cells, start, self.highlight_cell);
-        self.view.replace_from(start, tail);
-        if follow_bottom {
-            self.view.scroll_offset = usize::MAX;
-        }
-    }
-
-    pub(crate) fn set_highlight_cell(&mut self, cell: Option<usize>) {
-        let previous = std::mem::replace(&mut self.highlight_cell, cell);
-        // Only the style of the two user messages involved changes, never a height.
-        for index in previous.into_iter().chain(cell) {
-            if let Some(cell) = self.cells.get(index) {
-                let renderable = Self::cell_renderable(cell, index, self.highlight_cell);
-                self.view.renderables[index] = renderable;
-            }
-        }
-        if let Some(idx) = self.highlight_cell {
-            self.view.scroll_chunk_into_view(idx);
-        }
-    }
-
-    fn render_hints(&self, area: Rect, buf: &mut Buffer) {
-        let line1 = Rect::new(area.x, area.y, area.width, 1);
-        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
-        render_key_hints(line1, buf, PAGER_KEY_HINTS);
-
-        let mut pairs: Vec<(&[KeyBinding], &str)> =
-            vec![(&[KEY_Q], "to quit"), (&[KEY_ESC], "to edit prev")];
-        if self.highlight_cell.is_some() {
-            pairs.push((&[KEY_ENTER], "to edit message"));
-        }
-        render_key_hints(line2, buf, &pairs);
-    }
-
-    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let top_h = area.height.saturating_sub(3);
-        let top = Rect::new(area.x, area.y, area.width, top_h);
-        let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
-        self.view.render(top, buf);
-        self.render_hints(bottom, buf);
-    }
-}
-
-impl TranscriptOverlay {
-    pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
-        match event {
-            TuiEvent::Key(key_event) => match key_event {
-                e if KEY_Q.is_press(e) || KEY_CTRL_C.is_press(e) || KEY_CTRL_T.is_press(e) => {
-                    self.is_done = true;
-                    Ok(())
-                }
-                other => self.view.handle_key_event(tui, other),
-            },
-            TuiEvent::Draw => {
-                tui.draw(u16::MAX, |frame| {
-                    self.render(frame.area(), frame.buffer);
-                })?;
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-    pub(crate) fn is_done(&self) -> bool {
-        self.is_done
     }
 }
 
