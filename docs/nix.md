@@ -8,7 +8,7 @@ writes `config.toml` from a Home Manager module. Nothing is fetched at run time.
   inputs.nori.url = "github:tilework-tech/nori-cli";
 
   # in your Home Manager configuration
-  imports = [ nori.homeManagerModules.default ];
+  imports = [ nori.homeModules.default ];
 
   programs.nori = {
     enable = true;

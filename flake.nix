@@ -18,8 +18,8 @@
       overlays.default = import ./nix/overlay.nix self;
 
       # `programs.nori`: the package, one ACP adapter per agent, and config.toml.
-      homeManagerModules.default = import ./nix/home-module.nix self;
-      homeManagerModules.nori = self.homeManagerModules.default;
+      homeModules.default = import ./nix/home-module.nix self;
+      homeModules.nori = self.homeModules.default;
 
       packages = forAllSystems (
         _system: pkgs:
@@ -57,7 +57,7 @@
           evaluated = lib.evalModules {
             specialArgs = { inherit pkgs; };
             modules = [
-              (self.homeManagerModules.default)
+              (self.homeModules.default)
               (
                 { lib, ... }:
                 {
