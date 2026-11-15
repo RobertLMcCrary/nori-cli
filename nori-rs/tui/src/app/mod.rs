@@ -137,6 +137,10 @@ pub(crate) struct App {
     /// Whether the welcome card for the current conversation has already been
     /// written, ahead of the session that conversation will run on.
     welcome_card_written: bool,
+    /// A conversation's header card has been written in this run. Later conversations (a switch
+    /// of agent, `/new`) do not write it again: the footer names the model and mode, and the
+    /// line announcing the conversation names the agent.
+    session_card_shown: bool,
 
     /// Ephemeral per-session loop count override (set via /settings menu).
     /// Outer Option: whether overridden; inner Option<i32>: the value.
@@ -337,6 +341,7 @@ impl App {
             warm_candidate_pause: None,
             waiting_model_presses: Default::default(),
             welcome_card_written: false,
+            session_card_shown: false,
             loop_count_override: None,
             hotkey_config: nori_config::HotkeyConfig::default(),
             vim_mode: nori_config::VimEnterBehavior::Off,
@@ -402,6 +407,7 @@ impl App {
         if !cloud_mode && app.pending_session_activation.is_none() {
             app.chat_widget.emit_welcome_card();
             app.welcome_card_written = true;
+            app.session_card_shown = true;
         }
 
         // If skillset_per_session is enabled, show the skillset picker. The
@@ -551,6 +557,9 @@ impl App {
         // flag scopes this to that one handover: a later `/new` is a different
         // conversation and writes its own card when its session starts.
         if std::mem::take(&mut self.welcome_card_written) {
+            self.chat_widget.suppress_welcome_card();
+        }
+        if self.session_card_shown {
             self.chat_widget.suppress_welcome_card();
         }
         // The replacement carries its own empty footer, so re-seed it rather

@@ -32,10 +32,7 @@ impl ChatWidget {
             analytics,
         } = common;
         let activating_prepared_cloud_session = cloud_mode && prepared_agent.is_some();
-        let mut rng = rand::rng();
-        let placeholder = PROMPT_MODE_PLACEHOLDERS
-            [rng.random_range(0..PROMPT_MODE_PLACEHOLDERS.len())]
-        .to_string();
+        let placeholder = session_placeholder();
         let session_generation = next_session_generation();
         let spawn_result = if let Some(agent) = prepared_agent {
             super::agent::launch_prepared_agent(
@@ -221,10 +218,7 @@ impl ChatWidget {
             analytics,
         } = common;
         let activating_prepared_cloud_session = cloud_mode && prepared_agent.is_some();
-        let mut rng = rand::rng();
-        let placeholder = PROMPT_MODE_PLACEHOLDERS
-            [rng.random_range(0..PROMPT_MODE_PLACEHOLDERS.len())]
-        .to_string();
+        let placeholder = session_placeholder();
         let session_generation = next_session_generation();
         let spawn_result = if let Some(agent) = prepared_agent {
             super::agent::launch_prepared_agent(

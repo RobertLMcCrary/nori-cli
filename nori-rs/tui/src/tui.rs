@@ -167,6 +167,15 @@ pub fn init() -> Result<Terminal> {
     Ok(tui)
 }
 
+/// Names the terminal for the saved colors: another terminal has other colors.
+fn terminal_id() -> String {
+    std::env::var("TERM_PROGRAM")
+        .unwrap_or_else(|_| "default".to_owned())
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect()
+}
+
 fn set_panic_hook() {
     let hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
@@ -240,7 +249,13 @@ impl Tui {
         crate::startup_trace::mark("keyboard_query");
         // Cache this to avoid contention with the event reader.
         supports_color::on_cached(supports_color::Stream::Stdout);
-        let _ = crate::terminal_palette::default_colors();
+        // The terminal's colors come from the last run's answer; asking a new tab can take
+        // seconds, so the question is put later, off the frame path.
+        if let Ok(home) = nori_config::find_nori_home() {
+            crate::terminal_palette::load_cached_colors(
+                &home.join(format!(".terminal-colors-{}", terminal_id())),
+            );
+        }
         crate::startup_trace::mark("color_query");
 
         Self {
@@ -294,8 +309,20 @@ impl Tui {
 
         let terminal_focused = self.terminal_focused.clone();
         let event_stream = async_stream::stream! {
+            // The terminal is asked for its colors once it has had time to settle; a new tab can
+            // be slow to answer for its first seconds. It is asked from here, since a query
+            // made from another thread loses its reply to this stream's reader.
+            let palette_refresh = tokio::time::sleep(crate::terminal_palette::REFRESH_DELAY);
+            tokio::pin!(palette_refresh);
+            let mut palette_refreshed = false;
             loop {
                 select! {
+                    () = &mut palette_refresh, if !palette_refreshed => {
+                        palette_refreshed = true;
+                        if crate::terminal_palette::refresh_colors() {
+                            yield TuiEvent::Draw;
+                        }
+                    }
                     Some(Ok(event)) = crossterm_events.next() => {
                         match event {
                             Event::Key(key_event) => {

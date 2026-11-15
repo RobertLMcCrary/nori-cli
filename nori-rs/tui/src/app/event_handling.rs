@@ -223,7 +223,10 @@ impl App {
                     );
                     init.config = config;
                     init.prepared_agent = Some(*agent);
-                    let widget = ChatWidget::new_candidate(init);
+                    let mut widget = ChatWidget::new_candidate(init);
+                    if self.session_card_shown {
+                        widget.suppress_welcome_card();
+                    }
                     self.candidate_agent = Some(CandidateAgent::Activating {
                         agent_name,
                         display_name,
@@ -790,6 +793,7 @@ impl App {
                             unreachable!("candidate generation checked above")
                         };
                         let mut old_widget = std::mem::replace(&mut self.chat_widget, *widget);
+                        self.session_card_shown = true;
                         self.config.active_agent = agent_name.clone();
                         self.config.agent = agent_name;
                         self.configure_new_chat_widget();
@@ -842,6 +846,8 @@ impl App {
                         _ => None,
                     };
                     self.chat_widget.handle_session_event(generation, event);
+                    // That session has written its card, if it was to; later ones do not repeat it.
+                    self.session_card_shown |= started.is_some();
                     if let Some(started) = started
                         && let Some(handle) = self.chat_widget.harness_handle()
                         && let Err(error) = self

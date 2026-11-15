@@ -20,6 +20,12 @@ pub(crate) struct HistoryQueue {
     lines: Vec<Line<'static>>,
     /// The next frame writes the history rows Nori owns again, and all of the viewport.
     repaint: bool,
+    /// The next frame scrolls everything above the prompt into the scrollback.
+    clear_above: bool,
+    /// The prompt has been placed at the bottom of the screen. Only the first frame and a clear
+    /// do it: moving the screen down later would put blank rows into the middle of the
+    /// scrollback each time the prompt shrinks.
+    pinned: bool,
 }
 
 impl HistoryQueue {
@@ -31,8 +37,21 @@ impl HistoryQueue {
         self.lines.clear();
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Ctrl+L clears the screen above the prompt instead"
+        )
+    )]
     pub(crate) fn request_repaint(&mut self) {
         self.repaint = true;
+    }
+
+    /// Hide everything above the prompt: the next frame scrolls it into the scrollback, which is
+    /// left whole, and leaves the screen above the prompt empty.
+    pub(crate) fn request_clear_above(&mut self) {
+        self.clear_above = true;
     }
 
     /// Repaint what Nori owns if a repaint was asked for, place the viewport for a frame `height`
@@ -51,6 +70,17 @@ impl HistoryQueue {
         if std::mem::take(&mut self.repaint) {
             crate::insert_history::repaint_owned_history(terminal)?;
             terminal.clear()?;
+        }
+
+        if std::mem::take(&mut self.clear_above) {
+            let top = terminal.viewport_area.top();
+            if top > 0 {
+                terminal.backend_mut().scroll_region_up(0..top, top)?;
+            }
+            // What was above the prompt is in the scrollback now, where nothing repaints it.
+            terminal.written_history.clear();
+            terminal.clear()?;
+            self.pinned = false;
         }
 
         let size = terminal.size()?;
@@ -97,7 +127,19 @@ impl HistoryQueue {
                     )?;
                 }
             }
+        } else if area.bottom() < size.height && !self.pinned {
+            // The prompt goes to the bottom of the screen: whatever is on screen moves down with
+            // it, and only blank rows below the viewport fall off. The viewport is placed first,
+            // since clearing erases from the viewport downward.
+            let gap = size.height - area.bottom();
+            terminal
+                .backend_mut()
+                .scroll_region_down(0..size.height, gap)?;
+            area.y += gap;
+            terminal.set_viewport_area(area);
+            terminal.clear()?;
         }
+        self.pinned = true;
         if area != terminal.viewport_area {
             // TODO(nornagon): probably this could be collapsed with the clear + set_viewport_area above.
             terminal.clear()?;
@@ -150,6 +192,106 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ratatui::layout::Rect;
     use ratatui::style::Stylize;
+    use std::io::Write;
+
+    const WIDTH: u16 = 30;
+    const HEIGHT: u16 = 10;
+
+    fn screen(terminal: &Terminal<VT100Backend>) -> Vec<String> {
+        terminal.backend().vt100().screen().rows(0, WIDTH).collect()
+    }
+
+    fn terminal_after_a_shell() -> Terminal<VT100Backend> {
+        let mut terminal =
+            Terminal::with_options(VT100Backend::with_scrollback(WIDTH, HEIGHT)).expect("terminal");
+        write!(
+            terminal.backend_mut(),
+            "\x1b[1;1H$ nori\x1b[2;1Hshell output"
+        )
+        .expect("shell rows");
+        // The prompt starts where the cursor was, below the shell's rows.
+        terminal.set_viewport_area(Rect::new(0, 2, WIDTH, 2));
+        terminal
+    }
+
+    fn draw_prompt(terminal: &mut Terminal<VT100Backend>) {
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.buffer_mut().set_string(
+                    area.x,
+                    area.y,
+                    "> prompt",
+                    ratatui::style::Style::default(),
+                );
+                frame.buffer_mut().set_string(
+                    area.x,
+                    area.y + 1,
+                    "footer",
+                    ratatui::style::Style::default(),
+                );
+            })
+            .expect("draw");
+    }
+
+    #[test]
+    fn the_first_frame_puts_the_prompt_at_the_bottom_with_the_screen_just_above_it() {
+        let mut terminal = terminal_after_a_shell();
+        let mut queue = HistoryQueue::default();
+
+        queue.write_frame(&mut terminal, 2).expect("frame");
+        draw_prompt(&mut terminal);
+
+        assert_eq!(terminal.viewport_area, Rect::new(0, HEIGHT - 2, WIDTH, 2));
+        let rows = screen(&terminal);
+        assert_eq!(rows[6], "$ nori");
+        assert_eq!(rows[7], "shell output");
+        assert_eq!(rows[8], "> prompt");
+        assert_eq!(rows[9], "footer");
+        assert!(rows[..6].iter().all(String::is_empty), "{rows:?}");
+    }
+
+    #[test]
+    fn a_prompt_that_shrinks_later_does_not_move_the_screen() {
+        let mut terminal = terminal_after_a_shell();
+        let mut queue = HistoryQueue::default();
+        queue.write_frame(&mut terminal, 4).expect("frame");
+        draw_prompt(&mut terminal);
+        let before = terminal.backend().scrollback_rows().len();
+
+        // The prompt grows to four rows and shrinks back; neither puts rows into the scrollback.
+        queue.write_frame(&mut terminal, 2).expect("frame");
+        draw_prompt(&mut terminal);
+
+        assert_eq!(terminal.backend().scrollback_rows().len(), before);
+        assert_eq!(terminal.viewport_area.height, 2);
+    }
+
+    #[test]
+    fn clearing_hides_everything_above_the_prompt_in_the_scrollback() {
+        let mut terminal = terminal_after_a_shell();
+        let mut queue = HistoryQueue::default();
+        queue.write_frame(&mut terminal, 2).expect("frame");
+        queue.push((0..4).map(|n| Line::from(format!("history {n}"))).collect());
+        queue.write_frame(&mut terminal, 2).expect("frame");
+        draw_prompt(&mut terminal);
+        assert!(screen(&terminal).contains(&"history 3".to_string()));
+
+        queue.request_clear_above();
+        queue.write_frame(&mut terminal, 2).expect("frame");
+        draw_prompt(&mut terminal);
+
+        let rows = screen(&terminal);
+        assert!(
+            rows[..HEIGHT as usize - 2].iter().all(String::is_empty),
+            "{rows:?}"
+        );
+        assert_eq!(rows[HEIGHT as usize - 2], "> prompt");
+        // That the rows went into the scrollback rather than away is the terminal's doing (the
+        // emulator behind this test does not keep rows a region scroll pushes out); it is
+        // checked against a real terminal.
+        assert_eq!(terminal.owned_history_rows(), 0);
+    }
 
     #[test]
     fn a_burst_is_written_over_bounded_frames_each_line_once_in_order() {

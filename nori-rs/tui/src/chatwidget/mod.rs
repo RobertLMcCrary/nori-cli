@@ -12,7 +12,6 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use nori_config::NoriConfig as Config;
 use nori_harness::ConversationId;
-use rand::Rng;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -442,6 +441,15 @@ const PROMPT_MODE_PLACEHOLDERS: [&str; 5] = [
     "! for shell commands",
     "@ for file mentions",
 ];
+
+/// The prompt hint, chosen once for the run. Widgets are replaced as a session starts or an
+/// agent is switched, and a hint drawn anew each time would change under the user's eyes.
+fn session_placeholder() -> String {
+    use rand::Rng as _;
+    static CHOSEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let index = *CHOSEN.get_or_init(|| rand::rng().random_range(0..PROMPT_MODE_PLACEHOLDERS.len()));
+    PROMPT_MODE_PLACEHOLDERS[index].to_string()
+}
 
 // Extract the first bold (Markdown) element in the form **...** from `s`.
 // Returns the inner text if found; otherwise `None`.

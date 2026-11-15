@@ -1,23 +1,23 @@
-//! Repainting the screen from Nori's own model (Ctrl+L).
+//! Hiding everything above the prompt (Ctrl+L), and the repaint the tests exercise.
 //!
-//! Terminals can end up showing something other than what Nori drew: a program that wrote to the
-//! same tty, a font change, a glitch. Redrawing the whole screen is not an option, because the
-//! rows above the viewport that Nori did not write are the user's own history, and a full clear
-//! (`ESC[2J` pushes the screen into scrollback on some terminals, `ESC[3J` deletes scrollback on
-//! all of them) would damage it.
+//! Ctrl+L scrolls the rows above the viewport up into the scrollback, which is left whole, and
+//! leaves the screen above the prompt empty. A full clear is not used: `ESC[2J` pushes the screen
+//! into scrollback on some terminals and `ESC[3J` deletes scrollback on all of them.
 //!
-//! So a repaint touches exactly the rows Nori owns: the viewport, and the history it wrote
-//! directly above it that is still on screen. Those history rows are written again where they
-//! are, from the terminal's record of what it wrote there, in the same synchronized update as
-//! the next frame (see `history_queue`). History still waiting to be written is written after
-//! them as usual, so a repaint in the middle of a stream can neither drop nor repeat a line.
+//! A repaint, kept for recovering a screen that shows something other than what Nori drew,
+//! touches exactly the rows Nori owns: the viewport, and the history it wrote directly above it
+//! that is still on screen. Those history rows are written again where they are, from the
+//! terminal's record of what it wrote there, in the same synchronized update as the next frame
+//! (see `history_queue`). History still waiting to be written is written after them as usual, so
+//! a repaint in the middle of a stream can neither drop nor repeat a line.
 
 use super::Tui;
 
 impl Tui {
-    /// Repaint the rows Nori owns on the next draw. Scrollback is never touched.
-    pub(crate) fn request_repaint(&mut self) {
-        self.history.request_repaint();
+    /// Hide everything above the prompt on the next draw: it scrolls into the scrollback, which
+    /// is left whole, and the prompt stays at the bottom of an empty screen.
+    pub(crate) fn request_clear_screen(&mut self) {
+        self.history.request_clear_above();
         self.frame_requester().schedule_frame();
     }
 
@@ -336,7 +336,15 @@ mod tests {
             "{:?}",
             expected.0
         );
-        assert!(expected.0[0].0.starts_with("$ the user's row 0"));
+        // The prompt is pinned to the bottom, so blank rows may lead the user's own.
+        assert!(
+            expected
+                .0
+                .iter()
+                .any(|row| row.0.starts_with("$ the user's row 0")),
+            "{:?}",
+            expected.0
+        );
         for frame in 0..frames {
             for timing in [RepaintTiming::BeforeCommit, RepaintTiming::AfterCommit] {
                 let repainted = stream_answer(Some((frame, timing)));

@@ -93,7 +93,7 @@ impl ChatWidget {
     /// changes: the welcome card and the post-compaction header, both of which
     /// are written before the agent has advertised anything.
     pub(crate) fn live_status_view_model(&self) -> StatusViewModel {
-        self.status_view_model(self.agent_status.clone())
+        self.status_view_model(self.agent_status.clone(), false)
     }
 
     /// Write the welcome card now, before any agent session exists.
@@ -129,7 +129,13 @@ impl ChatWidget {
         self.show_welcome_banner = false;
     }
 
-    fn status_view_model(&self, agent: AgentStatusHandle) -> StatusViewModel {
+    /// `with_instructions` also reads and tokenizes the instruction files, which the compact card
+    /// never shows and which costs the first frame about 400 ms (the tokenizer loads).
+    fn status_view_model(
+        &self,
+        agent: AgentStatusHandle,
+        with_instructions: bool,
+    ) -> StatusViewModel {
         let footer = self.bottom_pane.status_footer_values();
         let mut model = StatusViewModel::new(agent, self.config.cwd.clone());
         model.approval_mode_label =
@@ -139,10 +145,12 @@ impl ChatWidget {
             version: footer.nori_version,
             version_source: footer.nori_version_source,
         };
-        model.instruction_files = crate::nori::session_header::local_instruction_files(
-            &self.config.active_agent,
-            &self.config.cwd,
-        );
+        if with_instructions {
+            model.instruction_files = crate::nori::session_header::local_instruction_files(
+                &self.config.active_agent,
+                &self.config.cwd,
+            );
+        }
         model.prompt_summary = footer.prompt_summary;
         model.session_title = footer.session_title;
         model.conversation_id = self.conversation_id();
@@ -157,7 +165,7 @@ impl ChatWidget {
     /// Render the `/status` card over a detached snapshot of the agent status,
     /// because printed output must not change after the fact.
     pub(crate) fn add_status_output(&mut self) {
-        let model = self.status_view_model(self.agent_status.snapshot());
+        let model = self.status_view_model(self.agent_status.snapshot(), true);
         self.add_to_history(crate::nori::session_header::new_nori_status_output(model));
     }
 }

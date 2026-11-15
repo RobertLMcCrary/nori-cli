@@ -627,16 +627,36 @@ A prompt submitted while the session is idle is painted at once. Its
 the chunks whose id it painted: a hash lookup, never a text comparison.
 
 Each frame is written with one `write` through `FrameWriter`, inside one
-synchronized update. The Redraw hotkey (default `ctrl+l`) repaints the rows
-Nori owns and leaves scrollback alone. The terminal keeps a record of the
-history rows it wrote directly above the viewport, a screenful at most
-(`written_history.rs`); the next frame writes those rows again where they are
-and redraws the viewport, and only then writes the history queued for it
-(`tui/history_queue.rs`). The repaint never reads or replaces that queue, so a
-line committed in the same frame as the key is written exactly once, during a
-stream as at any other time, and nothing scrolls while the rows are rewritten.
-Rows written at another width, or above a viewport the shell moved (after
-`^Z`), are not Nori's to rewrite and are left as they are.
+synchronized update. The prompt sits at the bottom of the screen: the first frame
+moves what is on screen down with it (blank rows fall in at the top, and only
+blank rows below the viewport fall off), and nothing moves the screen down
+again, because doing so each time the prompt shrinks would put blank rows into
+the middle of the scrollback. The Redraw hotkey (default `ctrl+l`) hides
+everything above the prompt: the next frame scrolls the rows above the viewport
+up into the scrollback, which stays whole (`ESC[2J` and `ESC[3J` are never
+sent), leaves the screen above the prompt empty, and places the prompt at the
+bottom again. History written afterwards fills in above the prompt as usual.
+
+The terminal keeps a record of the history rows it wrote directly above the
+viewport, a screenful at most (`written_history.rs`), so that a repaint can
+write exactly those rows again where they are (`insert_history::repaint_owned_history`,
+requested with `HistoryQueue::request_repaint`; the clear forgets the record,
+since the rows are gone from the screen). The repaint never reads or replaces the
+history queue (`tui/history_queue.rs`), so a line committed in the same frame is
+written exactly once. Rows written at another width, or above a viewport the
+shell moved (after `^Z`), are not Nori's to rewrite and are left as they are.
+
+The terminal's colors are not asked for before the first frame: a new terminal tab
+can take seconds to answer, and the question held the first paint back for its
+whole two-second timeout. The background from the previous run
+(`.terminal-colors-<TERM_PROGRAM>` under the Nori home) is used for the first frame; the
+foreground, which only tints the shimmer, is derived from it. A terminal that has
+answered before is asked again four seconds after launch from the event loop, and any
+terminal when its window gains focus, and a changed background redraws.
+
+The header card is written for the first conversation of a run only. A later one (an
+agent switch, `/new`) writes the line announcing it and, once the agent lists them, its
+options; the footer names the model and mode.
 
 The composer holds a fast first character back for 8 ms in case it begins a
 paste that arrives without bracketed-paste markers; the frame that releases it
