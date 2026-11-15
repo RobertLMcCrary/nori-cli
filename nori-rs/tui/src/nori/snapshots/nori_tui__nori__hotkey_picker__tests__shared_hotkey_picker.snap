@@ -25,4 +25,5 @@ expression: "text.lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
      Clear Screen                    ctrl + l
      Next Model                      ctrl + n
      Previous Model                  ctrl + p
+     Next Effort Level               ctrl + shift + n
   ↑↓/j/k move  enter rebind  r reset  esc close

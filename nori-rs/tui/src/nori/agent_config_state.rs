@@ -85,6 +85,16 @@ impl AgentConfigOption {
     }
 }
 
+/// Order models for stepping through and for the picker: as the agent advertised them, except
+/// that the Fable family, the largest, comes last. The sort is stable, so everything else keeps
+/// the agent's order (its default first).
+pub(crate) fn sort_models<T>(models: &mut [T], names: impl Fn(&T) -> (&str, &str)) {
+    models.sort_by_key(|model| {
+        let (value, name) = names(model);
+        value.to_lowercase().contains("fable") || name.to_lowercase().contains("fable")
+    });
+}
+
 /// Whether `option` is the agent's reasoning effort: the option it declares as its thought level,
 /// or, for an agent that declares no category for it, the one named for effort or reasoning.
 pub(crate) fn is_effort_option(option: &acp::SessionConfigOption) -> bool {

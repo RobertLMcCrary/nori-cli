@@ -195,58 +195,75 @@ fn effort_options(current: &str) -> Vec<acp::SessionConfigOption> {
     ]
 }
 
-fn effort_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> usize {
-    let mut count = 0;
+fn effort_steps(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> Vec<ModelStep> {
+    let mut steps = Vec::new();
     while let Ok(event) = rx.try_recv() {
-        if matches!(event, AppEvent::CycleEffort) {
-            count += 1;
+        if let AppEvent::CycleEffort(step) = event {
+            steps.push(step);
         }
     }
-    count
+    steps
 }
 
-/// A terminal without "report all keys" sends the press of Shift+Space as a plain space; only
-/// the release says Shift was held.
 #[test]
-fn shift_space_as_a_terminal_reports_it_takes_its_space_back_and_steps_the_effort() {
+fn ctrl_shift_n_and_p_step_the_effort_and_leave_the_model_keys_alone() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-    let _ = effort_events(&mut rx);
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-    let mut release = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT);
-    release.kind = crossterm::event::KeyEventKind::Release;
-    chat.handle_key_event(release);
-
-    assert_eq!(effort_events(&mut rx), 1);
-    assert_eq!(chat.composer_text(), "ab");
-
-    // A plain space, released without Shift, stays a space and steps nothing.
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-    let mut release = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
-    release.kind = crossterm::event::KeyEventKind::Release;
-    chat.handle_key_event(release);
-    assert_eq!(effort_events(&mut rx), 0);
+    let both = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    // A terminal may report the shifted key as `N`.
+    for (code, modifiers) in [
+        (KeyCode::Char('n'), both),
+        (KeyCode::Char('N'), both),
+        (KeyCode::Char('p'), both),
+        (KeyCode::Char('P'), both),
+        (KeyCode::Char('n'), KeyModifiers::CONTROL),
+    ] {
+        chat.handle_key_event(KeyEvent::new(code, modifiers));
+    }
+    assert_eq!(
+        effort_steps(&mut rx),
+        vec![
+            ModelStep::Next,
+            ModelStep::Next,
+            ModelStep::Previous,
+            ModelStep::Previous
+        ]
+    );
 }
 
-/// A terminal that reports the press with Shift gets the same result from the press alone.
 #[test]
-fn shift_space_reported_on_the_press_steps_the_effort_and_types_nothing() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-    let _ = effort_events(&mut rx);
+fn the_models_step_with_fable_last() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.sync_acp_session_config_snapshot(&[acp::SessionConfigOption::select(
+        "model",
+        "Model",
+        "default".to_owned(),
+        vec![
+            acp::SessionConfigSelectOption::new("default", "Default"),
+            acp::SessionConfigSelectOption::new("opus", "Opus 5.5"),
+            acp::SessionConfigSelectOption::new("claude-fable-5-2", "Fable 5.2"),
+            acp::SessionConfigSelectOption::new("sonnet", "Sonnet 5.5"),
+            acp::SessionConfigSelectOption::new("fable", "Fable 5.1"),
+            acp::SessionConfigSelectOption::new("haiku", "Haiku 5.5"),
+        ],
+    )
+    .category(acp::SessionConfigOptionCategory::Model)]);
 
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
-    let mut release = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT);
-    release.kind = crossterm::event::KeyEventKind::Release;
-    chat.handle_key_event(release);
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        chat.cycle_model(ModelStep::Next);
+        seen.push(current_model(&chat));
+    }
 
-    assert_eq!(effort_events(&mut rx), 1);
-    assert!(
-        !chat.composer_text().contains(' '),
-        "{:?}",
-        chat.composer_text()
+    assert_eq!(
+        seen,
+        [
+            "opus",
+            "sonnet",
+            "haiku",
+            "claude-fable-5-2",
+            "fable",
+            "default"
+        ]
     );
 }
 

@@ -306,8 +306,9 @@ pub(crate) enum AppEvent {
     /// Step to the next or previous model the agent offers.
     CycleModel(crate::chatwidget::ModelStep),
 
-    /// Step to the next effort level the agent offers (Shift+Space by default).
-    CycleEffort,
+    /// Step to the next or previous effort level the agent offers (Ctrl+Shift+N / Ctrl+Shift+P
+    /// by default).
+    CycleEffort(crate::chatwidget::ModelStep),
 
     /// Set an ACP session config option value.
     SetAcpSessionConfigOption {

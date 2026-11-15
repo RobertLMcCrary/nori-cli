@@ -1276,11 +1276,8 @@ impl App {
                     );
                 }
             }
-            AppEvent::CycleEffort => {
-                if !self
-                    .chat_widget
-                    .cycle_effort(crate::chatwidget::ModelStep::Next)
-                {
+            AppEvent::CycleEffort(step) => {
+                if !self.chat_widget.cycle_effort(step) {
                     self.chat_widget.add_info_message(
                         "The agent hasn't listed its options yet.".to_owned(),
                         None,
@@ -2169,16 +2166,6 @@ impl App {
                 if key_event.code != KeyCode::Esc && self.backtrack.primed {
                     self.reset_backtrack_state();
                 }
-                self.chat_widget.handle_key_event(key_event);
-            }
-            // A terminal that reports Shift only on the release of Shift+Space (see
-            // `ChatComposer::take_shift_space`).
-            KeyEvent {
-                code: KeyCode::Char(' '),
-                modifiers: crossterm::event::KeyModifiers::SHIFT,
-                kind: KeyEventKind::Release,
-                ..
-            } => {
                 self.chat_widget.handle_key_event(key_event);
             }
             _ => {

@@ -120,6 +120,12 @@ pub(crate) fn acp_session_config_value_picker_params(
     let mut recommended: Vec<SelectionItem> = Vec::new();
     match &select.options {
         acp::SessionConfigSelectOptions::Ungrouped(options) => {
+            let mut options: Vec<&acp::SessionConfigSelectOption> = options.iter().collect();
+            if is_model {
+                crate::nori::agent_config_state::sort_models(&mut options, |value| {
+                    (&value.value.0, &value.name)
+                });
+            }
             for option_value in options {
                 recommended.push(value_item(
                     option,

@@ -91,7 +91,14 @@ pub(crate) fn matches_binding(binding: &HotkeyBinding, event: &KeyEvent) -> bool
         return false;
     };
 
-    event.code == key_code && event.modifiers == modifiers
+    // A terminal that reports the shifted key (kitty's alternate keys) gives `N` for ctrl+shift+n.
+    let same_key = match (event.code, key_code) {
+        (KeyCode::Char(typed), KeyCode::Char(bound)) => {
+            typed.to_lowercase().eq(bound.to_lowercase())
+        }
+        (typed, bound) => typed == bound,
+    };
+    same_key && event.modifiers == modifiers
 }
 
 /// Convert a `KeyEvent` to a `HotkeyBinding` string for persistence.

@@ -8,10 +8,6 @@ impl ChatComposer {
         if !self.input_enabled {
             return (InputResult::None, false);
         }
-        if self.take_shift_space(&key_event) {
-            self.app_event_tx.send(AppEvent::CycleEffort);
-            return (InputResult::None, true);
-        }
         let is_newline_shortcut = !matches!(self.active_popup, ActivePopup::HistorySearch(_))
             && matches!(
                 key_event,
@@ -63,49 +59,8 @@ impl ChatComposer {
         }
 
         self.sync_selection_popups();
-        self.note_space_typed(&key_event);
 
         result
-    }
-
-    /// Remember that a plain space was just typed.
-    fn note_space_typed(&mut self, key_event: &KeyEvent) {
-        self.space_just_typed =
-            matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                && key_event.code == KeyCode::Char(' ')
-                && key_event.modifiers == KeyModifiers::NONE;
-    }
-
-    /// `shift+space` as a terminal reports it. Without `report all keys as escape codes` (which
-    /// would cost every key its text on layouts that compose characters) a terminal sends the
-    /// press of Shift+Space as a plain space, and only the release says that Shift was held. So
-    /// the release, when it follows the space that was just typed, takes that space back and is
-    /// the key. A terminal that does report the press with Shift is handled by the ordinary
-    /// hotkey arm instead.
-    fn take_shift_space(&mut self, key_event: &KeyEvent) -> bool {
-        let bound = crate::nori::hotkey_match::parse_binding(
-            self.textarea
-                .hotkey_config()
-                .binding_for(nori_config::HotkeyAction::NextEffort),
-        ) == Some((KeyCode::Char(' '), KeyModifiers::SHIFT));
-        if !bound
-            || key_event.kind != KeyEventKind::Release
-            || key_event.code != KeyCode::Char(' ')
-            || key_event.modifiers != KeyModifiers::SHIFT
-            || !std::mem::take(&mut self.space_just_typed)
-        {
-            return false;
-        }
-        // The space may still be held back as the start of a fast run of characters.
-        if let Some(held) = self.paste_burst.flush_before_modified_input() {
-            self.handle_paste_with_shell_detection(held, false);
-        }
-        let cursor = self.textarea.cursor();
-        if cursor == 0 || self.textarea.text().as_bytes().get(cursor - 1) != Some(&b' ') {
-            return false;
-        }
-        self.textarea.replace_range(cursor - 1..cursor, "");
-        true
     }
 
     /// Handle key event when the slash-command popup is visible.
@@ -806,7 +761,7 @@ impl ChatComposer {
                     .send(AppEvent::CycleModel(crate::chatwidget::ModelStep::Previous));
                 (InputResult::None, true)
             }
-            // Next effort level (Shift+Space by default).
+            // Next and previous effort level (Ctrl+Shift+N / Ctrl+Shift+P by default).
             key_event
                 if key_event.kind == KeyEventKind::Press
                     && matches_binding(
@@ -816,7 +771,22 @@ impl ChatComposer {
                         &key_event,
                     ) =>
             {
-                self.app_event_tx.send(AppEvent::CycleEffort);
+                self.app_event_tx
+                    .send(AppEvent::CycleEffort(crate::chatwidget::ModelStep::Next));
+                (InputResult::None, true)
+            }
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && matches_binding(
+                        self.textarea
+                            .hotkey_config()
+                            .binding_for(nori_config::HotkeyAction::PreviousEffort),
+                        &key_event,
+                    ) =>
+            {
+                self.app_event_tx.send(AppEvent::CycleEffort(
+                    crate::chatwidget::ModelStep::Previous,
+                ));
                 (InputResult::None, true)
             }
             // -------------------------------------------------------------

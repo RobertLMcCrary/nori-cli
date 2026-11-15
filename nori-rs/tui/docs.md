@@ -426,15 +426,12 @@ opened through the custom-model input to the set request, and only `Panel`
 reopens `/config`. Switching agents with `/agent` skips the resume picker when
 the new agent lists no sessions and starts a session at once.
 
-The Next Effort Level hotkey (default `shift+space`) steps the agent's effort option
-(the one it declares as its thought level, or named for effort or reasoning) through the
-same path, and the footer's model segment shows both (`Sonnet 5.5 · High`). A terminal
-that does not report every key as an escape code sends the press of Shift+Space as a plain
-space and only the release carries Shift, so the composer takes back the space it just
-typed when that release arrives (`ChatComposer::take_shift_space`); a terminal that
-reports the press with Shift is handled by the ordinary hotkey arm. Enabling
-"report all keys" would fix this at the source, but crossterm cannot read the associated
-text it needs for layouts that compose characters.
+The Next and Previous Effort Level hotkeys (default `ctrl+shift+n` and `ctrl+shift+p`) step
+the agent's effort option (the one it declares as its thought level, or named for effort or
+reasoning) through the same path, and the footer's model segment shows both (`Sonnet 5.5 ·
+High`). A letter binding matches the shifted key too, since a terminal may report `N` for
+ctrl+shift+n. Models are stepped through, and listed by `/model`, in the agent's order except
+that the Fable family comes last (`agent_config_state::sort_models`).
 
 The Next Model and Previous Model hotkeys (default `ctrl+n` and `ctrl+p`) step
 through the models the agent offers without a picker (`chatwidget/model_cycle.rs`,

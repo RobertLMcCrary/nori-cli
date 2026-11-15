@@ -827,6 +827,8 @@ pub enum HotkeyAction {
     PreviousModel,
     /// Step to the next effort level (reasoning effort) the agent offers.
     NextEffort,
+    /// Step to the previous effort level the agent offers.
+    PreviousEffort,
 }
 
 impl HotkeyAction {
@@ -853,6 +855,7 @@ impl HotkeyAction {
             Self::NextModel => "Next Model",
             Self::PreviousModel => "Previous Model",
             Self::NextEffort => "Next Effort Level",
+            Self::PreviousEffort => "Previous Effort Level",
         }
     }
 
@@ -881,6 +884,7 @@ impl HotkeyAction {
             Self::NextModel => "Switch to the next model the agent offers",
             Self::PreviousModel => "Switch to the previous model the agent offers",
             Self::NextEffort => "Step to the next effort level the agent offers",
+            Self::PreviousEffort => "Step to the previous effort level the agent offers",
         }
     }
 
@@ -907,6 +911,7 @@ impl HotkeyAction {
             Self::NextModel => "next_model",
             Self::PreviousModel => "previous_model",
             Self::NextEffort => "next_effort",
+            Self::PreviousEffort => "previous_effort",
         }
     }
 
@@ -932,7 +937,8 @@ impl HotkeyAction {
             Self::Redraw => "ctrl+l",
             Self::NextModel => "ctrl+n",
             Self::PreviousModel => "ctrl+p",
-            Self::NextEffort => "shift+space",
+            Self::NextEffort => "ctrl+shift+n",
+            Self::PreviousEffort => "ctrl+shift+p",
         }
     }
 
@@ -959,6 +965,7 @@ impl HotkeyAction {
             Self::NextModel,
             Self::PreviousModel,
             Self::NextEffort,
+            Self::PreviousEffort,
         ]
     }
 }
@@ -1086,6 +1093,8 @@ pub struct HotkeyConfigToml {
     pub previous_model: Option<HotkeyBinding>,
     /// Hotkey for stepping to the next effort level the agent offers.
     pub next_effort: Option<HotkeyBinding>,
+    /// Hotkey for stepping to the previous effort level the agent offers.
+    pub previous_effort: Option<HotkeyBinding>,
 }
 
 /// Resolved hotkey configuration with defaults applied.
@@ -1131,6 +1140,8 @@ pub struct HotkeyConfig {
     pub previous_model: HotkeyBinding,
     /// Hotkey for stepping to the next effort level the agent offers.
     pub next_effort: HotkeyBinding,
+    /// Hotkey for stepping to the previous effort level the agent offers.
+    pub previous_effort: HotkeyBinding,
 }
 
 impl Default for HotkeyConfig {
@@ -1182,6 +1193,9 @@ impl Default for HotkeyConfig {
             next_model: HotkeyBinding::from_str(HotkeyAction::NextModel.default_binding()),
             previous_model: HotkeyBinding::from_str(HotkeyAction::PreviousModel.default_binding()),
             next_effort: HotkeyBinding::from_str(HotkeyAction::NextEffort.default_binding()),
+            previous_effort: HotkeyBinding::from_str(
+                HotkeyAction::PreviousEffort.default_binding(),
+            ),
         }
     }
 }
@@ -1256,6 +1270,10 @@ impl HotkeyConfig {
                 .clone()
                 .unwrap_or(defaults.previous_model),
             next_effort: toml.next_effort.clone().unwrap_or(defaults.next_effort),
+            previous_effort: toml
+                .previous_effort
+                .clone()
+                .unwrap_or(defaults.previous_effort),
         }
     }
 
@@ -1282,6 +1300,7 @@ impl HotkeyConfig {
             HotkeyAction::NextModel => &self.next_model,
             HotkeyAction::PreviousModel => &self.previous_model,
             HotkeyAction::NextEffort => &self.next_effort,
+            HotkeyAction::PreviousEffort => &self.previous_effort,
         }
     }
 
@@ -1308,6 +1327,7 @@ impl HotkeyConfig {
             HotkeyAction::NextModel => self.next_model = binding,
             HotkeyAction::PreviousModel => self.previous_model = binding,
             HotkeyAction::NextEffort => self.next_effort = binding,
+            HotkeyAction::PreviousEffort => self.previous_effort = binding,
         }
     }
 
@@ -1340,6 +1360,7 @@ impl HotkeyConfig {
             (HotkeyAction::NextModel, &self.next_model),
             (HotkeyAction::PreviousModel, &self.previous_model),
             (HotkeyAction::NextEffort, &self.next_effort),
+            (HotkeyAction::PreviousEffort, &self.previous_effort),
         ]
     }
 }
