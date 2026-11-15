@@ -1,6 +1,8 @@
 use super::*;
 
 const AGENT_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long the agent picker's cursor stays on a row before that agent starts warming.
+const WARM_CANDIDATE_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 
 async fn prepare_agent_with_timeout(
     spec: nori_harness::runtime::AgentPrepareSpec,
@@ -137,15 +139,49 @@ impl App {
     /// Start preparing a switch candidate immediately. Replacing this state
     /// drops and tears down any older candidate without touching the active session.
     pub(crate) fn begin_agent_candidate(&mut self, agent_name: String, display_name: String) {
+        self.cancel_warm_pause();
+        // An agent already warming for this very row is taken over, not started again.
+        match self.candidate_agent.as_mut() {
+            Some(CandidateAgent::Prepared {
+                agent_name: warm,
+                speculative,
+                ..
+            }) if *speculative && *warm == agent_name => {
+                *speculative = false;
+                self.chat_widget.set_login_agent_override(Some(agent_name));
+                self.follow_up_prepared_candidate();
+                return;
+            }
+            Some(CandidateAgent::Preparing {
+                agent_name: warm,
+                speculative,
+                ..
+            }) if *speculative && *warm == agent_name => {
+                *speculative = false;
+                self.chat_widget.set_login_agent_override(Some(agent_name));
+                self.chat_widget
+                    .add_info_message(format!("Preparing {display_name}…"), None);
+                return;
+            }
+            _ => {}
+        }
         self.discard_candidate();
         self.chat_widget
             .set_login_agent_override(Some(agent_name.clone()));
-        let generation = crate::chatwidget::agent::next_session_generation();
-        let config = self.config_for_agent(&agent_name);
         self.chat_widget
             .add_info_message(format!("Preparing {display_name}…"), None);
+        self.start_candidate_preparation(agent_name, display_name, false);
+    }
 
-        let spec = crate::chatwidget::agent::agent_prepare_spec(config, None);
+    fn start_candidate_preparation(
+        &mut self,
+        agent_name: String,
+        display_name: String,
+        speculative: bool,
+    ) {
+        let generation = crate::chatwidget::agent::next_session_generation();
+        let spec =
+            crate::chatwidget::agent::agent_prepare_spec(self.config_for_agent(&agent_name), None);
         let tx = self.app_event_tx.clone();
         let prepared_agent_name = agent_name.clone();
         let task = tokio::spawn(async move {
@@ -163,7 +199,97 @@ impl App {
             generation,
             agent_name: prepared_agent_name,
             abort: task.abort_handle(),
+            speculative,
         });
+    }
+
+    /// What follows a candidate that is ready and chosen: resume the session the agent
+    /// offers on its own, start a fresh one when there is nothing to resume, or ask.
+    pub(crate) fn follow_up_prepared_candidate(&mut self) {
+        let Some(CandidateAgent::Prepared { agent, .. }) = &self.candidate_agent else {
+            return;
+        };
+        let automatic_resume =
+            super::session_setup::automatic_resume_event(agent.automatic_session_id());
+        let sessions = match agent.catalog() {
+            nori_harness::runtime::SessionCatalog::Unsupported => Vec::new(),
+            nori_harness::runtime::SessionCatalog::Listed(sessions) => sessions.clone(),
+        };
+        if let Some(event) = automatic_resume {
+            self.app_event_tx.send(event);
+        } else if sessions.is_empty() {
+            // Nothing to resume: the agent just picked starts a session at once instead of
+            // asking about a list with one row.
+            self.app_event_tx.send(AppEvent::NewSession);
+        } else {
+            self.chat_widget
+                .show_acp_resume_session_picker(sessions, true);
+        }
+    }
+
+    /// The agent picker's cursor rests on `agent_name`: warm it once it has stayed a moment.
+    pub(crate) fn highlight_agent_candidate(&mut self, agent_name: String, display_name: String) {
+        self.cancel_warm_pause();
+        let tx = self.app_event_tx.clone();
+        let pause = tokio::spawn(async move {
+            tokio::time::sleep(WARM_CANDIDATE_PAUSE).await;
+            tx.send(AppEvent::WarmAgentCandidate {
+                agent_name,
+                display_name,
+            });
+        });
+        self.warm_candidate_pause = Some(pause.abort_handle());
+    }
+
+    pub(crate) fn warm_agent_candidate(&mut self, agent_name: String, display_name: String) {
+        match &self.candidate_agent {
+            None => {}
+            Some(
+                CandidateAgent::Preparing {
+                    agent_name: warm,
+                    speculative: true,
+                    ..
+                }
+                | CandidateAgent::Prepared {
+                    agent_name: warm,
+                    speculative: true,
+                    ..
+                },
+            ) => {
+                if *warm == agent_name {
+                    return;
+                }
+            }
+            // A switch the user already chose is under way.
+            Some(_) => return,
+        }
+        self.drop_candidate();
+        self.start_candidate_preparation(agent_name, display_name, true);
+    }
+
+    /// The picker closed without a choice: nothing warmed for it is wanted.
+    pub(crate) fn discard_warm_candidate(&mut self) {
+        self.cancel_warm_pause();
+        if matches!(
+            self.candidate_agent,
+            Some(
+                CandidateAgent::Preparing {
+                    speculative: true,
+                    ..
+                } | CandidateAgent::Prepared {
+                    speculative: true,
+                    ..
+                }
+            )
+        ) {
+            self.drop_candidate();
+        }
+    }
+
+    fn cancel_warm_pause(&mut self) {
+        if let Some(pause) = self.warm_candidate_pause.take() {
+            pause.abort();
+        }
     }
 
     pub(crate) fn cancel_primary_agent_preparation(&mut self) {
@@ -173,6 +299,13 @@ impl App {
     }
 
     pub(crate) fn discard_candidate(&mut self) {
+        self.cancel_warm_pause();
+        self.drop_candidate();
+        self.chat_widget.set_login_agent_override(None);
+    }
+
+    /// Tear down the candidate, leaving the chat widget's login override as it is.
+    fn drop_candidate(&mut self) {
         match self.candidate_agent.take() {
             Some(CandidateAgent::Preparing { abort, .. }) => abort.abort(),
             Some(CandidateAgent::Prepared { agent, .. }) => {
@@ -183,7 +316,6 @@ impl App {
             }
             None => {}
         }
-        self.chat_widget.set_login_agent_override(None);
     }
 
     /// Replace the current widget with a sessionless one while a new child is

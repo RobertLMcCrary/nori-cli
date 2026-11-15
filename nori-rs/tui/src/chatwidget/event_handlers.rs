@@ -706,6 +706,7 @@ impl ChatWidget {
                             crate::app_event::HarnessAction::UndoTo(index),
                         ));
                     })],
+                    on_highlight: None,
                     dismiss_on_select: true,
                     search_value: None,
                     is_header: false,

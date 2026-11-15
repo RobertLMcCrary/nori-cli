@@ -429,8 +429,9 @@ the new agent lists no sessions and starts a session at once.
 The Next Model and Previous Model hotkeys (default `ctrl+n` and `ctrl+p`) step
 through the models the agent offers without a picker (`chatwidget/model_cycle.rs`,
 origin `Cycle`). A press updates the advertised configuration in place, so the
-footer shows the new model at once and the agent's echo of the change adds no
-history line. One request is out at a time: presses made while it is out only
+footer shows the new model at once (the `model` footer segment, on by default, beside
+the mode above the prompt; it hides when the agent offers no model choice) and the
+agent's echo of the change adds no history line. One request is out at a time: presses made while it is out only
 move the target, which is sent when the request returns. A refusal restores the
 model from before the run and says why. Up and Down keep prompt-history recall;
 with a popup open, `ctrl+n` and `ctrl+p` move through its list.
@@ -830,7 +831,15 @@ the switch. On `SessionStarted`, only the active-agent identity is committed
 into `App`, so other current settings are never overwritten by candidate-era
 state.
 
-Agent switching is transactional. Selecting an `/agent` row immediately starts
+Agent switching is transactional. While the `/agent` picker is open, a cursor
+that rests on a row for 250 ms starts warming that agent as a *speculative*
+candidate (`HighlightAgentCandidate` -> `WarmAgentCandidate`; the component
+picker fires a row's `on_highlight` when the selection changes). A speculative
+candidate that becomes ready only waits; nothing follows it. Choosing its row
+takes it over (no "Preparing" line, no second spawn), moving to another row
+replaces it, and closing the picker without a choice (`DiscardWarmAgentCandidate`)
+shuts it down. A warming failure is silent, since choosing the agent tries
+again and reports what goes wrong. Selecting an `/agent` row immediately starts
 a live candidate without changing the active `ChatWidget`; the private
 `CandidateAgent` state records preparation, picker-ready, and activation
 phases. The current and candidate subprocesses coexist while the candidate

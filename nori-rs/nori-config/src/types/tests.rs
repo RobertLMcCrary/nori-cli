@@ -910,6 +910,7 @@ fn test_footer_segment_display_name() {
         "Skillset Version"
     );
     assert_eq!(FooterSegment::TokenUsage.display_name(), "Token Usage");
+    assert_eq!(FooterSegment::Model.display_name(), "Model");
     assert_eq!(
         FooterSegment::ModeIndicator.display_name(),
         "Mode Indicator"
@@ -939,6 +940,7 @@ fn test_footer_segment_all_variants() {
             FooterSegment::Skillset,
             FooterSegment::NoriVersion,
             FooterSegment::TokenUsage,
+            FooterSegment::Model,
             FooterSegment::ModeIndicator,
             FooterSegment::CloudSession,
         ]
@@ -962,6 +964,7 @@ fn test_footer_segment_config_default_is_lean_subset() {
         FooterSegment::Context,
         FooterSegment::GitBranch,
         FooterSegment::VimMode,
+        FooterSegment::Model,
         FooterSegment::ModeIndicator,
         FooterSegment::WorktreeName,
         FooterSegment::CloudSession,
@@ -1062,10 +1065,13 @@ fn test_footer_layout_default_places_mode_above_prompt_and_state_on_the_right() 
     use pretty_assertions::assert_eq;
     let layout = FooterLayoutConfig::default();
 
-    // The agent mode owns the textarea's top-right corner, above the prompt.
+    // The model and the agent mode own the textarea's top-right corner, above the prompt.
     assert_eq!(
         layout.textarea_top_right,
-        vec![FooterSegment::ModeIndicator.into()]
+        vec![
+            FooterSegment::Model.into(),
+            FooterSegment::ModeIndicator.into()
+        ]
     );
     // Location and headroom are right-aligned on the footer row.
     assert_eq!(

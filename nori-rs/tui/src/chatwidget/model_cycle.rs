@@ -30,6 +30,62 @@ pub(crate) struct ModelCycle {
     before: Option<Vec<acp::SessionConfigOption>>,
 }
 
+/// Presses made before the agent listed its models. The placeholder widget they land on is
+/// replaced when the session starts, so the app keeps them and hands them to the widget that
+/// has the list.
+#[derive(Debug, Default)]
+pub(crate) struct WaitingModelPresses {
+    /// Next presses minus previous ones.
+    net: i32,
+    last: Option<std::time::Instant>,
+}
+
+/// How long a press waits for the list before it is forgotten, so that a press made on an agent
+/// that never lists models does not surface on the next agent.
+const PRESS_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl WaitingModelPresses {
+    /// Keep a press; true when it starts a run (the user is told once per run).
+    pub(crate) fn press(&mut self, step: ModelStep, now: std::time::Instant) -> bool {
+        let starts_run = self.last.is_none() || self.is_stale(now);
+        if starts_run {
+            self.net = 0;
+        }
+        self.net += match step {
+            ModelStep::Next => 1,
+            ModelStep::Previous => -1,
+        };
+        self.last = Some(now);
+        starts_run
+    }
+
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.last.is_some()
+    }
+
+    /// The presses to make now: the direction and how many; none when they went stale or
+    /// cancelled out.
+    pub(crate) fn take(&mut self, now: std::time::Instant) -> Option<(ModelStep, u32)> {
+        let stale = self.is_stale(now);
+        let net = std::mem::take(&mut self.net);
+        self.last = None;
+        if stale || net == 0 {
+            return None;
+        }
+        let step = if net > 0 {
+            ModelStep::Next
+        } else {
+            ModelStep::Previous
+        };
+        Some((step, net.unsigned_abs()))
+    }
+
+    fn is_stale(&self, now: std::time::Instant) -> bool {
+        self.last
+            .is_some_and(|last| now.saturating_duration_since(last) > PRESS_STALE_AFTER)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Target {
     config_id: String,
@@ -39,7 +95,12 @@ struct Target {
 }
 
 impl ChatWidget {
-    pub(crate) fn cycle_model(&mut self, step: ModelStep) {
+    /// Step to the next or previous model. False, with nothing done, while the agent has not
+    /// listed its options yet.
+    pub(crate) fn cycle_model(&mut self, step: ModelStep) -> bool {
+        if self.agent_config().is_empty() {
+            return false;
+        }
         let mut options = self.agent_config().raw_options();
         let Some(option) = options
             .iter_mut()
@@ -49,12 +110,12 @@ impl ChatWidget {
                 "This agent doesn't offer a choice of model.".to_owned(),
                 None,
             );
-            return;
+            return true;
         };
         let option_name = option.name.clone();
         let config_id = option.id.to_string();
         let acp::SessionConfigKind::Select(select) = &mut option.kind else {
-            return;
+            return true;
         };
         let offered: Vec<(String, String)> = match &select.options {
             acp::SessionConfigSelectOptions::Ungrouped(values) => values
@@ -72,7 +133,7 @@ impl ChatWidget {
         };
         if offered.len() < 2 {
             self.add_info_message("This agent offers one model.".to_owned(), None);
-            return;
+            return true;
         }
         let current = select.current_value.to_string();
         let position = offered
@@ -102,6 +163,7 @@ impl ChatWidget {
             self.send_model_target(target);
         }
         self.request_redraw();
+        true
     }
 
     fn send_model_target(&mut self, target: Target) {

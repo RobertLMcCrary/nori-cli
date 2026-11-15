@@ -246,6 +246,22 @@ pub(crate) enum AppEvent {
     /// Abandon the prepared candidate while keeping the active session.
     CancelAgentCandidate,
 
+    /// The agent picker's cursor came to rest on an agent: warm it in the background once the
+    /// cursor has stayed a moment, so that choosing it finds it ready.
+    HighlightAgentCandidate {
+        agent_name: String,
+        display_name: String,
+    },
+
+    /// The highlight outlasted the pause: start warming the agent.
+    WarmAgentCandidate {
+        agent_name: String,
+        display_name: String,
+    },
+
+    /// The picker closed without a choice: drop an agent warmed for it.
+    DiscardWarmAgentCandidate,
+
     /// Agent failed to spawn (ACP or HTTP backend). Show error and prompt user
     /// to select a different agent.
     AgentSpawnFailed {

@@ -60,6 +60,7 @@ mod layout_cache;
 mod local_echo;
 mod model_cycle;
 pub(crate) use model_cycle::ModelStep;
+pub(crate) use model_cycle::WaitingModelPresses;
 mod stream_frame;
 pub(crate) mod subagents;
 pub(crate) use self::agent::HarnessHandle;

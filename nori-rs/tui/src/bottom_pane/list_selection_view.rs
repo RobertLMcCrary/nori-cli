@@ -54,6 +54,8 @@ pub(crate) struct SelectionItem {
     pub selected_description: Option<String>,
     pub is_current: bool,
     pub actions: Vec<SelectionAction>,
+    /// Fired when the cursor lands on this row, before anything is chosen (pickers only).
+    pub on_highlight: Option<SelectionAction>,
     pub dismiss_on_select: bool,
     pub search_value: Option<String>,
     /// When true, this row is a non-selectable section header: navigation skips

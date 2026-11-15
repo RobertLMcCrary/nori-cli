@@ -46,6 +46,33 @@ fn presses_step_through_the_models_and_wrap() {
     assert_eq!(current_model(&chat), "haiku");
 }
 
+fn screen(chat: &ChatWidget) -> String {
+    use crate::test_backend::VT100Backend;
+    use ratatui::Terminal;
+    let height = chat.desired_height(80);
+    let mut terminal = Terminal::new(VT100Backend::new(80, height)).expect("terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw");
+    terminal.backend().vt100().screen().contents()
+}
+
+#[test]
+fn the_footer_shows_the_model_a_press_switched_to() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.sync_acp_session_config_snapshot(&models("sonnet"));
+    assert!(screen(&chat).contains("Sonnet"), "{}", screen(&chat));
+
+    chat.cycle_model(ModelStep::Next);
+    let contents = screen(&chat);
+    assert!(contents.contains("Opus"), "{contents}");
+    assert!(!contents.contains("Sonnet"), "{contents}");
+
+    // A refusal puts the earlier model back on screen too.
+    chat.on_model_cycle_result(Err("not on this plan".to_owned()));
+    assert!(screen(&chat).contains("Sonnet"), "{}", screen(&chat));
+}
+
 #[test]
 fn a_refused_switch_brings_the_earlier_model_back() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
@@ -70,6 +97,16 @@ fn a_refused_switch_brings_the_earlier_model_back() {
 #[test]
 fn an_agent_without_a_choice_of_model_says_so() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.sync_acp_session_config_snapshot(&[acp::SessionConfigOption::select(
+        "mode",
+        "Mode",
+        "ask".to_owned(),
+        vec![
+            acp::SessionConfigSelectOption::new("ask", "Ask"),
+            acp::SessionConfigSelectOption::new("code", "Code"),
+        ],
+    )
+    .category(acp::SessionConfigOptionCategory::Mode)]);
     chat.cycle_model(ModelStep::Next);
     let history: String = drain_insert_history(&mut rx)
         .iter()
@@ -79,6 +116,49 @@ fn an_agent_without_a_choice_of_model_says_so() {
         history.contains("doesn't offer a choice of model"),
         "{history}"
     );
+}
+
+#[test]
+fn a_press_before_the_agent_lists_its_models_does_nothing_yet() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+
+    assert!(!chat.cycle_model(ModelStep::Next));
+
+    let history: String = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect();
+    assert_eq!(history, "");
+}
+
+#[test]
+fn presses_that_waited_for_the_list_are_made_once_it_is_known() {
+    use std::time::Duration;
+    use std::time::Instant;
+    let t0 = Instant::now();
+    let mut waiting = WaitingModelPresses::default();
+    assert!(
+        waiting.press(ModelStep::Next, t0),
+        "the first press starts a run"
+    );
+    assert!(!waiting.press(ModelStep::Next, t0 + Duration::from_secs(1)));
+    assert!(!waiting.press(ModelStep::Previous, t0 + Duration::from_secs(2)));
+    assert!(waiting.is_waiting());
+    // Two next presses and one previous leave one step forward.
+    assert_eq!(
+        waiting.take(t0 + Duration::from_secs(3)),
+        Some((ModelStep::Next, 1))
+    );
+    assert!(!waiting.is_waiting());
+
+    // A press nobody answered for a long while is forgotten rather than surfacing later.
+    assert!(waiting.press(ModelStep::Next, t0));
+    assert_eq!(waiting.take(t0 + Duration::from_secs(60)), None);
+
+    // Presses that cancel out make none.
+    assert!(waiting.press(ModelStep::Next, t0));
+    waiting.press(ModelStep::Previous, t0);
+    assert_eq!(waiting.take(t0), None);
 }
 
 #[test]

@@ -26,6 +26,10 @@ impl ChatWidget {
         self.agent_status
             .set(AgentStatus::from_config(&self.config.active_agent, &config));
         let mode = config.mode_config();
+        let model = config
+            .option_for_category(&nori_protocol::acp::v1::SessionConfigOptionCategory::Model)
+            .map(crate::nori::agent_config_state::AgentConfigOption::display_value);
+        self.bottom_pane.set_model_label(model);
         self.agent_config = config;
         self.apply_acp_mode_config_snapshot(self.acp_mode_config_generation, mode);
     }

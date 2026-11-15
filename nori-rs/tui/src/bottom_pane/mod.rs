@@ -625,6 +625,12 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    /// The model shown in the footer (None hides it).
+    pub(crate) fn set_model_label(&mut self, label: Option<String>) {
+        self.composer.set_model_label(label);
+        self.request_redraw();
+    }
+
     /// Update the cloud session id displayed in the footer (None hides it).
     pub(crate) fn set_cloud_session(&mut self, cloud_session: Option<String>) {
         self.composer.set_cloud_session(cloud_session);
@@ -1219,6 +1225,7 @@ mod tests {
                 [PickerItem::new("alpha".to_string(), "session", "Alpha")],
             ),
             actions: std::collections::BTreeMap::new(),
+            highlights: Default::default(),
             on_dismiss: None,
             on_shift_tab: None,
             primary_column: "session".to_string(),

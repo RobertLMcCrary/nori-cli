@@ -50,6 +50,8 @@ pub fn agent_picker_params_with_subtitle(
             let is_current = agent.agent_name.to_lowercase() == current_normalized;
             let agent_name = agent.agent_name.clone();
             let display_name = agent.display_name.clone();
+            let highlight_agent = agent_name.clone();
+            let highlight_display = display_name.clone();
 
             // Start preparing the selected agent as soon as the picker closes.
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
@@ -59,11 +61,22 @@ pub fn agent_picker_params_with_subtitle(
                 });
             })];
 
+            // Resting on a row starts its agent warming, so choosing it is nearly instant.
+            let on_highlight: Option<SelectionAction> = (!is_current).then(|| {
+                Box::new(move |tx: &AppEventSender| {
+                    tx.send(AppEvent::HighlightAgentCandidate {
+                        agent_name: highlight_agent.clone(),
+                        display_name: highlight_display.clone(),
+                    });
+                }) as SelectionAction
+            });
+
             SelectionItem {
                 name: agent.display_name,
                 description: Some(agent.description),
                 is_current,
                 actions,
+                on_highlight,
                 dismiss_on_select: true,
                 ..Default::default()
             }
@@ -90,6 +103,10 @@ pub fn agent_picker_params_with_subtitle(
         ]),
         on_shift_tab: Some(Box::new(move |tx| {
             tx.send(AppEvent::SetConfigAcpWireRecording(!recording_enabled));
+        })),
+        // Closing the picker without a choice drops whatever it warmed.
+        on_dismiss: Some(Box::new(|tx| {
+            tx.send(AppEvent::DiscardWarmAgentCandidate);
         })),
         items,
         ..Default::default()

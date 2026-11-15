@@ -148,6 +148,7 @@ pub(crate) struct ChatComposer {
     /// The approval mode label to display in the footer (e.g., "Read Only", "Agent", "Full Access").
     approval_mode_label: Option<String>,
     acp_mode_label: Option<String>,
+    model_label: Option<String>,
     /// Cloud session id shown in the footer when attached to a cloud session.
     cloud_session: Option<String>,
     vim_enter_behavior: nori_config::VimEnterBehavior,
@@ -224,6 +225,7 @@ impl ChatComposer {
             system_info: None,
             approval_mode_label: None,
             acp_mode_label: None,
+            model_label: None,
             cloud_session: None,
             vim_enter_behavior: nori_config::VimEnterBehavior::Off,
             vertical_footer: false,
@@ -487,6 +489,10 @@ impl ChatComposer {
 
     pub(crate) fn set_acp_mode_label(&mut self, label: Option<String>) {
         self.acp_mode_label = label;
+    }
+
+    pub(crate) fn set_model_label(&mut self, label: Option<String>) {
+        self.model_label = label;
     }
 
     pub(crate) fn set_cloud_session(&mut self, cloud_session: Option<String>) {

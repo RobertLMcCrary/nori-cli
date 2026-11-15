@@ -130,6 +130,10 @@ pub(crate) struct App {
     /// Live agent-switch candidate. The active widget remains usable until an
     /// activating candidate publishes `SessionStarted`.
     candidate_agent: Option<CandidateAgent>,
+    /// Model presses made before the agent listed its models; they apply when it does.
+    waiting_model_presses: crate::chatwidget::WaitingModelPresses,
+    /// The pause between the agent picker's cursor settling on a row and that agent warming.
+    warm_candidate_pause: Option<tokio::task::AbortHandle>,
     /// Whether the welcome card for the current conversation has already been
     /// written, ahead of the session that conversation will run on.
     welcome_card_written: bool,
@@ -187,11 +191,15 @@ enum CandidateAgent {
         generation: crate::app_event::SessionGeneration,
         agent_name: String,
         abort: tokio::task::AbortHandle,
+        /// Warming for a highlighted picker row: nothing is chosen yet, so nothing follows its
+        /// readiness.
+        speculative: bool,
     },
     Prepared {
         agent_name: String,
         display_name: String,
         agent: Box<nori_harness::runtime::PreparedAgent>,
+        speculative: bool,
     },
     Activating {
         agent_name: String,
@@ -326,6 +334,8 @@ impl App {
             primary_agent_preparation: None,
             pending_session_activation,
             candidate_agent: None,
+            warm_candidate_pause: None,
+            waiting_model_presses: Default::default(),
             welcome_card_written: false,
             loop_count_override: None,
             hotkey_config: nori_config::HotkeyConfig::default(),

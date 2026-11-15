@@ -173,6 +173,14 @@ impl App {
         tui: &mut tui::Tui,
         event: AppEvent,
     ) -> Result<bool> {
+        if self.waiting_model_presses.is_waiting()
+            && !self.chat_widget.agent_config().is_empty()
+            && let Some((step, count)) = self.waiting_model_presses.take(std::time::Instant::now())
+        {
+            for _ in 0..count {
+                self.chat_widget.cycle_model(step);
+            }
+        }
         match event {
             AppEvent::ContextTimelineReady {
                 generation,
@@ -411,17 +419,11 @@ impl App {
 
                     match agent {
                         Ok(agent) => {
-                            let automatic_resume = super::session_setup::automatic_resume_event(
-                                agent.automatic_session_id(),
-                            );
-                            let sessions = match agent.catalog() {
-                                nori_harness::runtime::SessionCatalog::Unsupported => Vec::new(),
-                                nori_harness::runtime::SessionCatalog::Listed(sessions) => {
-                                    sessions.clone()
-                                }
-                            };
-                            let Some(CandidateAgent::Preparing { agent_name, .. }) =
-                                self.candidate_agent.take()
+                            let Some(CandidateAgent::Preparing {
+                                agent_name,
+                                speculative,
+                                ..
+                            }) = self.candidate_agent.take()
                             else {
                                 unreachable!("candidate generation checked above")
                             };
@@ -429,17 +431,25 @@ impl App {
                                 agent_name,
                                 display_name,
                                 agent: Box::new(agent),
+                                speculative,
                             });
-                            if let Some(event) = automatic_resume {
-                                self.app_event_tx.send(event);
-                            } else if sessions.is_empty() {
-                                // Nothing to resume: the agent just picked starts a session
-                                // at once instead of asking about a list with one row.
-                                self.app_event_tx.send(AppEvent::NewSession);
-                            } else {
-                                self.chat_widget
-                                    .show_acp_resume_session_picker(sessions, true);
+                            // A warmed agent waits to be chosen; it starts nothing on its own.
+                            if !speculative {
+                                self.follow_up_prepared_candidate();
                             }
+                        }
+                        // Warming that failed says nothing yet: choosing the agent tries again
+                        // and reports what goes wrong.
+                        Err(_)
+                            if matches!(
+                                &self.candidate_agent,
+                                Some(CandidateAgent::Preparing {
+                                    speculative: true,
+                                    ..
+                                })
+                            ) =>
+                        {
+                            self.candidate_agent = None;
                         }
                         Err(error) => {
                             self.candidate_agent = None;
@@ -1178,6 +1188,15 @@ impl App {
             } => {
                 self.begin_agent_candidate(agent_name, display_name);
             }
+            AppEvent::HighlightAgentCandidate {
+                agent_name,
+                display_name,
+            } => self.highlight_agent_candidate(agent_name, display_name),
+            AppEvent::WarmAgentCandidate {
+                agent_name,
+                display_name,
+            } => self.warm_agent_candidate(agent_name, display_name),
+            AppEvent::DiscardWarmAgentCandidate => self.discard_warm_candidate(),
             AppEvent::CancelAgentCandidate => {
                 self.discard_candidate();
                 self.chat_widget
@@ -1239,7 +1258,17 @@ impl App {
                 );
             }
             AppEvent::CycleModel(step) => {
-                self.chat_widget.cycle_model(step);
+                if !self.chat_widget.cycle_model(step)
+                    && self
+                        .waiting_model_presses
+                        .press(step, std::time::Instant::now())
+                {
+                    self.chat_widget.add_info_message(
+                        "The agent hasn't listed its models yet; this applies as soon as it does."
+                            .to_owned(),
+                        None,
+                    );
+                }
             }
             AppEvent::AcpSessionConfigSetResult {
                 success,

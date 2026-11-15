@@ -18,6 +18,8 @@ use ratatui::text::Span;
 use ratatui::widgets::Widget;
 
 const MODE_INDICATOR_LABEL_MAX_CHARS: usize = 20;
+/// Model names are short ("Opus 5.5"), but agents can advertise long ids.
+const MODEL_LABEL_MAX_CHARS: usize = 24;
 /// Minimum blank columns between the left and right footer groups before the
 /// right group starts shedding segments.
 const FOOTER_GROUP_MIN_GAP_COLS: u16 = 2;
@@ -73,6 +75,8 @@ pub(crate) struct FooterProps {
     pub(crate) footer_layout_config: FooterLayoutConfig,
     /// ACP agent mode label to display when the agent exposes a mode option.
     pub(crate) acp_mode_label: Option<String>,
+    /// The model the agent is using, when it offers a choice of model.
+    pub(crate) model_label: Option<String>,
     /// Cloud session identifier (e.g. `nori-fast-kazunoko-aac8`) when attached
     /// through cloud mode. Renders the `CloudSession` segment.
     pub(crate) cloud_session: Option<String>,
@@ -554,6 +558,9 @@ fn builtin_footer_segment(props: &FooterProps, segment: FooterSegment) -> Option
             ])
         }),
         FooterSegment::TokenUsage => token_usage_segment(props),
+        FooterSegment::Model => props.model_label.as_ref().map(|label| {
+            Line::from(Span::from(truncate_label(label, MODEL_LABEL_MAX_CHARS)).dim())
+        }),
         FooterSegment::ModeIndicator => props.acp_mode_label.as_ref().map(|raw_label| {
             let label = truncate_label(raw_label, MODE_INDICATOR_LABEL_MAX_CHARS);
             let text = format!("[ {label} ]");
@@ -928,6 +935,7 @@ mod tests {
             skillset: true,
             nori_version: true,
             token_usage: true,
+            model: true,
             mode_indicator: true,
             cloud_session: true,
         }
@@ -962,6 +970,7 @@ mod tests {
             footer_segment_config: snapshot_segment_config(),
             footer_layout_config: nori_config::FooterLayoutConfig::default(),
             acp_mode_label: None,
+            model_label: None,
             cloud_session: None,
         }
     }
@@ -1281,6 +1290,30 @@ footer_right = ["mode_indicator"]
         }
 
         // The mode indicator moved above the prompt rather than disappearing.
+        assert_eq!(
+            textarea_corner_segments(&props).top_right.to_string(),
+            "[ Plan ]"
+        );
+    }
+
+    #[test]
+    fn the_model_sits_beside_the_mode_above_the_prompt() {
+        let props = FooterProps {
+            model_label: Some("Opus 5.5".to_string()),
+            acp_mode_label: Some("Plan".to_string()),
+            ..default_props()
+        };
+        assert_eq!(
+            textarea_corner_segments(&props).top_right.to_string(),
+            "Opus 5.5 · [ Plan ]"
+        );
+
+        // An agent with no choice of model shows no model.
+        let props = FooterProps {
+            model_label: None,
+            acp_mode_label: Some("Plan".to_string()),
+            ..default_props()
+        };
         assert_eq!(
             textarea_corner_segments(&props).top_right.to_string(),
             "[ Plan ]"
@@ -1909,6 +1942,7 @@ footer_right = []
             skillset: false,
             nori_version: false,
             token_usage: false,
+            model: false,
             mode_indicator: false,
             cloud_session: false,
         };

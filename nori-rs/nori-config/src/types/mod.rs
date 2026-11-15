@@ -1368,6 +1368,8 @@ pub enum FooterSegment {
     NoriVersion,
     /// Token usage: "Tokens: 77K total (32K cached)"
     TokenUsage,
+    /// Model the agent is using: "Opus 5.5". Hidden when the agent offers no model choice.
+    Model,
     /// ACP mode indicator: "[ Plan ]"
     ModeIndicator,
     /// Cloud session identity: "☁ nori-fast-kazunoko-aac8". Only rendered when
@@ -1395,6 +1397,7 @@ impl FooterSegment {
             Self::Skillset => "Skillset",
             Self::NoriVersion => "Skillset Version",
             Self::TokenUsage => "Token Usage",
+            Self::Model => "Model",
             Self::ModeIndicator => "Mode Indicator",
             Self::CloudSession => "Cloud Session",
         }
@@ -1419,6 +1422,7 @@ impl FooterSegment {
             Self::Skillset => "skillset",
             Self::NoriVersion => "nori_version",
             Self::TokenUsage => "token_usage",
+            Self::Model => "model",
             Self::ModeIndicator => "mode_indicator",
             Self::CloudSession => "cloud_session",
         }
@@ -1443,6 +1447,7 @@ impl FooterSegment {
             Self::Skillset,
             Self::NoriVersion,
             Self::TokenUsage,
+            Self::Model,
             Self::ModeIndicator,
             Self::CloudSession,
         ]
@@ -1504,6 +1509,8 @@ pub struct FooterSegmentConfigToml {
     pub nori_version: Option<bool>,
     /// Enable/disable token usage segment.
     pub token_usage: Option<bool>,
+    /// Enable/disable current model segment.
+    pub model: Option<bool>,
     /// Enable/disable ACP mode indicator segment.
     pub mode_indicator: Option<bool>,
     /// Enable/disable cloud session identity segment.
@@ -1545,6 +1552,8 @@ pub struct FooterSegmentConfig {
     pub nori_version: bool,
     /// Enable/disable token usage segment.
     pub token_usage: bool,
+    /// Enable/disable current model segment.
+    pub model: bool,
     /// Enable/disable ACP mode indicator segment.
     pub mode_indicator: bool,
     /// Enable/disable cloud session identity segment.
@@ -1577,6 +1586,7 @@ impl Default for FooterSegmentConfig {
             skillset: false,
             nori_version: false,
             token_usage: false,
+            model: true,
             mode_indicator: true,
             cloud_session: true,
         }
@@ -1614,6 +1624,7 @@ impl FooterSegmentConfig {
             skillset: toml.skillset.unwrap_or(defaults.skillset),
             nori_version: toml.nori_version.unwrap_or(defaults.nori_version),
             token_usage: toml.token_usage.unwrap_or(defaults.token_usage),
+            model: toml.model.unwrap_or(defaults.model),
             mode_indicator: toml.mode_indicator.unwrap_or(defaults.mode_indicator),
             cloud_session: toml.cloud_session.unwrap_or(defaults.cloud_session),
         }
@@ -1638,6 +1649,7 @@ impl FooterSegmentConfig {
             FooterSegment::Skillset => self.skillset,
             FooterSegment::NoriVersion => self.nori_version,
             FooterSegment::TokenUsage => self.token_usage,
+            FooterSegment::Model => self.model,
             FooterSegment::ModeIndicator => self.mode_indicator,
             FooterSegment::CloudSession => self.cloud_session,
         }
@@ -1662,6 +1674,7 @@ impl FooterSegmentConfig {
             FooterSegment::Skillset => self.skillset = enabled,
             FooterSegment::NoriVersion => self.nori_version = enabled,
             FooterSegment::TokenUsage => self.token_usage = enabled,
+            FooterSegment::Model => self.model = enabled,
             FooterSegment::ModeIndicator => self.mode_indicator = enabled,
             FooterSegment::CloudSession => self.cloud_session = enabled,
         }
@@ -1859,10 +1872,13 @@ impl Default for FooterLayoutConfig {
                 FooterSegment::Context.into(),
             ],
             textarea_top_left: Vec::new(),
-            // The agent mode sits on the textarea's top-right corner, above
-            // the prompt, so it reads as a property of what you are about to
-            // send rather than another metadata chip.
-            textarea_top_right: vec![FooterSegment::ModeIndicator.into()],
+            // The model and the agent mode sit on the textarea's top-right
+            // corner, above the prompt, so they read as properties of what you
+            // are about to send rather than other metadata chips.
+            textarea_top_right: vec![
+                FooterSegment::Model.into(),
+                FooterSegment::ModeIndicator.into(),
+            ],
             textarea_bottom_left: Vec::new(),
             textarea_bottom_right: Vec::new(),
         }
