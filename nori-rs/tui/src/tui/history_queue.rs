@@ -23,12 +23,9 @@ pub(crate) struct HistoryQueue {
     /// The next frame scrolls everything above the prompt into the scrollback.
     clear_above: bool,
     /// The prompt has been placed at the bottom of the screen. Only the first frame and a clear
-    /// do it, and the shrink after the screen was pushed up: moving the screen down on every
-    /// shrink would put blank rows into the middle of the scrollback each time.
+    /// do it: moving the screen down later would put blank rows into the middle of the
+    /// scrollback each time the prompt shrinks.
     pinned: bool,
-    /// A taller viewport pushed the screen up into the scrollback, so the prompt has to go back
-    /// down to the bottom when it shrinks, or the room it gave up stays blank below it.
-    bumped: bool,
 }
 
 impl HistoryQueue {
@@ -96,7 +93,6 @@ impl HistoryQueue {
                 .backend_mut()
                 .scroll_region_up(0..area.top(), area.bottom() - size.height)?;
             area.y = size.height - area.height;
-            self.bumped = true;
         } else if area.y == 0 && area.height < size.height {
             // Viewport was full-screen (y=0) and has shrunk. Reposition
             // to bottom so insert_history_lines has room above.
@@ -131,7 +127,7 @@ impl HistoryQueue {
                     )?;
                 }
             }
-        } else if area.bottom() < size.height && (!self.pinned || self.bumped) {
+        } else if area.bottom() < size.height && !self.pinned {
             // The prompt goes to the bottom of the screen: whatever is on screen moves down with
             // it, and only blank rows below the viewport fall off. The viewport is placed first,
             // since clearing erases from the viewport downward.
@@ -142,7 +138,6 @@ impl HistoryQueue {
             area.y += gap;
             terminal.set_viewport_area(area);
             terminal.clear()?;
-            self.bumped = false;
         }
         self.pinned = true;
         if area != terminal.viewport_area {
@@ -270,26 +265,6 @@ mod tests {
 
         assert_eq!(terminal.backend().scrollback_rows().len(), before);
         assert_eq!(terminal.viewport_area.height, 2);
-    }
-
-    #[test]
-    fn a_prompt_that_pushed_the_screen_up_returns_to_the_bottom_when_it_shrinks() {
-        let mut terminal = terminal_after_a_shell();
-        let mut queue = HistoryQueue::default();
-        queue.write_frame(&mut terminal, 2).expect("frame");
-        draw_prompt(&mut terminal);
-
-        // A picker opens and closes: the prompt is pushed up with the screen, then comes back.
-        queue.write_frame(&mut terminal, 6).expect("frame");
-        draw_prompt(&mut terminal);
-        queue.write_frame(&mut terminal, 6).expect("frame");
-        queue.write_frame(&mut terminal, 2).expect("frame");
-        draw_prompt(&mut terminal);
-
-        assert_eq!(terminal.viewport_area, Rect::new(0, HEIGHT - 2, WIDTH, 2));
-        let rows = screen(&terminal);
-        assert_eq!(rows[HEIGHT as usize - 2], "> prompt");
-        assert_eq!(rows[HEIGHT as usize - 1], "footer");
     }
 
     #[test]
