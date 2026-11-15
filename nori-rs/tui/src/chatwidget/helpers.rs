@@ -80,6 +80,9 @@ impl ChatWidget {
             return;
         }
         self.exiting = true;
+        if self.stream_ending {
+            self.flush_answer_stream_with_separator();
+        }
         self.bottom_pane.show_exit_in_progress();
 
         if self.cloud_mode && self.acp_session_id.is_some() {

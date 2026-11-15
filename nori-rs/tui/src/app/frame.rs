@@ -39,22 +39,14 @@ impl App {
         Ok(true)
     }
 
-    /// Repaint the visible screen from the transcript, leaving scrollback alone.
-    pub(super) fn repaint_screen(&mut self, tui: &mut tui::Tui) -> Result<()> {
+    /// Repaint the rows Nori owns on the visible screen, leaving scrollback alone.
+    pub(super) fn repaint_screen(&mut self, tui: &mut tui::Tui) {
         if tui.is_alt_screen_active() {
             // A pager overlay draws the whole screen every frame; forgetting what the terminal
             // shows is all it takes.
             tui.request_full_repaint();
-            return Ok(());
+        } else {
+            tui.request_repaint();
         }
-        let width = tui.terminal.size()?.width;
-        let rows = tui.history_rows_to_repaint()?;
-        let tail = crate::transcript_reflow::render_transcript_tail_rows(
-            &self.transcript_cells,
-            width,
-            rows,
-        );
-        tui.request_repaint(tail);
-        Ok(())
     }
 }

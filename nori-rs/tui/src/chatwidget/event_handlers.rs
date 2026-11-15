@@ -58,6 +58,8 @@ impl ChatWidget {
                 }
                 if self.replay_source.is_none() {
                     self.handle_proactive_session_update(&notification.update);
+                } else {
+                    self.note_replayed_update(&notification.update);
                 }
                 let events = self
                     .client_event_normalizer
@@ -347,12 +349,17 @@ impl ChatWidget {
             },
             nori_protocol::NoriEvent::ReplayStarted(started) => {
                 self.flush_answer_stream_with_separator();
-                self.flush_replay_message();
                 self.replay_source = Some(started.source);
+                self.app_event_tx.send(AppEvent::HistoryReplay(
+                    crate::app_event::HistoryReplay::Started,
+                ));
             }
             nori_protocol::NoriEvent::ReplayFinished => {
-                self.flush_replay_message();
+                self.end_replayed_turn();
                 self.replay_source = None;
+                self.app_event_tx.send(AppEvent::HistoryReplay(
+                    crate::app_event::HistoryReplay::Finished,
+                ));
             }
             nori_protocol::NoriEvent::Subagent(wire) => self.handle_subagent_wire(wire),
             nori_protocol::NoriEvent::Undo(_) | nori_protocol::NoriEvent::UserShell(_) => {}
@@ -442,6 +449,7 @@ impl ChatWidget {
     }
 
     pub(super) fn flush_answer_stream_with_separator(&mut self) {
+        self.stream_ending = false;
         self.live_tail.set(None);
         if let Some(mut controller) = self.stream_controller.take() {
             let (cell, source) = controller.finalize();
@@ -561,8 +569,19 @@ impl ChatWidget {
     }
 
     fn finish_task_presentation(&mut self, last_agent_message: Option<String>, notify: bool) {
-        // If a stream is currently active, finalize it.
-        self.flush_answer_stream_with_separator();
+        // If a stream is currently active, finalize it. A burst too big to render in one frame
+        // is finished by the frames that follow, as during the turn, instead of in one stall.
+        self.commit_stream_for_frame();
+        if self
+            .stream_controller
+            .as_ref()
+            .is_some_and(StreamController::has_unrendered_input)
+        {
+            self.stream_ending = true;
+            self.request_redraw();
+        } else {
+            self.flush_answer_stream_with_separator();
+        }
 
         self.pending_client_tool_cells.clear();
         self.finalize_active_cell_as_failed();
@@ -596,6 +615,7 @@ impl ChatWidget {
         self.bottom_pane.set_task_running(false);
         self.completed_client_tool_calls.clear();
         self.stream_controller = None;
+        self.stream_ending = false;
         self.live_tail.set(None);
     }
 
@@ -712,6 +732,10 @@ impl ChatWidget {
 
     #[inline]
     pub(super) fn handle_streaming_delta(&mut self, delta: String) {
+        // Text after the end of a turn is not part of its answer.
+        if self.stream_ending {
+            self.flush_answer_stream_with_separator();
+        }
         // Always flush the active cell before streaming agent text. This ensures
         // tool cells appear in the correct chronological position (before the text
         // that follows them), even when tool calls haven't completed yet.
@@ -719,10 +743,12 @@ impl ChatWidget {
 
         if self.stream_controller.is_none() {
             if self.needs_final_message_separator {
+                // A replayed turn is not running; its update says how long it ran.
                 let elapsed_seconds = self
                     .bottom_pane
                     .status_widget()
-                    .map(crate::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds);
+                    .map(crate::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
+                    .or(self.replay_turn_elapsed.map(|elapsed| elapsed.as_secs()));
                 self.add_to_history(history_cell::FinalMessageSeparator::new(elapsed_seconds));
                 self.needs_final_message_separator = false;
             }
@@ -912,7 +938,9 @@ impl ChatWidget {
                     }
                 } else {
                     self.flush_active_cell();
-                    self.session_stats.record_user_message();
+                    if self.replay_source.is_none() {
+                        self.session_stats.record_user_message();
+                    }
                     self.active_user_message_id = message_delta.message_id;
                     self.active_cell
                         .set(Some(Box::new(history_cell::new_user_prompt(
@@ -1018,71 +1046,6 @@ impl ChatWidget {
             ));
             self.request_redraw();
         }
-    }
-
-    fn handle_replay_client_event(&mut self, event: crate::presentation::ClientEvent) {
-        match event {
-            crate::presentation::ClientEvent::MessageDelta(delta) => {
-                let same_message = self.replay_message.as_ref().is_some_and(|message| {
-                    message.stream == delta.stream
-                        && match (&message.message_id, &delta.message_id) {
-                            (Some(current), Some(incoming)) => current == incoming,
-                            (None, None) => true,
-                            (Some(_), None) | (None, Some(_)) => false,
-                        }
-                });
-                if same_message {
-                    if let Some(message) = self.replay_message.as_mut() {
-                        message.text.push_str(&delta.delta);
-                    }
-                } else {
-                    self.flush_replay_message();
-                    self.replay_message = Some(ReplayMessage {
-                        stream: delta.stream,
-                        message_id: delta.message_id,
-                        text: delta.delta,
-                    });
-                }
-            }
-            crate::presentation::ClientEvent::PlanSnapshot(snapshot) => {
-                self.flush_replay_message();
-                self.handle_client_replay_entry(crate::presentation::ReplayEntry::PlanSnapshot {
-                    snapshot,
-                });
-            }
-            crate::presentation::ClientEvent::ToolSnapshot(snapshot) => {
-                self.flush_replay_message();
-                self.handle_client_replay_entry(crate::presentation::ReplayEntry::ToolSnapshot {
-                    snapshot: Box::new(snapshot),
-                });
-            }
-            crate::presentation::ClientEvent::ReplayEntry(replay_entry) => {
-                self.flush_replay_message();
-                self.handle_client_replay_entry(replay_entry);
-            }
-            event => {
-                self.flush_replay_message();
-                self.handle_client_event(event);
-            }
-        }
-    }
-
-    fn flush_replay_message(&mut self) {
-        let Some(message) = self.replay_message.take() else {
-            return;
-        };
-        let replay_entry = match message.stream {
-            crate::presentation::MessageStream::User => {
-                crate::presentation::ReplayEntry::UserMessage { text: message.text }
-            }
-            crate::presentation::MessageStream::Answer => {
-                crate::presentation::ReplayEntry::AssistantMessage { text: message.text }
-            }
-            crate::presentation::MessageStream::Reasoning => {
-                crate::presentation::ReplayEntry::ReasoningMessage { text: message.text }
-            }
-        };
-        self.handle_client_replay_entry(replay_entry);
     }
 
     fn handle_client_replay_entry(&mut self, replay_entry: crate::presentation::ReplayEntry) {

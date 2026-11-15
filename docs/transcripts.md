@@ -25,6 +25,14 @@ $NORI_HOME/transcripts/by-project/{project-id}/
 - Session files are created with mode `0600` on Unix.
 - The writer creates a fresh file, appends one JSON object per line, and flushes
   each line. It does not `fsync`, so a crashed session can lose its tail.
+- A session resumed from its own transcript, whose history is replayed from
+  that transcript, goes on recording into that file
+  (`TranscriptRecorder::continue_session`): same `session_id`, no second
+  `session_meta`, and a newline first if the file stopped in the middle of a
+  line. The replayed history is already in the file and is not recorded again,
+  so such a resume never copies the transcript. When the agent replays the
+  history itself (`session/load`), recording starts a new file as before, since
+  the agent's history can hold more than the local one.
 
 ### Project IDs and `project.json`
 
@@ -97,7 +105,11 @@ Optional identity fields, including `agent`, `git`, `acp_session_id`, and
 Nori transcript for a branch-at-head fork. Within `git`, `branch` and
 `commit_hash` are optional.
 `acp_session_id` is the agent's identity used for ACP session load or resume;
-it is distinct from Nori's transcript `session_id`.
+it is distinct from Nori's transcript `session_id`. A transcript that a resume
+continued may hold sessions the agent started since (a `session/new` fallback);
+the metadata keeps the first, and resuming the transcript resumes the last one
+recorded (`Transcript::latest_acp_session_id`: the last non-archived
+`session_started` event, else the metadata's).
 
 ### `user`
 
@@ -273,8 +285,10 @@ reducer as the live `HarnessHandle::context_timeline().await` query. Boundaries
 retain the latest observation available at that time; a late update never
 rewrites a completed checkpoint.
 
-When resume creates a fresh transcript, it first archives the supplied local
-transcript's required raw timeline evidence with `historical_evidence` set.
+A resume that continues the local transcript needs no archive: its evidence is
+already in the file. When resume creates a fresh transcript (there is no local
+file to continue), it first archives the supplied local transcript's required
+raw timeline evidence with `historical_evidence` set.
 The new file can reconstruct prior checkpoints without reading an ancestor
 file. `Transcript::records()` and conversation replay exclude these archives,
 while provider replay is still recorded separately, including messages newer

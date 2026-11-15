@@ -728,14 +728,33 @@ async fn resuming_legacy_messages_keeps_unknown_checkpoint_history_after_reload(
             .expect("live legacy timeline")
             .incomplete_history
     );
-    let saved = saved(
-        &session,
-        dir.path(),
-        current.transcript_id.as_ref().unwrap(),
-    )
-    .await;
+    // The session goes on recording into the legacy transcript, which holds its history already,
+    // so the replay is not recorded a second time.
+    assert_eq!(current.transcript_id.as_deref(), Some("legacy"));
+    session
+        .handle
+        .flush_transcript()
+        .await
+        .expect("flush transcript");
+    let saved = TranscriptLoader::new(dir.path().into())
+        .load_transcript("project", "legacy")
+        .await
+        .expect("reload legacy transcript");
     assert!(saved.context_timeline().incomplete_history);
-    assert!(saved.records().any(|record|matches!(record,nori_harness::TranscriptRecord::SessionEvent(SessionEvent::Acp(AcpEvent::Notification(acp::AgentNotification::SessionNotification(notification)))) if matches!(&notification.update,acp::SessionUpdate::UserMessageChunk(_)))));
+    let user_turns = saved
+        .records()
+        .filter(|record| match record {
+            nori_harness::TranscriptRecord::User { .. } => true,
+            nori_harness::TranscriptRecord::SessionEvent(SessionEvent::Acp(
+                AcpEvent::Notification(acp::AgentNotification::SessionNotification(notification)),
+            )) => matches!(
+                &notification.update,
+                acp::SessionUpdate::UserMessageChunk(_)
+            ),
+            _ => false,
+        })
+        .count();
+    assert_eq!(user_turns, 1);
     session.handle.shutdown().await.expect("shutdown");
 }
 

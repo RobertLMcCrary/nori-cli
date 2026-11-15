@@ -157,6 +157,9 @@ impl PreparedResumeAction {
         match self {
             PreparedResumeAction::RealignViewport(area) => {
                 terminal.set_viewport_area(area);
+                // The shell wrote to the screen while Nori was suspended, so the rows above the
+                // viewport are no longer the ones Nori wrote.
+                terminal.written_history.clear();
             }
             PreparedResumeAction::RestoreAltScreen => {
                 execute!(terminal.backend_mut(), EnterAlternateScreen)?;

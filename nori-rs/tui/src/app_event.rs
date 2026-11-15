@@ -160,6 +160,9 @@ pub(crate) enum AppEvent {
 
     InsertHistoryCell(Box<dyn HistoryCell>),
 
+    /// The session's history starts or stops being replayed into the scrollback.
+    HistoryReplay(HistoryReplay),
+
     /// Replace the just-finished assistant stream cells with one raw-Markdown cell.
     ConsolidateAgentMessage {
         source: String,
@@ -671,4 +674,11 @@ pub(crate) enum AgentPrepareIntent {
         agent_name: String,
         display_name: String,
     },
+}
+
+/// The bounds of a replayed history among the cells inserted into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryReplay {
+    Started,
+    Finished,
 }

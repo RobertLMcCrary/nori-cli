@@ -109,11 +109,18 @@ pub(super) struct OpenFence {
 /// What [`OpenFence::advance`] found.
 pub(super) enum FenceProgress {
     Open,
+    /// It consumed as many lines as one call may, and complete lines are still waiting.
+    Paused,
     /// The closing fence ends at this offset into the message.
     Closed {
         end: usize,
     },
 }
+
+/// The most lines one [`OpenFence::advance`] consumes. Highlighting is what streaming code costs,
+/// so a burst of thousands of lines is spread over consecutive frames: its first lines are on
+/// screen at once instead of after every one of them was highlighted.
+pub(super) const MAX_LINES_PER_ADVANCE: usize = 400;
 
 impl OpenFence {
     /// A fence whose opener ends (after its newline) at `body_start`.
@@ -133,10 +140,16 @@ impl OpenFence {
         }
     }
 
-    /// Consume every complete line of `message` not consumed yet, appending the lines they render
-    /// to `out`. Costs the length of the new lines.
+    /// Consume the complete lines of `message` not consumed yet, up to
+    /// [`MAX_LINES_PER_ADVANCE`], appending the lines they render to `out`. Costs the length of
+    /// the lines consumed.
     pub(super) fn advance(&mut self, message: &str, out: &mut Vec<Line<'static>>) -> FenceProgress {
+        let mut consumed = 0;
         while let Some(newline) = memchr::memchr(b'\n', &message.as_bytes()[self.next_line..]) {
+            if consumed == MAX_LINES_PER_ADVANCE {
+                return FenceProgress::Paused;
+            }
+            consumed += 1;
             let start = self.next_line;
             let end = start + newline + 1;
             self.next_line = end;

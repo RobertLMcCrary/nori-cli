@@ -21,6 +21,7 @@ use ratatui::layout::Size;
 pub struct VT100Backend {
     crossterm_backend: CrosstermBackend<vt100::Parser>,
     recording: Option<Vec<u8>>,
+    scrollback: Option<Scrollback>,
 }
 
 impl VT100Backend {
@@ -29,15 +30,158 @@ impl VT100Backend {
         Self {
             crossterm_backend: CrosstermBackend::new(vt100::Parser::new(height, width, 0)),
             recording: None,
+            scrollback: None,
         }
     }
 
-    /// Like [`Self::new`], keeping `scrollback` rows of history that scrolled off the top.
-    pub fn with_scrollback(width: u16, height: u16, scrollback: usize) -> Self {
+    /// Like [`Self::new`], keeping the rows that scroll off the top of the screen the way a
+    /// terminal with scrollback does (see [`Self::scrollback_rows`]).
+    pub fn with_scrollback(width: u16, height: u16) -> Self {
         Self {
-            crossterm_backend: CrosstermBackend::new(vt100::Parser::new(height, width, scrollback)),
-            recording: None,
+            scrollback: Some(Scrollback::default()),
+            ..Self::new(width, height)
         }
+    }
+
+    /// The rows that scrolled off the top of the screen, oldest first, each as its text followed
+    /// by the escape sequences that reproduce it (so equal rows are equal in style too).
+    ///
+    /// vt100 keeps scrollback only while no scroll region is set, but history is inserted
+    /// through a region that starts at the top row, and terminals keep what scrolls out of the
+    /// top of such a region. So the backend watches its own output for whatever scrolls a region
+    /// that starts at the top row (a line feed or a wrapping character on its bottom margin,
+    /// `ESC D`, `ESC E`, `CSI n S`), copies the rows about to leave before the parser scrolls
+    /// them, and forgets them all on `CSI 3 J`.
+    pub fn scrollback_rows(&self) -> &[(String, Vec<u8>)] {
+        self.scrollback
+            .as_ref()
+            .map_or(&[], |scrollback| scrollback.rows.as_slice())
+    }
+
+    /// Feed `buf` to the parser, copying the rows that each scroll is about to push out first.
+    fn feed_keeping_scrollback(&mut self, scrollback: &mut Scrollback, buf: &[u8]) {
+        let mut fed = 0;
+        for (index, &byte) in buf.iter().enumerate() {
+            let scroll = match std::mem::take(&mut scrollback.escape) {
+                Escape::Ground => match byte {
+                    0x1b => {
+                        scrollback.escape = Escape::Esc;
+                        Scroll::None
+                    }
+                    b'\n' | 0x0b | 0x0c => Scroll::OnBottomMargin,
+                    // A character that does not fit on the rest of the row wraps to the next one.
+                    0x20..=0x7e | 0xc0..=0xff => {
+                        let len = match byte {
+                            0xc0..=0xdf => 2,
+                            0xe0..=0xef => 3,
+                            0xf0..=0xff => 4,
+                            _ => 1,
+                        };
+                        let width = buf
+                            .get(index..index + len)
+                            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                            .and_then(|text| text.chars().next())
+                            .map_or(1, |c| {
+                                unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)
+                            });
+                        self.vt100_mut().process(&buf[fed..index]);
+                        fed = index;
+                        let (_, cols) = self.vt100().screen().size();
+                        let (_, col) = self.vt100().screen().cursor_position();
+                        if width > 0 && usize::from(col) + width > usize::from(cols) {
+                            Scroll::OnBottomMargin
+                        } else {
+                            Scroll::None
+                        }
+                    }
+                    _ => Scroll::None,
+                },
+                Escape::Esc => match byte {
+                    b'[' => {
+                        scrollback.escape = Escape::Csi(Vec::new());
+                        Scroll::None
+                    }
+                    b']' => {
+                        scrollback.escape = Escape::Osc;
+                        Scroll::None
+                    }
+                    b'D' | b'E' => Scroll::OnBottomMargin,
+                    b'c' => {
+                        scrollback.margins = None;
+                        Scroll::None
+                    }
+                    _ => Scroll::None,
+                },
+                Escape::Csi(mut params) if !(0x40..=0x7e).contains(&byte) => {
+                    params.push(byte);
+                    scrollback.escape = Escape::Csi(params);
+                    Scroll::None
+                }
+                Escape::Csi(params) => {
+                    let params = String::from_utf8_lossy(&params).into_owned();
+                    let mut numbers = params
+                        .split(';')
+                        .map(|number| number.parse::<u16>().unwrap_or(0));
+                    match byte {
+                        b'r' => {
+                            let (rows, _) = self.vt100().screen().size();
+                            let top = numbers.next().unwrap_or(0).max(1) - 1;
+                            let bottom = numbers
+                                .next()
+                                .filter(|bottom| *bottom > 0)
+                                .unwrap_or(rows)
+                                .min(rows)
+                                - 1;
+                            scrollback.margins = (top < bottom).then_some((top, bottom));
+                            Scroll::None
+                        }
+                        b'S' => Scroll::Region(usize::from(numbers.next().unwrap_or(0).max(1))),
+                        b'J' if params == "3" => {
+                            scrollback.rows.clear();
+                            Scroll::None
+                        }
+                        _ => Scroll::None,
+                    }
+                }
+                Escape::Osc => {
+                    scrollback.escape = match byte {
+                        0x07 => Escape::Ground,
+                        0x1b => Escape::OscEsc,
+                        _ => Escape::Osc,
+                    };
+                    Scroll::None
+                }
+                Escape::OscEsc => {
+                    if byte != b'\\' {
+                        scrollback.escape = Escape::Osc;
+                    }
+                    Scroll::None
+                }
+            };
+            if matches!(scroll, Scroll::None) {
+                continue;
+            }
+            self.vt100_mut().process(&buf[fed..index]);
+            fed = index;
+            let screen = self.vt100().screen();
+            let (rows, cols) = screen.size();
+            let (top, bottom) = scrollback.margins.unwrap_or((0, rows - 1));
+            let (row, _) = screen.cursor_position();
+            let leaving = match scroll {
+                Scroll::None => 0,
+                Scroll::OnBottomMargin => usize::from(row == bottom),
+                Scroll::Region(count) => count,
+            };
+            if top == 0 && leaving > 0 {
+                scrollback.rows.extend(
+                    screen
+                        .rows(0, cols)
+                        .zip(screen.rows_formatted(0, cols))
+                        .take(leaving.min(usize::from(bottom) + 1)),
+                );
+            }
+        }
+        self.vt100_mut().process(&buf[fed..]);
     }
 
     /// Start keeping a copy of every byte written to the backend.
@@ -59,13 +203,48 @@ impl VT100Backend {
     }
 }
 
+/// Rows that scrolled off the top of the screen, and what is needed to see the next ones go.
+#[derive(Default)]
+struct Scrollback {
+    rows: Vec<(String, Vec<u8>)>,
+    /// The scroll region's top and bottom rows, when one is set.
+    margins: Option<(u16, u16)>,
+    escape: Escape,
+}
+
+/// What the byte being written does to the rows at the top of the screen.
+enum Scroll {
+    None,
+    /// Scrolls the region up a row if the cursor is on its bottom margin.
+    OnBottomMargin,
+    /// Scrolls the region up this many rows.
+    Region(usize),
+}
+
+/// Where the backend's output is inside an escape sequence.
+#[derive(Default)]
+enum Escape {
+    #[default]
+    Ground,
+    Esc,
+    Csi(Vec<u8>),
+    Osc,
+    OscEsc,
+}
+
 impl Write for VT100Backend {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = self.crossterm_backend.writer_mut().write(buf)?;
         if let Some(recording) = self.recording.as_mut() {
-            recording.extend_from_slice(&buf[..written]);
+            recording.extend_from_slice(buf);
         }
-        Ok(written)
+        match self.scrollback.take() {
+            Some(mut scrollback) => {
+                self.feed_keeping_scrollback(&mut scrollback, buf);
+                self.scrollback = Some(scrollback);
+            }
+            None => self.vt100_mut().process(buf),
+        }
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {

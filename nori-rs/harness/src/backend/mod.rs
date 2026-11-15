@@ -393,6 +393,7 @@ pub(crate) mod orchestrator;
 pub use nori_client_mcp::set_stdio_bridge;
 pub use orchestrator::refresh_agent_catalog;
 pub mod prepared;
+mod replay_timing;
 mod session;
 mod session_defaults;
 pub(crate) mod session_reducer;

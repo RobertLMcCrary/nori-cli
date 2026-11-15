@@ -96,6 +96,7 @@ impl ChatWidget {
             initial_echo_painted: false,
             pending_echoes: Default::default(),
             stream_controller: None,
+            stream_ending: false,
             session_generation,
             owned_prompt_request_id: None,
             proactive_turn_active: false,
@@ -103,7 +104,7 @@ impl ChatWidget {
             completed_client_tool_calls: HashSet::new(),
             client_event_normalizer: Default::default(),
             replay_source: None,
-            replay_message: None,
+            replay_turn_elapsed: None,
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
             current_status_header: crate::status_indicator_widget::pick_status_message(
@@ -282,6 +283,7 @@ impl ChatWidget {
             initial_echo_painted: false,
             pending_echoes: Default::default(),
             stream_controller: None,
+            stream_ending: false,
             session_generation,
             owned_prompt_request_id: None,
             proactive_turn_active: false,
@@ -289,7 +291,7 @@ impl ChatWidget {
             completed_client_tool_calls: HashSet::new(),
             client_event_normalizer: Default::default(),
             replay_source: None,
-            replay_message: None,
+            replay_turn_elapsed: None,
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
             current_status_header: crate::status_indicator_widget::pick_status_message(

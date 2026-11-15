@@ -2086,3 +2086,18 @@ fn conflated_deltas_render_exactly_like_the_originals() {
         );
     }
 }
+
+#[test]
+fn a_held_back_keystroke_is_drawn_in_the_frame_that_releases_it() {
+    let (mut chat, _rx, _unused_rx) = make_chatwidget_manual();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    // The first fast character is held back in case a paste follows it.
+    assert_eq!(chat.composer_text(), "");
+    std::thread::sleep(crate::bottom_pane::ChatComposer::recommended_paste_flush_delay());
+
+    let skip_frame = chat.handle_paste_burst_tick(crate::tui::FrameRequester::test_dummy());
+
+    assert!(!skip_frame, "the frame that releases the key must draw it");
+    assert_eq!(chat.composer_text(), "h");
+}

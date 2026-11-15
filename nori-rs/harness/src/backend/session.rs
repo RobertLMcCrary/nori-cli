@@ -630,19 +630,38 @@ impl AcpBackend {
         let (history_log_id, history_entry_count) =
             crate::message_history::history_metadata(&config.nori_home).await;
 
-        // A child keeps no transcript of its own: its parent's shows what it did.
+        // A child keeps no transcript of its own: its parent's shows what it did. A session
+        // resumed from its transcript goes on recording into that transcript. One the agent
+        // replays itself gets a new transcript instead: the agent's history may hold more than
+        // the local one, and recording it into the local one would repeat what is there.
+        let agent_replays = deferred_replay_batches
+            .iter()
+            .any(|batch| batch.source == nori_protocol::ReplaySource::Agent);
+        let recorded_transcript = transcript
+            .filter(|_| !agent_replays)
+            .map(|transcript| {
+                let path = crate::transcript::TranscriptLoader::new(config.nori_home.clone())
+                    .session_path(&transcript.meta.project_id, &transcript.meta.session_id);
+                (path, &transcript.meta)
+            })
+            .filter(|(path, _)| path.is_file());
         let transcript_recorder = if config.delegation.is_child() {
             None
         } else {
-            match TranscriptRecorder::new(
-                &config.nori_home,
-                &cwd,
-                Some(config.agent.clone()),
-                &config.cli_version,
-                Some(session_id.to_string()),
-            )
-            .await
-            {
+            let recorder = match recorded_transcript {
+                Some((path, meta)) => TranscriptRecorder::continue_session(path, meta).await,
+                None => {
+                    TranscriptRecorder::new(
+                        &config.nori_home,
+                        &cwd,
+                        Some(config.agent.clone()),
+                        &config.cli_version,
+                        Some(session_id.to_string()),
+                    )
+                    .await
+                }
+            };
+            match recorder {
                 Ok(recorder) => Some(Arc::new(recorder)),
                 Err(e) => {
                     warn!("Failed to initialize transcript recorder: {e}");
@@ -650,7 +669,10 @@ impl AcpBackend {
                 }
             }
         };
-        if let (Some(recorder), Some(transcript)) = (&transcript_recorder, transcript) {
+        // A new transcript of a resumed session starts with the evidence of the old one.
+        if let (Some(recorder), Some(transcript)) = (&transcript_recorder, transcript)
+            && !recorder.continues_recorded_session()
+        {
             for evidence in transcript.archived_context_evidence() {
                 if let Err(error) = recorder.record_session_event(&evidence).await {
                     warn!(%error, "Failed to archive context timeline evidence");

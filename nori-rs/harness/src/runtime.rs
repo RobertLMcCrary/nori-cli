@@ -1101,10 +1101,21 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
         // Drop our Arc reference; the typed command task owns the backend.
         drop(backend);
 
+        let mut replaying = false;
         while let Some(BackendEvent::Public(event)) = backend_event_rx.recv().await {
             let session_ended = matches!(event, SessionEvent::Nori(NoriEvent::SessionEnded(_)));
+            let in_replay = match &event {
+                SessionEvent::Nori(NoriEvent::ReplayStarted(_)) => {
+                    replaying = true;
+                    true
+                }
+                SessionEvent::Nori(NoriEvent::ReplayFinished) => std::mem::take(&mut replaying),
+                _ => replaying,
+            };
             let evidence = observe_context_event(&context_timeline, &event).await;
+            // A transcript that already holds the history being replayed does not record it again.
             if let Some(recorder) = transcript_recorder_cell.read().await.clone()
+                && !(in_replay && recorder.continues_recorded_session())
                 && let Err(error) = recorder.record_session_event(&evidence).await
             {
                 tracing::warn!(%error, "failed to record public session event");

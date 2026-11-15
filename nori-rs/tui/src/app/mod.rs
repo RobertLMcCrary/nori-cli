@@ -99,6 +99,8 @@ pub(crate) struct App {
     pub(crate) overlay: Option<Overlay>,
     pub(crate) deferred_history_lines: Vec<Line<'static>>,
     has_emitted_history_lines: bool,
+    /// Where the cells of the history being replayed start in `transcript_cells`, while it is.
+    replay_painted_from: Option<usize>,
     pub(crate) transcript_reflow: crate::transcript_reflow::TranscriptReflowState,
 
     pub(crate) enhanced_keys_supported: bool,
@@ -209,6 +211,7 @@ struct SystemInfoRefreshRequest {
 mod config_persistence;
 mod event_handling;
 mod frame;
+mod history_replay;
 mod resize_reflow;
 mod session_setup;
 
@@ -312,6 +315,7 @@ impl App {
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
+            replay_painted_from: None,
             transcript_reflow: Default::default(),
             backtrack: BacktrackState::default(),
             pending_update_action: None,

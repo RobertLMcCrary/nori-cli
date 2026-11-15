@@ -523,19 +523,29 @@ Streaming output remains transient and is consolidated into one source-backed
 assistant cell when the message finishes; user, tool, event, and assistant
 cells otherwise keep their semantic order.
 
-Reflow is width-only and trailing-debounced by 75 ms. It waits while a popup,
-transcript overlay, alternate screen, or assistant stream owns presentation,
-then runs once that boundary closes. The replay retains at most the newest
-1,000 semantic cells and 10,000 physical rows, truncating from the oldest edge
-and prefixing `… history truncated` plus a blank line when either limit applies.
-These bounds limit terminal output, not the in-memory transcript.
+Reflow is width-only. The first width change after a quiet spell is reflowed
+in the frame that sees it; changes that follow within 75 ms of the previous one
+(dragging a window edge) are trailing-debounced by 75 ms, so a drag costs two
+reflows, its first and its last. It waits while a popup, transcript overlay,
+alternate screen, or assistant stream owns presentation, then runs once that
+boundary closes. The replay retains at most the newest 1,000 semantic cells and
+10,000 physical rows, truncating from the oldest edge and prefixing
+`… history truncated` plus a blank line when either limit applies. These bounds
+limit terminal output, not the in-memory transcript. The rows go out through
+the history queue, which writes a bounded batch per frame (see below), so a
+large reflow streams over consecutive frames instead of one synchronized update
+of megabytes.
 
-Reflow deliberately clears the visible screen and the terminal's native
-scrollback, including output from before Nori started, before replaying the
-bounded history. It does not attempt to discover or preserve a scrollback
-origin. The behavior is enabled by default and can be toggled through
-`/settings` or `[tui] resize_reflow` in `config.toml`; disabling it cancels any
-pending replay.
+Reflow deliberately erases, before replaying the bounded history: the whole
+visible screen (`ESC[2J`, which some terminals, such as iTerm2 with "save lines
+to scrollback when an app clears the screen", copy into scrollback first), and
+then the terminal's entire native scrollback buffer (`ESC[3J`). That is
+everything the terminal window or multiplexer pane holds: the shell prompts and
+command output from before Nori started, output other programs wrote to the
+same terminal, and Nori's own history beyond the replay's bounds. It does not
+attempt to discover or preserve a scrollback origin. The behavior is enabled by
+default and can be toggled through `/settings` or `[tui] resize_reflow` in
+`config.toml`; disabling it cancels any pending replay.
 
 #### Startup
 
@@ -546,7 +556,8 @@ own configuration. Agent installation checks look binaries up in `PATH`
 in-process. The Codex auth manager builds its HTTP client only once saved
 credentials exist. A transcript chosen with `nori resume` loads on a task while
 the agent starts (`PendingSessionActivation::ResumeLoading`), never before the
-first frame, and the first frame is drawn directly once the app is ready
+first frame, and is moved (never copied) to the session that replays it. The
+first frame is drawn directly once the app is ready
 rather than through the frame scheduler. `NORI_STARTUP_TRACE=<file>` appends
 `<phase> <microseconds>` for each startup phase (`startup_trace.rs`) to find
 anything that creeps back onto this path.
@@ -562,9 +573,24 @@ messages that changed, not the token rate. `MarkdownStreamCollector` freezes
 each completed top-level block and re-renders only the open one; a top-level
 fenced code block is streamed by `markdown_stream/fence.rs`, which highlights
 each line once with the syntax state carried forward, so a long code block
-costs its length in total. Streamed lines equal the one-shot render, styles
-included, which the property tests in `markdown_stream/incremental_tests.rs`
-check.
+costs its length in total, and at most 400 of its lines a frame, so a burst of
+thousands is on screen from its first frame. A turn that ends with such a burst
+still unrendered leaves the rest to the frames that follow (`stream_ending`)
+rather than rendering it in one stall; anything shown after it waits for it.
+A paragraph line too long for 16 rows is wrapped first-fit, not optimally, in
+the stream and in the one-shot render alike, and while it is being typed each of
+its rows goes to the scrollback once the first word of the next row is complete
+and nothing before it can still be restyled (`markdown_stream/long_line.rs`), so
+only the last few rows of a one-paragraph answer are live. Streamed lines equal
+the one-shot render, styles included, which the property tests in
+`markdown_stream/incremental_tests.rs` check.
+
+History reaches the terminal through `tui/history_queue.rs`, which writes at
+most 2,000 lines or about 256 KB a frame and asks for the next frame at once
+when more is queued: a burst, a reflow, or a resumed history goes out in
+bounded synchronized updates, its first rows promptly, and no terminal with a
+short timeout for a synchronized update draws one half done. Nothing queued is
+ever dropped.
 
 A prompt submitted while the session is idle is painted at once. Its
 `PromptEchoId` travels in `_meta` on the `session/prompt` request and on every
@@ -573,7 +599,24 @@ the chunks whose id it painted: a hash lookup, never a text comparison.
 
 Each frame is written with one `write` through `FrameWriter`, inside one
 synchronized update. The Redraw hotkey (default `ctrl+l`) repaints the rows
-Nori owns from its own model and leaves scrollback alone.
+Nori owns and leaves scrollback alone. The terminal keeps a record of the
+history rows it wrote directly above the viewport, a screenful at most
+(`written_history.rs`); the next frame writes those rows again where they are
+and redraws the viewport, and only then writes the history queued for it
+(`tui/history_queue.rs`). The repaint never reads or replaces that queue, so a
+line committed in the same frame as the key is written exactly once, during a
+stream as at any other time, and nothing scrolls while the rows are rewritten.
+Rows written at another width, or above a viewport the shell moved (after
+`^Z`), are not Nori's to rewrite and are left as they are.
+
+The composer holds a fast first character back for 8 ms in case it begins a
+paste that arrives without bracketed-paste markers; the frame that releases it
+draws it, rather than asking for another frame and waiting out the frame
+interval too. An `@` file search runs at the first keystroke (`file_search.rs`);
+keys typed while it runs only update the query, and the newest query is searched
+the moment it finishes, while a query that no longer extends the running one
+cancels and replaces it. A Markdown table is set apart from the blocks around it
+by a blank line, as every block is.
 
 #### Subagents
 
@@ -630,8 +673,14 @@ edit of another also shows what changed in it, on a stronger tint over the same
 syntax colours (`disparate::layout::segments` cuts the line where colours and
 changes begin and end): in a structural diff, the novel tokens on it (a line
 with some tokens kept is an edit); in a line diff, the words that differ from
-the line it is paired with (`View::rows`). A line new throughout is only
-tinted, as added and removed lines are. On 16-colour terminals, which have no
+the line it is paired with. Lines are paired by `View::rows_by` with
+`EditPairing`, disparate's `Dice` score raised a little for lines that start
+with the same token, because an edited line keeps its head: when an edit also
+splits a line, the half that kept `let total =` is its partner, not the shorter
+half. A paired line that was also rewrapped (split, or joined with its
+neighbour) is compared with all the lines it became, and when those have
+nothing new in them the words that only moved are not emphasised. A line new
+throughout is only tinted, as added and removed lines are. On 16-colour terminals, which have no
 tints, the changed words are bold and underlined instead. A diff costs what
 changed, not the file: equal lines are compared as bytes, only the top-level
 items around changes are parsed, and only the lines shown are highlighted.
@@ -1145,11 +1194,17 @@ stays resumable.
 
 #### Transcripts and view-only mode
 
-Between `ReplayStarted` and `ReplayFinished`, replayed user and assistant
-messages are assembled in event order and rendered as static conversation
-history with turn boundaries. They are not handled as live output streams;
-replayed assistant messages use the same raw-Markdown-backed cells as completed
-live messages so later width changes use the same rendering path.
+Between `ReplayStarted` and `ReplayFinished`, replayed updates go through the
+same handlers as live ones (`chatwidget/replay.rs`), so a resumed session
+renders as it did live: text that continues across a tool call stays one
+message, and a "Worked for" separator shows the duration its turn ran, which
+the replayed chunk carries (`nori_protocol::turn_elapsed_in_meta`). A replay
+has no turn lifecycle; a user message starts a turn and ends the one before,
+doing to the history what the end of a live turn does, and the end of the
+replay ends the last. The cells of a replay go into the transcript only, and
+when it ends the newest of them are painted at once with the reflow's bounds
+(`app/history_replay.rs`): a long session costs its replay's last 1,000 cells
+and 10,000 rows in output rather than every row it ever wrote.
 View-only rendering recovers initialization identity and replay source from the
 stored lifecycle events, then runs raw session-information notifications
 through the same private normalizer and renderer as the live TUI.

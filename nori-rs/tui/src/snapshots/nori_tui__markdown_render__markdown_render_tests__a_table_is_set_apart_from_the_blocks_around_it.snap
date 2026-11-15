@@ -1,0 +1,13 @@
+---
+source: tui/src/markdown_render_tests.rs
+expression: rendered
+---
+> A quoted remark.
+
+Name  Value
+━━━━  ━━━━━
+one   1
+
+───
+
+After the rule.

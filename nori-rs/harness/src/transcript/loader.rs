@@ -110,6 +110,27 @@ impl PartialEq for TranscriptRecord<'_> {
 }
 
 impl Transcript {
+    /// The agent session to resume: the one started last in this transcript. A resumed session
+    /// goes on recording into the transcript it was resumed from, so a session started since
+    /// (by a replay into a new session, or a compaction) can be newer than the metadata's.
+    pub fn latest_acp_session_id(&self) -> Option<String> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|line| match &line.entry {
+                TranscriptEntry::SessionEvent(entry) if !entry.historical_evidence => {
+                    match &entry.event {
+                        nori_protocol::SessionEvent::Nori(
+                            nori_protocol::NoriEvent::SessionStarted(started),
+                        ) => Some(started.acp_session_id.to_string()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .or_else(|| self.meta.acp_session_id.clone())
+    }
+
     /// Iterate over records without exposing the versioned storage schema.
     pub fn records(&self) -> impl Iterator<Item = TranscriptRecord<'_>> {
         TranscriptRecords {
@@ -831,6 +852,59 @@ mod tests {
     use crate::transcript::recorder::TranscriptRecorder;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn a_transcript_resumes_the_agent_session_it_started_last() {
+        let temp_dir = TempDir::new().unwrap();
+        let nori_home = temp_dir.path();
+        let recorder = TranscriptRecorder::new(
+            nori_home,
+            nori_home,
+            None,
+            "0.1.0",
+            Some("acp-first".to_string()),
+        )
+        .await
+        .unwrap();
+        let started = |acp_session_id: &str| {
+            super::super::SessionEventEntry::new(nori_protocol::SessionEvent::Nori(
+                nori_protocol::NoriEvent::SessionStarted(nori_protocol::SessionStarted {
+                    transcript_id: Some(recorder.session_id().to_string()),
+                    acp_session_id: acp_session_id.to_string().into(),
+                    cwd: "/work".into(),
+                    transcript_path: None,
+                    history_log_id: 0,
+                    history_entry_count: 0,
+                    config_options: Vec::new(),
+                }),
+            ))
+        };
+        recorder
+            .record_session_event(&started("acp-first"))
+            .await
+            .unwrap();
+        // Resumed into a new agent session, recorded into the same transcript.
+        recorder
+            .record_session_event(&started("acp-second"))
+            .await
+            .unwrap();
+        // Evidence copied from another transcript names a session that is not this one's.
+        let mut evidence = started("acp-elsewhere");
+        evidence.historical_evidence = true;
+        recorder.record_session_event(&evidence).await.unwrap();
+        recorder.shutdown().await.unwrap();
+
+        let transcript = TranscriptLoader::new(nori_home.to_path_buf())
+            .load_transcript(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+
+        assert_eq!(transcript.meta.acp_session_id.as_deref(), Some("acp-first"));
+        assert_eq!(
+            transcript.latest_acp_session_id().as_deref(),
+            Some("acp-second")
+        );
+    }
 
     #[tokio::test]
     async fn test_list_projects_empty() {

@@ -26,6 +26,12 @@ pub(super) fn local_image_content(
 
 impl ChatWidget {
     pub(super) fn flush_active_cell(&mut self) {
+        // The answer of a turn that ended comes before whatever was shown after it.
+        if self.stream_ending && self.active_cell.as_ref().is_some() {
+            let active = self.active_cell.take();
+            self.flush_answer_stream_with_separator();
+            self.active_cell.set(active);
+        }
         self.active_user_message_id = None;
         if let Some(active) = self.active_cell.take() {
             let is_user_message = active.as_any().is::<history_cell::UserHistoryCell>();
@@ -50,6 +56,11 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
+        // The answer of a turn that ended comes before whatever is added after it; its own lines
+        // are what the frames that finish it add.
+        if self.stream_ending && !cell.as_any().is::<history_cell::AgentMessageCell>() {
+            self.flush_answer_stream_with_separator();
+        }
         if !cell.display_lines(u16::MAX).is_empty() {
             // Always flush active cell before inserting new history to preserve
             // chronological ordering.

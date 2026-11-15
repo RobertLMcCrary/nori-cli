@@ -27,11 +27,17 @@ pub(crate) enum WidthChange {
 pub(crate) struct TranscriptReflowState {
     last_observed_width: Option<u16>,
     last_reflow_width: Option<u16>,
+    /// When the width last changed.
+    last_change: Option<Instant>,
     pending_until: Option<Instant>,
     resize_requested_during_stream: bool,
 }
 
 impl TranscriptReflowState {
+    /// Note the width of a frame. The first change after a quiet spell is reflowed at once; the
+    /// changes that follow it closely, as dragging a window edge sends them, wait until none came
+    /// for [`REFLOW_DEBOUNCE`]. So a resize costs one reflow and a drag two, the first and the
+    /// last, and neither waits on a timer before it starts.
     pub(crate) fn note_width(&mut self, width: u16, now: Instant) -> WidthChange {
         let Some(previous_width) = self.last_observed_width.replace(width) else {
             self.last_reflow_width = Some(width);
@@ -40,11 +46,15 @@ impl TranscriptReflowState {
         if previous_width == width {
             return WidthChange::Unchanged;
         }
+        let in_burst = self
+            .last_change
+            .replace(now)
+            .is_some_and(|last| now.saturating_duration_since(last) < REFLOW_DEBOUNCE);
         if self.last_reflow_width == Some(width) {
             self.cancel();
             return WidthChange::Cancelled;
         }
-        self.pending_until = Some(now + REFLOW_DEBOUNCE);
+        self.pending_until = Some(if in_burst { now + REFLOW_DEBOUNCE } else { now });
         WidthChange::Scheduled
     }
 
@@ -220,41 +230,6 @@ fn display_lines_in_parallel(
     })
 }
 
-/// The newest `rows` terminal rows of the transcript, oldest first, rendered at `width`.
-///
-/// Only as many cells as it takes to fill `rows` are laid out, so the cost depends on the screen,
-/// not on the length of the transcript. A line that would straddle the cut is left out whole.
-pub(crate) fn render_transcript_tail_rows(
-    transcript_cells: &[Arc<dyn HistoryCell>],
-    width: u16,
-    rows: usize,
-) -> Vec<Line<'static>> {
-    if rows == 0 {
-        return Vec::new();
-    }
-    // Newest cell first; each entry is the cell's wrapped lines followed by its separator.
-    let mut newest_first: Vec<Vec<Line<'static>>> = Vec::new();
-    let mut collected = 0;
-    for (index, cell) in transcript_cells.iter().enumerate().rev() {
-        let lines = cell.display_lines(width);
-        if lines.is_empty() {
-            continue;
-        }
-        let mut wrapped = crate::insert_history::wrap_history_lines_for_width(&lines, width);
-        // Every cell after the first is set apart by a blank line, except a continuation.
-        if !cell.is_stream_continuation() && index > 0 {
-            wrapped.insert(0, Line::default());
-        }
-        collected += physical_rows(&wrapped, width);
-        newest_first.push(wrapped);
-        if collected >= rows {
-            break;
-        }
-    }
-    let lines: Vec<Line<'static>> = newest_first.into_iter().rev().flatten().collect();
-    retain_newest_rows(lines, width, rows)
-}
-
 fn retain_newest_rows(
     lines: Vec<Line<'static>>,
     width: u16,
@@ -320,18 +295,36 @@ mod tests {
     }
 
     #[test]
-    fn width_changes_use_a_trailing_seventy_five_millisecond_debounce() {
+    fn a_width_change_after_a_quiet_spell_is_reflowed_at_once() {
         let started = Instant::now();
         let mut state = TranscriptReflowState::default();
         state.note_width(80, started);
 
         assert_eq!(state.note_width(100, started), WidthChange::Scheduled);
-        assert!(!state.pending_is_due(started + Duration::from_millis(74)));
+        assert!(state.pending_is_due(started));
 
-        let repeated = started + Duration::from_millis(50);
+        state.mark_reflowed(100);
+        let later = started + Duration::from_secs(1);
+        assert_eq!(state.note_width(120, later), WidthChange::Scheduled);
+        assert!(state.pending_is_due(later));
+    }
+
+    #[test]
+    fn width_changes_that_follow_closely_use_a_trailing_seventy_five_millisecond_debounce() {
+        let started = Instant::now();
+        let mut state = TranscriptReflowState::default();
+        state.note_width(80, started);
+        state.note_width(100, started);
+        state.mark_reflowed(100);
+
+        let dragged = started + Duration::from_millis(16);
+        assert_eq!(state.note_width(110, dragged), WidthChange::Scheduled);
+        assert!(!state.pending_is_due(dragged + Duration::from_millis(74)));
+
+        let repeated = dragged + Duration::from_millis(50);
         assert_eq!(state.note_width(120, repeated), WidthChange::Scheduled);
-        assert!(!state.pending_is_due(started + Duration::from_millis(124)));
-        assert!(state.pending_is_due(started + Duration::from_millis(125)));
+        assert!(!state.pending_is_due(repeated + Duration::from_millis(74)));
+        assert!(state.pending_is_due(repeated + Duration::from_millis(75)));
     }
 
     #[test]

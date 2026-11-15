@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use serde_json;
 use tokio::fs::File;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
@@ -44,6 +46,9 @@ pub struct TranscriptRecorder {
     session_id: String,
     project_id: String,
     transcript_path: PathBuf,
+    /// It appends to a session recorded before, which already holds the history a resume
+    /// replays.
+    continues_recorded_session: bool,
 }
 
 impl TranscriptRecorder {
@@ -122,6 +127,7 @@ impl TranscriptRecorder {
             session_id,
             project_id: project_id_info.id,
             transcript_path,
+            continues_recorded_session: false,
         })
     }
 
@@ -200,7 +206,47 @@ impl TranscriptRecorder {
             session_id,
             project_id: project_id_info.id,
             transcript_path,
+            continues_recorded_session: false,
         })
+    }
+
+    /// Continue recording the session that `transcript_path` holds, whose metadata is `meta`.
+    ///
+    /// What is recorded from now on is appended to that file under the session's own id, so a
+    /// resumed session keeps one transcript instead of a new copy of it per resume.
+    pub async fn continue_session(
+        transcript_path: PathBuf,
+        meta: &SessionMetaEntry,
+    ) -> io::Result<Self> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&transcript_path)
+            .await?;
+        // A session that stopped in the middle of a line (a crash, a full disk) has that line
+        // ended first, so that what is appended starts on a line of its own.
+        if file.metadata().await?.len() > 0 {
+            file.seek(io::SeekFrom::End(-1)).await?;
+            let mut last = [0];
+            file.read_exact(&mut last).await?;
+            if last != *b"\n" {
+                file.write_all(b"\n").await?;
+            }
+        }
+        let (tx, rx) = mpsc::channel::<TranscriptCmd>(256);
+        tokio::spawn(run_writer_loop(file, rx));
+        Ok(Self {
+            tx,
+            session_id: meta.session_id.clone(),
+            project_id: meta.project_id.clone(),
+            transcript_path,
+            continues_recorded_session: true,
+        })
+    }
+
+    /// Whether this recorder appends to a session recorded before (see [`Self::continue_session`]).
+    pub fn continues_recorded_session(&self) -> bool {
+        self.continues_recorded_session
     }
 
     /// Record a user message.
@@ -448,6 +494,67 @@ mod tests {
         assert!(recorder.transcript_path().exists());
 
         recorder.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_goes_on_recording_into_its_own_transcript() {
+        let temp_dir = TempDir::new().unwrap();
+        let nori_home = temp_dir.path();
+        let first = TranscriptRecorder::new(nori_home, nori_home, None, "0.1.0", None)
+            .await
+            .unwrap();
+        first
+            .record_user_message("msg-1", "first turn", vec![])
+            .await
+            .unwrap();
+        first.shutdown().await.unwrap();
+        // The session stopped in the middle of writing a line.
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(first.transcript_path())
+            .await
+            .unwrap()
+            .write_all(b"{\"ts\":\"2026")
+            .await
+            .unwrap();
+        let loader = super::super::TranscriptLoader::new(nori_home.to_path_buf());
+        let transcript = loader
+            .load_transcript(first.project_id(), first.session_id())
+            .await
+            .unwrap();
+
+        let resumed = TranscriptRecorder::continue_session(
+            first.transcript_path().to_path_buf(),
+            &transcript.meta,
+        )
+        .await
+        .unwrap();
+        resumed
+            .record_user_message("msg-2", "second turn", vec![])
+            .await
+            .unwrap();
+        resumed.shutdown().await.unwrap();
+
+        assert!(resumed.continues_recorded_session());
+        assert_eq!(resumed.session_id(), first.session_id());
+        assert_eq!(resumed.transcript_path(), first.transcript_path());
+        let sessions = std::fs::read_dir(first.transcript_path().parent().unwrap())
+            .unwrap()
+            .count();
+        assert_eq!(sessions, 1);
+        let reloaded = loader
+            .load_transcript(first.project_id(), first.session_id())
+            .await
+            .unwrap();
+        let turns: Vec<&str> = reloaded
+            .entries
+            .iter()
+            .filter_map(|line| match &line.entry {
+                TranscriptEntry::User(user) => Some(user.content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turns, vec!["first turn", "second turn"]);
     }
 
     #[tokio::test]

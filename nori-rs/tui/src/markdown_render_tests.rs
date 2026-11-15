@@ -1124,3 +1124,16 @@ fn does_not_wrap_url_like_token() {
         "expected URL to remain intact on a single line, got: {lines:?}"
     );
 }
+
+#[test]
+fn a_table_is_set_apart_from_the_blocks_around_it() {
+    let md = "> A quoted remark.\n\n| Name | Value |\n| --- | --- |\n| one | 1 |\n\n---\n\nAfter the rule.\n";
+    let text = crate::markdown_render::render_markdown_text_with_width(md, Some(40));
+    let rendered = text
+        .lines
+        .iter()
+        .map(|line| line.to_string().trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_snapshot!(rendered);
+}

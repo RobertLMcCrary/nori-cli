@@ -18,6 +18,10 @@ impl ChatWidget {
         }
         let committed = controller.commit_for_frame();
         let live = controller.live_tail_cell();
+        // A burst too big for one frame is rendered by the frames that follow it straight away.
+        if controller.has_unrendered_input() {
+            self.request_redraw();
+        }
         if let Some(cell) = committed {
             // NOTE: Do NOT hide the status indicator here. The "Working (Xs)" message stays
             // visible until the turn completes.
@@ -28,6 +32,15 @@ impl ChatWidget {
             .is_some_and(|cell| !cell.is_stream_continuation());
         self.live_tail
             .set(live.map(|cell| Box::new(cell) as Box<dyn HistoryCell>));
+        // The turn is over and so, now, is the rendering of its answer.
+        if self.stream_ending
+            && !self
+                .stream_controller
+                .as_ref()
+                .is_some_and(StreamController::has_unrendered_input)
+        {
+            self.flush_answer_stream_with_separator();
+        }
     }
 
     /// Tell the widget how many rows the terminal has, so the viewport leaves room for history.

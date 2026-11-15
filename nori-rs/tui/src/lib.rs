@@ -109,6 +109,7 @@ pub(crate) use nori::update_prompt::run_update_prompt_if_needed;
 mod version;
 
 mod wrapping;
+mod written_history;
 
 #[cfg(test)]
 pub mod test_backend;

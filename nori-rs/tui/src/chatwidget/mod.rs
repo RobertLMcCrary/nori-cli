@@ -77,6 +77,7 @@ mod key_handling;
 mod login;
 mod pickers;
 mod remote_control;
+mod replay;
 mod session_config_mode;
 mod user_input;
 use crate::nori::session_header::CloudSessionInfo;
@@ -206,6 +207,9 @@ pub(crate) struct ChatWidget {
     pending_echoes: local_echo::PendingEchoes,
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
+    /// The turn ended while the stream still had a burst to render, which the frames that follow
+    /// finish before the answer is finalized (see `stream_frame`).
+    stream_ending: bool,
     session_generation: crate::app_event::SessionGeneration,
     owned_prompt_request_id: Option<nori_protocol::acp::v1::RequestId>,
     proactive_turn_active: bool,
@@ -213,7 +217,8 @@ pub(crate) struct ChatWidget {
     completed_client_tool_calls: HashSet<String>,
     client_event_normalizer: crate::presentation::ClientEventNormalizer,
     replay_source: Option<nori_protocol::ReplaySource>,
-    replay_message: Option<ReplayMessage>,
+    /// How long the replayed turn had been running, as its latest update says.
+    replay_turn_elapsed: Option<Duration>,
     // Accumulates the current reasoning block text to extract a header
     reasoning_buffer: String,
     // Accumulates full reasoning content for transcript-only recording
@@ -329,12 +334,6 @@ pub(crate) struct ChatWidget {
 struct UserMessage {
     text: String,
     image_paths: Vec<PathBuf>,
-}
-
-struct ReplayMessage {
-    stream: crate::presentation::MessageStream,
-    message_id: Option<String>,
-    text: String,
 }
 
 impl From<String> for UserMessage {

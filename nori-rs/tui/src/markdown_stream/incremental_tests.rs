@@ -218,6 +218,30 @@ fn a_two_thousand_line_burst_is_committed_by_a_single_advance() {
     assert_eq!(plain(&committed)[1999], "line 1999");
 }
 
+#[test]
+fn a_fenced_burst_is_highlighted_over_bounded_frames_and_comes_out_whole() {
+    let (doc, _) = rust_fence(2_000);
+    let mut collector = MarkdownStreamCollector::new(Some(80));
+    collector.push_delta(&doc);
+
+    let mut frames = Vec::new();
+    while collector.is_dirty() {
+        frames.push(collector.advance());
+    }
+    let mut out: Vec<Line<'static>> = frames.iter().flatten().cloned().collect();
+    out.extend(collector.finalize_and_drain().0);
+
+    assert!(frames.len() > 2, "{} frames", frames.len());
+    assert!(
+        frames
+            .iter()
+            .all(|lines| lines.len() <= fence::MAX_LINES_PER_ADVANCE + 4),
+        "{:?}",
+        frames.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    assert_eq!(styled(&out), styled(&one_shot_lines(&doc, Some(80))));
+}
+
 fn paragraphs(count: usize) -> String {
     (0..count)
         .map(|index| {
@@ -357,4 +381,85 @@ fn a_table_inside_a_fence_stays_code() {
             "| 1 | 2 |".to_string()
         ]
     );
+}
+
+/// A paragraph line of `words` tokens with `markup` spliced in after the given token indices.
+fn long_line(words: usize, markup: &[(usize, &str)]) -> String {
+    let mut line = String::new();
+    for index in 0..words {
+        if let Some((_, text)) = markup.iter().find(|(at, _)| *at == index) {
+            line.push_str(text);
+        }
+        line.push_str(&format!("w{index:05}"));
+        // Words of several lengths, so the rows break in different places.
+        line.push_str(match index % 5 {
+            0 => " and ",
+            1 => ", ",
+            2 => " is longer than most; ",
+            _ => " ",
+        });
+    }
+    line
+}
+
+#[test]
+fn a_long_paragraph_line_commits_its_final_rows_while_it_is_typed() {
+    let width = 40;
+    let line = long_line(2_000, &[]);
+    let mut collector = MarkdownStreamCollector::new(Some(width));
+    let mut committed = Vec::new();
+    let mut live_rows = Vec::new();
+    for piece in line.as_bytes().chunks(32) {
+        collector.push_delta(std::str::from_utf8(piece).expect("ascii"));
+        committed.extend(collector.advance());
+        live_rows.push(collector.live_tail().len());
+    }
+    let committed_while_typing = committed.len();
+    committed.extend(collector.finalize_and_drain().0);
+
+    assert_eq!(
+        styled(&committed),
+        styled(&one_shot_lines(&line, Some(width)))
+    );
+    // Nearly every row reached the scrollback before the line ended, and only the last few
+    // rows were ever live once the line was long.
+    assert!(
+        committed_while_typing + 3 >= committed.len(),
+        "{committed_while_typing} of {} rows committed while typing",
+        committed.len()
+    );
+    assert!(
+        live_rows.iter().rev().take(100).all(|rows| *rows <= 3),
+        "{:?}",
+        &live_rows[live_rows.len() - 100..]
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn any_split_of_a_long_line_with_markup_equals_the_one_shot_render(
+        words in 200usize..900,
+        markup in prop::collection::vec(
+            (0usize..900, prop_oneof![
+                Just("**"), Just("*"), Just("`"), Just("_"), Just("["), Just("]("), Just(")"),
+                Just("<"), Just("~~"), Just("\\"), Just("&amp;"), Just("https://x.io/a-b "),
+                Just("www.example.com "), Just("well-known "), Just("a/b "), Just("why? "),
+                Just("averyveryveryveryveryveryverylongword "), Just("é "),
+            ]),
+            0..6,
+        ),
+        cuts in prop::collection::vec(0usize..40_000, 0..60),
+        width in prop_oneof![Just(24usize), Just(37usize), Just(80usize)],
+        trailing in prop_oneof![Just(""), Just("\n"), Just("\nnext line\n")],
+    ) {
+        let doc = format!("{}{trailing}", long_line(words, &markup));
+        let pieces = split_at_chars(&doc, &cuts);
+        let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        prop_assert_eq!(
+            styled(&streamed_lines(&refs, 1, Some(width))),
+            styled(&one_shot_lines(&doc, Some(width)))
+        );
+    }
 }

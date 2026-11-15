@@ -45,6 +45,8 @@ use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::widgets::WidgetRef;
 
+use crate::written_history::WrittenHistory;
+
 pub(crate) const fn crossterm_color(color: Color) -> CrosstermColor {
     match color {
         Color::Reset => CrosstermColor::Reset,
@@ -153,9 +155,9 @@ where
     /// The terminal may no longer show the previous buffer, so the next frame repaints every row
     /// instead of only the rows that changed.
     repaint_all: bool,
-    /// Rows of history this terminal has been asked to write since the screen was last cleared
-    /// or replayed. Those that are still on screen are the part of it that Nori owns.
-    history_rows_written: usize,
+    /// The history this terminal wrote directly above the viewport. What of it is still on
+    /// screen is the part of the screen above the viewport that Nori owns.
+    pub(crate) written_history: WrittenHistory,
 }
 
 impl<B> Drop for Terminal<B>
@@ -192,7 +194,7 @@ where
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
             repaint_all: true,
-            history_rows_written: 0,
+            written_history: WrittenHistory::default(),
         })
     }
 
@@ -403,20 +405,10 @@ where
         Ok(())
     }
 
-    /// Record that `rows` rows of history were written above the viewport.
-    pub(crate) fn note_history_rows(&mut self, rows: usize) {
-        self.history_rows_written = self.history_rows_written.saturating_add(rows);
-    }
-
     /// Rows of history above the viewport that this terminal wrote and that are still on screen.
     pub(crate) fn owned_history_rows(&self) -> usize {
-        self.history_rows_written
-            .min(usize::from(self.viewport_area.top()))
-    }
-
-    /// Forget that any history was written, e.g. after the screen was cleared.
-    pub(crate) fn reset_history_rows(&mut self) {
-        self.history_rows_written = 0;
+        self.written_history
+            .owned_rows(self.viewport_area.top(), self.viewport_area.width)
     }
 
     /// The terminal no longer shows what the previous frame drew: the next frame repaints
@@ -450,7 +442,7 @@ where
         self.last_known_cursor_pos = Position { x: 0, y: 0 };
         self.previous_buffer_mut().reset();
         self.repaint_all = true;
-        self.history_rows_written = 0;
+        self.written_history.clear();
         Ok(())
     }
 

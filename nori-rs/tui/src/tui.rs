@@ -26,7 +26,6 @@ use crossterm::terminal::EndSynchronizedUpdate;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 use crossterm::terminal::supports_keyboard_enhancement;
-use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::queue;
@@ -45,6 +44,7 @@ use crate::tui::job_control::SUSPEND_KEY;
 #[cfg(unix)]
 use crate::tui::job_control::SuspendContext;
 
+mod history_queue;
 #[cfg(unix)]
 mod job_control;
 mod repaint;
@@ -184,9 +184,7 @@ pub struct Tui {
     frame_schedule_tx: tokio::sync::mpsc::UnboundedSender<Instant>,
     draw_tx: tokio::sync::broadcast::Sender<()>,
     pub(crate) terminal: Terminal,
-    pending_history_lines: Vec<Line<'static>>,
-    /// History to replay above the viewport on the next draw, set by a repaint request.
-    repaint_history: Option<Vec<Line<'static>>>,
+    history: history_queue::HistoryQueue,
     /// The next draw repaints the whole (alternate) screen.
     full_repaint: bool,
     /// Whether a frame was drawn yet, for the startup trace.
@@ -245,8 +243,7 @@ impl Tui {
             frame_schedule_tx,
             draw_tx,
             terminal,
-            pending_history_lines: vec![],
-            repaint_history: None,
+            history: history_queue::HistoryQueue::default(),
             full_repaint: false,
             first_frame_drawn: false,
             alt_saved_viewport: None,
@@ -379,12 +376,12 @@ impl Tui {
     }
 
     pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.pending_history_lines.extend(lines);
+        self.history.push(lines);
         self.frame_requester().schedule_frame();
     }
 
     pub(crate) fn clear_pending_history_lines(&mut self) {
-        self.pending_history_lines.clear();
+        self.history.clear();
     }
 
     pub(crate) fn is_alt_screen_active(&self) -> bool {
@@ -456,106 +453,41 @@ impl Tui {
         #[cfg(unix)] prepared_resume: Option<job_control::PreparedResumeAction>,
         mut pending_viewport_area: Option<ratatui::layout::Rect>,
     ) -> Result<()> {
-        #[cfg(unix)]
-        let mut prepared_resume = prepared_resume;
-        {
-            self.begin_repaint()?;
-            #[cfg(unix)]
-            if let Some(prepared) = prepared_resume.take() {
-                prepared.apply(&mut self.terminal)?;
-            }
-            let terminal = &mut self.terminal;
-            if let Some(new_area) = pending_viewport_area.take() {
-                terminal.set_viewport_area(new_area);
-                terminal.clear()?;
-            }
-
-            let size = terminal.size()?;
-
-            let mut area = terminal.viewport_area;
-            area.height = height.min(size.height);
-            area.width = size.width;
-            // If the viewport has expanded, scroll everything else up to make room.
-            if area.bottom() > size.height {
-                terminal
-                    .backend_mut()
-                    .scroll_region_up(0..area.top(), area.bottom() - size.height)?;
-                area.y = size.height - area.height;
-            } else if area.y == 0 && area.height < size.height {
-                // Viewport was full-screen (y=0) and has shrunk. Reposition
-                // to bottom so insert_history_lines has room above.
-                let new_y = size.height - area.height;
-                area.y = new_y;
-
-                // Set viewport area and clear BEFORE writing history into
-                // the vacated rows. clear() erases from viewport_area.y
-                // downward, so we must reposition first to avoid wiping
-                // content we're about to paint above the viewport.
-                terminal.set_viewport_area(area);
-                terminal.clear()?;
-
-                // Write pending history lines directly into the vacated rows
-                // to avoid pushing stale viewport content into scrollback.
-                if !self.pending_history_lines.is_empty() {
-                    crate::insert_history::write_pending_lines_directly(
-                        terminal,
-                        &mut self.pending_history_lines,
-                        new_y,
-                    )?;
-                } else {
-                    // No pending lines — just clear the stale rows.
-                    let writer = terminal.backend_mut();
-                    for row in 0..new_y {
-                        crossterm::queue!(
-                            writer,
-                            crossterm::cursor::MoveTo(0, row),
-                            crossterm::terminal::Clear(
-                                crossterm::terminal::ClearType::UntilNewLine
-                            )
-                        )?;
-                    }
-                }
-            }
-            if area != terminal.viewport_area {
-                // TODO(nornagon): probably this could be collapsed with the clear + set_viewport_area above.
-                terminal.clear()?;
-                terminal.set_viewport_area(area);
-            }
-
-            if !self.pending_history_lines.is_empty() {
-                // Cap pending lines to avoid unbounded growth if insertion
-                // is blocked for an extended period (e.g., full-screen widget).
-                const MAX_PENDING_LINES: usize = crate::transcript_reflow::MAX_REFLOW_ROWS;
-                if self.pending_history_lines.len() > MAX_PENDING_LINES {
-                    let excess = self.pending_history_lines.len() - MAX_PENDING_LINES;
-                    self.pending_history_lines.drain(..excess);
-                }
-                let inserted = crate::insert_history::insert_history_lines(
-                    terminal,
-                    &self.pending_history_lines,
-                )?;
-                if inserted {
-                    self.pending_history_lines.clear();
-                }
-            }
-
-            // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
-            #[cfg(unix)]
-            {
-                let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
-                    self.alt_saved_viewport
-                        .map(|r| r.bottom().saturating_sub(1))
-                        .unwrap_or_else(|| area.bottom().saturating_sub(1))
-                } else {
-                    area.bottom().saturating_sub(1)
-                };
-                self.suspend_context.set_cursor_y(inline_area_bottom);
-            }
-
-            terminal.draw(|frame| {
-                draw_fn(frame);
-            })
+        if std::mem::take(&mut self.full_repaint) {
+            self.terminal.clear()?;
         }
+        #[cfg(unix)]
+        if let Some(prepared) = prepared_resume {
+            prepared.apply(&mut self.terminal)?;
+        }
+        let terminal = &mut self.terminal;
+        if let Some(new_area) = pending_viewport_area.take() {
+            terminal.set_viewport_area(new_area);
+            terminal.clear()?;
+        }
+
+        if self.history.write_frame(terminal, height)? {
+            self.frame_requester().schedule_frame();
+        }
+        let terminal = &mut self.terminal;
+
+        // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
+        #[cfg(unix)]
+        {
+            let area = terminal.viewport_area;
+            let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
+                self.alt_saved_viewport
+                    .map(|r| r.bottom().saturating_sub(1))
+                    .unwrap_or_else(|| area.bottom().saturating_sub(1))
+            } else {
+                area.bottom().saturating_sub(1)
+            };
+            self.suspend_context.set_cursor_y(inline_area_bottom);
+        }
+
+        terminal.draw(|frame| {
+            draw_fn(frame);
+        })
     }
 }
 

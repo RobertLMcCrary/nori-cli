@@ -93,6 +93,9 @@ fn is_local_path_like_link(dest: &str) -> bool {
         || dest.starts_with("../")
 }
 
+/// Rows a line wraps into beyond which it is wrapped first-fit rather than optimally.
+pub(crate) const LONG_LINE_ROWS: usize = 16;
+
 pub fn render_markdown_text(input: &str) -> Text<'static> {
     render_markdown_text_with_width(input, None)
 }
@@ -112,10 +115,10 @@ pub(crate) fn render_markdown_text_with_width_and_cwd(
 /// Render `input` as the continuation of earlier output when `preceded`.
 ///
 /// Rendering a document in pieces must give the lines of rendering it in one go. The only state a
-/// prose block inherits from the blocks before it is that they ended, so it opens with a blank
-/// separator line. `preceded` reproduces exactly that state for the first prose segment of
-/// `input`, which lets the streaming path render each block once and never again. Tables start
-/// their own rendering, so they inherit nothing.
+/// block inherits from the blocks before it is that they ended, so it opens with a blank separator
+/// line. `preceded` reproduces exactly that state for the first segment of `input`, which lets the
+/// streaming path render each block once and never again. A table is rendered on its own, and is
+/// set apart from whatever comes before and after it by a blank line, as every block is.
 pub(crate) fn render_markdown_continuation(
     input: &str,
     width: Option<usize>,
@@ -125,18 +128,22 @@ pub(crate) fn render_markdown_continuation(
     let segments = table_segments::markdown_segments(input);
     if segments.iter().any(|segment| segment.is_table) {
         let mut lines = Vec::new();
-        for (index, segment) in segments.into_iter().enumerate() {
+        for segment in segments {
             let source = &input[segment.range];
-            let rendered = if segment.is_table {
+            let follows = preceded || !lines.is_empty();
+            if segment.is_table {
                 let mut markdown = nori_tui_components::Markdown::new(source);
                 if let Some(width) = width.and_then(|width| u16::try_from(width).ok()) {
                     markdown = markdown.width(width);
                 }
-                markdown.render_text()
+                let rendered = markdown.render_text();
+                if follows && !rendered.lines.is_empty() {
+                    lines.push(Line::default());
+                }
+                lines.extend(rendered.lines);
             } else {
-                render_markdown_without_tables(source, width, cwd, preceded && index == 0)
-            };
-            lines.extend(rendered.lines);
+                lines.extend(render_markdown_without_tables(source, width, cwd, follows).lines);
+            }
         }
         return lines;
     }
@@ -618,9 +625,15 @@ where
             if !self.current_line_in_code_block
                 && let Some(width) = self.wrap_width
             {
-                let opts = RtOptions::new(width)
+                let mut opts = RtOptions::new(width)
                     .initial_indent(self.current_initial_indent.clone().into())
                     .subsequent_indent(self.current_subsequent_indent.clone().into());
+                // Balancing the raggedness of a line this long buys nothing; wrapping it greedily
+                // places each row's break by that row and the next word alone, so a streaming
+                // answer can commit its rows as they become final (`markdown_stream/long_line.rs`).
+                if line.width() > LONG_LINE_ROWS * width {
+                    opts = opts.wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
+                }
                 for wrapped in adaptive_wrap_line(&line, opts) {
                     let owned = line_to_static(&wrapped).style(style);
                     self.text.lines.push(owned);

@@ -107,7 +107,7 @@ impl App {
                 key_event,
             )
         {
-            self.repaint_screen(tui)?;
+            self.repaint_screen(tui);
             return Ok(true);
         }
         if self.overlay.is_some() {
@@ -616,10 +616,11 @@ impl App {
                     self.begin_agent_preparation(crate::app_event::AgentPrepareIntent::Idle);
                     return Ok(true);
                 }
+                // The activation stays pending, transcript and all, unless the agent is ready.
                 self.pending_session_activation = Some(PendingSessionActivation::Resume {
                     acp_session_id: acp_session_id.clone(),
                     title: title.clone(),
-                    transcript: transcript.clone().map(Box::new),
+                    transcript: transcript.map(Box::new),
                 });
                 let agent = match self.take_refreshed_prepared_agent() {
                     Ok(Some(agent)) => agent,
@@ -630,7 +631,8 @@ impl App {
                         return Ok(true);
                     }
                 };
-                self.pending_session_activation = None;
+                let transcript =
+                    take_pending_resume_transcript(&mut self.pending_session_activation);
                 let (initial_prompt, initial_images) = self.chat_widget.take_initial_input();
                 self.shutdown_current_conversation();
                 let mut init = self.chat_widget_init(
@@ -684,7 +686,12 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
                 self.transcript_cells.push(cell.clone());
-                let mut display = cell.display_lines(tui.terminal.last_known_screen_size.width);
+                // A replayed history is painted all at once when the replay ends.
+                let mut display = if self.replay_painted_from.is_some() {
+                    Vec::new()
+                } else {
+                    cell.display_lines(tui.terminal.last_known_screen_size.width)
+                };
                 if !display.is_empty() {
                     // Only insert a separating blank line for new cells that are not
                     // part of an ongoing stream. Streaming continuations should not
@@ -702,6 +709,12 @@ impl App {
                         tui.insert_history_lines(display);
                     }
                 }
+            }
+            AppEvent::HistoryReplay(crate::app_event::HistoryReplay::Started) => {
+                self.replay_painted_from = Some(self.transcript_cells.len());
+            }
+            AppEvent::HistoryReplay(crate::app_event::HistoryReplay::Finished) => {
+                self.paint_replayed_history(tui);
             }
             AppEvent::ConsolidateAgentMessage { source, cwd } => {
                 let consolidation = crate::transcript_reflow::consolidate_agent_message_cells(
@@ -1629,7 +1642,7 @@ impl App {
             AppEvent::ResumeTranscriptLoaded { transcript } => match transcript {
                 Ok(transcript) => {
                     let transcript = *transcript;
-                    let acp_session_id = transcript.meta.acp_session_id.clone();
+                    let acp_session_id = transcript.latest_acp_session_id();
                     let display_name =
                         crate::nori::agent_picker::get_agent_info(&self.config.active_agent)
                             .map(|info| info.display_name)
@@ -1669,10 +1682,12 @@ impl App {
                         return Ok(true);
                     }
 
+                    // The activation stays pending, transcript and all, unless the agent is
+                    // ready.
                     self.pending_session_activation = Some(PendingSessionActivation::Resume {
                         acp_session_id: acp_session_id.clone(),
                         title: None,
-                        transcript: Some(Box::new(transcript.clone())),
+                        transcript: Some(Box::new(transcript)),
                     });
                     let agent = match self.take_refreshed_prepared_agent() {
                         Ok(Some(agent)) => agent,
@@ -1684,7 +1699,8 @@ impl App {
                             return Ok(true);
                         }
                     };
-                    self.pending_session_activation = None;
+                    let transcript =
+                        take_pending_resume_transcript(&mut self.pending_session_activation);
 
                     let (initial_prompt, initial_images) = self.chat_widget.take_initial_input();
                     self.shutdown_current_conversation();
@@ -1699,7 +1715,7 @@ impl App {
                     );
                     init.prepared_agent = Some(agent);
                     self.chat_widget =
-                        ChatWidget::new_resumed_acp(init, acp_session_id, None, Some(transcript));
+                        ChatWidget::new_resumed_acp(init, acp_session_id, None, transcript);
                     self.configure_new_chat_widget();
 
                     self.chat_widget
@@ -2134,6 +2150,21 @@ pub(super) fn reattach_info_message(
         format!("Reattaching to {session_label}...")
     } else {
         format!("Resuming session with {display_name}...")
+    }
+}
+
+/// Take back the transcript of a resume left pending in case the agent was not ready, now that it
+/// is: moving it out, rather than having kept a copy, holds one transcript in memory at a time.
+fn take_pending_resume_transcript(
+    pending: &mut Option<PendingSessionActivation>,
+) -> Option<nori_harness::transcript::Transcript> {
+    match pending.take() {
+        Some(PendingSessionActivation::Resume { transcript, .. }) => {
+            transcript.map(|transcript| *transcript)
+        }
+        Some(PendingSessionActivation::New | PendingSessionActivation::ResumeLoading) | None => {
+            None
+        }
     }
 }
 

@@ -9,6 +9,7 @@ use crate::markdown_render::top_level_block_starts;
 use crate::render::line_utils::is_blank_line_spaces_only;
 
 mod fence;
+mod long_line;
 
 pub(crate) use fence::FenceOpener;
 
@@ -29,12 +30,16 @@ pub(crate) struct MarkdownStreamCollector {
     cwd: Option<PathBuf>,
     /// Bytes of `buffer` that are frozen. The open block starts here.
     frozen_len: usize,
-    /// The frozen text ends inside a prose segment, so the open block continues it.
+    /// The frozen text rendered something, so the open block continues that output and opens
+    /// with the separator a block after another gets.
     prose_continues: bool,
     /// Lines of the open block already handed out.
     committed_in_open: usize,
     /// Length of the open block's complete prefix that was last rendered.
     complete_cache: Option<usize>,
+    /// Where the line being typed starts, and where the first of its rows not committed yet
+    /// starts, when some of them are (see `long_line`).
+    line_committed: Option<(usize, usize)>,
     live: Vec<Line<'static>>,
     dirty: bool,
     /// The open block is a fenced code block streamed line by line.
@@ -64,6 +69,7 @@ impl MarkdownStreamCollector {
             prose_continues: false,
             committed_in_open: 0,
             complete_cache: None,
+            line_committed: None,
             live: Vec::new(),
             dirty: false,
             fence: None,
@@ -78,6 +84,7 @@ impl MarkdownStreamCollector {
         self.prose_continues = false;
         self.committed_in_open = 0;
         self.complete_cache = None;
+        self.line_committed = None;
         self.live.clear();
         self.dirty = false;
         self.fence = None;
@@ -154,6 +161,12 @@ impl MarkdownStreamCollector {
                     self.live = fence.live(&self.buffer);
                     return out;
                 }
+                fence::FenceProgress::Paused => {
+                    // The rest of the burst is the next frames' work.
+                    self.live.clear();
+                    self.dirty = true;
+                    return out;
+                }
                 fence::FenceProgress::Closed { end } => self.close_fence(end),
             }
         }
@@ -193,6 +206,31 @@ impl MarkdownStreamCollector {
         };
         while live.last().is_some_and(is_blank_line_spaces_only) {
             live.pop();
+        }
+        // The rows of a long line that cannot change any more go to the scrollback now, once
+        // everything before the line has.
+        let line_start = open_start
+            + memchr::memrchr(b'\n', &self.buffer.as_bytes()[open_start..])
+                .map_or(0, |newline| newline + 1);
+        if complete_len == line_start - open_start
+            && let Some(width) = self.width
+        {
+            let committed_to = match self.line_committed {
+                Some((start, to)) if start == line_start => to,
+                Some(_) | None => line_start,
+            };
+            if let Some((rows, to)) = long_line::final_rows(
+                &self.buffer,
+                open_start,
+                line_start,
+                committed_to,
+                &live,
+                width,
+            ) {
+                out.extend(live.drain(..rows));
+                self.committed_in_open += rows;
+                self.line_committed = Some((line_start, to));
+            }
         }
         self.live = live;
         out
@@ -260,7 +298,16 @@ impl MarkdownStreamCollector {
             let starts = top_level_block_starts(&stable[last.range.clone()]);
             self.parsed_bytes += last.range.len();
             if starts.len() >= 2 {
-                open_start = last.range.start + starts[starts.len() - 1];
+                // Freeze up to the open block, or up to the first fenced block before it: a fence
+                // is streamed line by line instead, so a burst of code is highlighted over as
+                // many frames as it takes rather than all in one.
+                let open = (1..starts.len())
+                    .find(|index| {
+                        let block = &stable[last.range.start + starts[*index]..];
+                        FenceOpener::parse(block.split('\n').next().unwrap_or_default()).is_some()
+                    })
+                    .unwrap_or(starts.len() - 1);
+                open_start = last.range.start + starts[open];
                 open_continues_prose = true;
             }
         }
@@ -270,11 +317,13 @@ impl MarkdownStreamCollector {
 
         let from = self.frozen_len;
         let frozen = self.render(from..from + open_start, self.prose_continues);
+        // A block that starts a segment of its own continues output when anything came before it.
+        let continues = open_continues_prose || self.prose_continues || !frozen.is_empty();
         // The block that was open is the first thing frozen; its early lines were already
         // handed out as they were committed.
         out.extend(frozen.into_iter().skip(self.committed_in_open));
         self.frozen_len += open_start;
-        self.prose_continues = open_continues_prose;
+        self.prose_continues = continues;
         self.committed_in_open = 0;
         self.complete_cache = None;
     }
@@ -283,7 +332,10 @@ impl MarkdownStreamCollector {
     /// newline, a temporary one is appended for rendering. Returns the raw source unchanged.
     pub fn finalize_and_drain(&mut self) -> (Vec<Line<'static>>, String) {
         self.dirty = true;
-        let mut out = self.advance();
+        let mut out = Vec::new();
+        while self.dirty {
+            out.extend(self.advance());
+        }
         if let Some(fence) = self.fence.as_mut() {
             // The message ended inside a code block, which ends it.
             fence.finish(&self.buffer, &mut out);
@@ -948,6 +1000,14 @@ mod tests {
     async fn streamed_table_followed_by_prose_matches_full() {
         let source = format!("{STREAMED_TABLE}\nAnd some trailing prose.\n");
         assert_streamed_table_equals_full(&source, Some(80));
+    }
+
+    #[tokio::test]
+    async fn streamed_table_between_a_quote_and_a_rule_matches_full() {
+        let source = format!("> A quoted remark.\n\n{STREAMED_TABLE}\n---\n\nAfter the rule.\n");
+        for width in [Some(60), Some(80), None] {
+            assert_streamed_table_equals_full(&source, width);
+        }
     }
 
     #[tokio::test]

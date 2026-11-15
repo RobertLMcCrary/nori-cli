@@ -567,6 +567,19 @@ transcript; `session/load` is used when there is no transcript. Transcripts
 are read in one pass, split with `memchr`, and parsed on every core
 (`transcript/parse.rs`), with the same rules for unparseable lines as before.
 
+A session resumed from its local transcript, with the history replayed from that
+transcript, goes on recording into that file
+(`TranscriptRecorder::continue_session`) instead of a new copy, and the runtime
+does not record the events between `ReplayStarted` and `ReplayFinished` into a
+transcript that already holds them. A resume whose history the agent replays
+starts a new transcript, as the agent's history can hold more than the local
+one. When the replay comes from the transcript,
+the first chunk of each run of agent text carries
+`nori_protocol::TURN_ELAPSED_META_KEY`: how long its turn had been running when
+it was recorded, from the turn's user message, less the time spent waiting on a
+permission (`backend/replay_timing.rs`). The client shows that duration on the
+"Worked for" separator a live turn times itself.
+
 #### Private reduction and transcripts
 
 ACP update reduction in `harness/src/normalized/` is private implementation
@@ -614,11 +627,11 @@ session identity, so load failure is terminal rather than calling
 `session/new`. Private v2 compatibility types remain in the transcript loader;
 storage enums are not exported. Public readers use `Transcript::records()` and
 `TranscriptRecord` for conversation events, or `Transcript::context_timeline()`
-for checkpoint history. Resume copies only the raw evidence needed by the
-timeline into the new transcript, preserving original observation identity and
-time. This archived evidence is excluded from conversation records and replay;
-agent replay remains independently recorded, including content newer than the
-local transcript. Fork copies the parent transcript and retains those same
+for checkpoint history. A resume that has to start a new transcript (no local
+file to continue) copies only the raw evidence needed by the timeline into it,
+preserving original observation identity and time. This archived evidence is
+excluded from conversation records and replay; agent replay is then recorded
+into the new transcript, including content newer than the local one. Fork copies the parent transcript and retains those same
 identities. See the [transcript format](../../docs/transcripts.md) for optional
 storage metadata and compatibility rules.
 

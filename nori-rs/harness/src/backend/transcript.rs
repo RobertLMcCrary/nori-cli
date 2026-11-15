@@ -55,27 +55,30 @@ pub fn transcript_to_replay_session_events(
         .acp_session_id
         .clone()
         .unwrap_or_else(|| format!("transcript-{}", transcript.meta.session_id));
-    transcript
-        .entries
-        .iter()
-        .flat_map(|line| {
-            if matches!(&line.entry, crate::transcript::TranscriptEntry::SessionEvent(entry) if entry.historical_evidence) { return Vec::new(); }
-            if has_raw_notifications
-                && let crate::transcript::TranscriptEntry::SessionEvent(entry) = &line.entry
-                && matches!(
-                    entry.event,
-                    nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
-                        nori_protocol::acp::v1::AgentNotification::SessionNotification(_)
-                    ))
-                )
-            {
-                return vec![entry.event.clone()];
+    let mut timing = super::replay_timing::TurnTiming::default();
+    let mut replay = Vec::new();
+    for line in &transcript.entries {
+        if let crate::transcript::TranscriptEntry::SessionEvent(entry) = &line.entry {
+            if entry.historical_evidence {
+                continue;
             }
+            timing.observe(entry);
+            if has_raw_notifications
+                && let nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                    nori_protocol::acp::v1::AgentNotification::SessionNotification(notification),
+                )) = &entry.event
+            {
+                replay.push(timing.replayed(notification, entry.observed_at.as_deref()));
+                continue;
+            }
+        }
 
-            let updates: Vec<_> = match &line.entry {
-                crate::transcript::TranscriptEntry::User(user)
-                    if !canonical_user_message_ids.contains(&user.id) =>
-                {
+        let updates: Vec<_> = match &line.entry {
+            crate::transcript::TranscriptEntry::User(user) => {
+                timing.start_turn(&line.ts);
+                if canonical_user_message_ids.contains(&user.id) {
+                    Vec::new()
+                } else {
                     vec![nori_protocol::acp::v1::SessionUpdate::UserMessageChunk(
                         nori_protocol::acp::v1::ContentChunk::new(
                             nori_protocol::acp::v1::ContentBlock::Text(
@@ -84,54 +87,44 @@ pub fn transcript_to_replay_session_events(
                         ),
                     )]
                 }
-                crate::transcript::TranscriptEntry::User(_) => Vec::new(),
-                crate::transcript::TranscriptEntry::Assistant(assistant)
-                    if !has_raw_notifications =>
-                {
-                    assistant
-                        .content
-                        .iter()
-                        .map(|block| match block {
-                            ContentBlock::Text { text } => {
-                                nori_protocol::acp::v1::SessionUpdate::AgentMessageChunk(
-                                    nori_protocol::acp::v1::ContentChunk::new(
-                                        nori_protocol::acp::v1::ContentBlock::Text(
-                                            nori_protocol::acp::v1::TextContent::new(text.clone()),
-                                        ),
+            }
+            crate::transcript::TranscriptEntry::Assistant(assistant) if !has_raw_notifications => {
+                assistant
+                    .content
+                    .iter()
+                    .map(|block| match block {
+                        ContentBlock::Text { text } => {
+                            nori_protocol::acp::v1::SessionUpdate::AgentMessageChunk(
+                                nori_protocol::acp::v1::ContentChunk::new(
+                                    nori_protocol::acp::v1::ContentBlock::Text(
+                                        nori_protocol::acp::v1::TextContent::new(text.clone()),
                                     ),
-                                )
-                            }
-                            ContentBlock::Thinking { thinking } => {
-                                nori_protocol::acp::v1::SessionUpdate::AgentThoughtChunk(
-                                    nori_protocol::acp::v1::ContentChunk::new(
-                                        nori_protocol::acp::v1::ContentBlock::Text(
-                                            nori_protocol::acp::v1::TextContent::new(
-                                                thinking.clone(),
-                                            ),
-                                        ),
+                                ),
+                            )
+                        }
+                        ContentBlock::Thinking { thinking } => {
+                            nori_protocol::acp::v1::SessionUpdate::AgentThoughtChunk(
+                                nori_protocol::acp::v1::ContentChunk::new(
+                                    nori_protocol::acp::v1::ContentBlock::Text(
+                                        nori_protocol::acp::v1::TextContent::new(thinking.clone()),
                                     ),
-                                )
-                            }
-                        })
-                        .collect()
-                }
-                _ => Vec::new(),
-            };
-            updates
-                .into_iter()
-                .map(|update| {
-                    nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
-                        nori_protocol::acp::v1::AgentNotification::SessionNotification(
-                            nori_protocol::acp::v1::SessionNotification::new(
-                                session_id.clone(),
-                                update,
-                            ),
-                        ),
-                    ))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+                                ),
+                            )
+                        }
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        replay.extend(updates.into_iter().map(|update| {
+            nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                nori_protocol::acp::v1::AgentNotification::SessionNotification(
+                    nori_protocol::acp::v1::SessionNotification::new(session_id.clone(), update),
+                ),
+            ))
+        }));
+    }
+    replay
 }
 
 /// Convert a loaded transcript into normalized replay events suitable for ACP
@@ -474,9 +467,127 @@ mod tests {
                     )
             )
         ));
+        // The answer is replayed as it was recorded, saying how long its turn had run by then.
+        let mut replayed = serde_json::to_value(&replay[1]).unwrap();
+        let meta = replayed
+            .pointer_mut("/event/update")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|update| update.remove("_meta"));
+        assert!(
+            meta.is_some_and(|meta| meta.get(nori_protocol::TURN_ELAPSED_META_KEY).is_some()),
+            "{replayed}"
+        );
+        assert_eq!(replayed, serde_json::to_value(raw_assistant_event).unwrap());
+    }
+
+    fn at(seconds: i64) -> String {
+        (chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z").unwrap()
+            + chrono::TimeDelta::seconds(seconds))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn observed(event: nori_protocol::SessionEvent, seconds: i64) -> TranscriptLine {
+        let mut entry = SessionEventEntry::new(event);
+        entry.observed_at = Some(at(seconds));
+        TranscriptLine {
+            ts: at(seconds),
+            v: 3,
+            entry: TranscriptEntry::SessionEvent(entry),
+        }
+    }
+
+    fn notification(update: serde_json::Value) -> nori_protocol::SessionEvent {
+        nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+            nori_protocol::acp::v1::AgentNotification::SessionNotification(
+                serde_json::from_value(serde_json::json!({ "sessionId": "s", "update": update }))
+                    .unwrap(),
+            ),
+        ))
+    }
+
+    fn text(text: &str) -> nori_protocol::SessionEvent {
+        notification(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": text },
+        }))
+    }
+
+    #[test]
+    fn each_run_of_replayed_text_says_how_long_its_turn_had_run_without_the_waits() {
+        let mut transcript = make_transcript(Vec::new());
+        transcript.entries.push(TranscriptLine {
+            ts: at(0),
+            v: 3,
+            entry: TranscriptEntry::User(UserEntry {
+                id: "user-1".into(),
+                content: "Do it".into(),
+                attachments: vec![],
+            }),
+        });
+        let permission: nori_protocol::acp::v1::RequestPermissionRequest =
+            serde_json::from_value(serde_json::json!({
+                "sessionId": "s",
+                "toolCall": { "toolCallId": "t1" },
+                "options": [],
+            }))
+            .unwrap();
+        transcript.entries.extend([
+            observed(text("Looking. "), 1),
+            observed(text("Still looking. "), 2),
+            observed(
+                notification(serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "title": "Edit a file",
+                })),
+                3,
+            ),
+            observed(
+                nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Request {
+                    request_id: nori_protocol::acp::v1::RequestId::Str("ask".into()),
+                    request: nori_protocol::acp::v1::AgentRequest::RequestPermissionRequest(
+                        permission,
+                    ),
+                }),
+                4,
+            ),
+            // The user answered ten seconds later.
+            observed(
+                notification(serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "t1",
+                    "status": "completed",
+                })),
+                14,
+            ),
+            observed(text("Done."), 16),
+        ]);
+
+        let elapsed: Vec<Option<std::time::Duration>> =
+            transcript_to_replay_session_events(&transcript)
+                .iter()
+                .filter_map(|event| match event {
+                    nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                        nori_protocol::acp::v1::AgentNotification::SessionNotification(
+                            notification,
+                        ),
+                    )) => match &notification.update {
+                        nori_protocol::acp::v1::SessionUpdate::AgentMessageChunk(chunk) => {
+                            Some(nori_protocol::turn_elapsed_in_meta(chunk.meta.as_ref()))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+
         assert_eq!(
-            serde_json::to_value(&replay[1]).unwrap(),
-            serde_json::to_value(raw_assistant_event).unwrap()
+            elapsed,
+            vec![
+                Some(std::time::Duration::from_secs(1)),
+                None,
+                Some(std::time::Duration::from_secs(6)),
+            ]
         );
     }
 

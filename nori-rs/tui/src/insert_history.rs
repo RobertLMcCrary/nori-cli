@@ -55,16 +55,6 @@ pub(crate) fn wrap_history_lines_for_width(lines: &[Line<'_>], width: u16) -> Ve
     wrapped
 }
 
-/// Terminal rows that `lines` take when written at `width`, wrapped as history is.
-pub(crate) fn physical_rows_of(lines: &[Line<'_>], width: u16) -> usize {
-    let width = usize::from(width.max(1));
-    lines
-        .iter()
-        .flat_map(|line| wrap_history_line(line, width))
-        .map(|line| physical_row_count(&line, width))
-        .sum()
-}
-
 fn physical_row_count(line: &Line<'_>, width: usize) -> usize {
     line.width().max(1).div_ceil(width.max(1))
 }
@@ -173,9 +163,9 @@ where
     // fetch/restore the cursor position. insert_history_lines should be cursor-position-neutral :)
     queue!(writer, MoveTo(0, cursor_top))?;
 
-    for line in wrapped {
+    for line in &wrapped {
         queue!(writer, Print("\r\n"))?;
-        let physical_rows = physical_row_count(&line, wrap_width);
+        let physical_rows = physical_row_count(line, wrap_width);
         if physical_rows > 1 {
             queue!(writer, SavePosition)?;
             for _ in 1..physical_rows {
@@ -192,7 +182,7 @@ where
         queue!(writer, Clear(ClearType::UntilNewLine))?;
         // Merge line-level style into each span so that ANSI colors reflect
         // line styles (e.g., blockquotes with green fg).
-        write_line_spans(writer, &line)?;
+        write_line_spans(writer, line)?;
     }
 
     queue!(writer, ResetScrollRegion)?;
@@ -204,7 +194,9 @@ where
     if should_update_area {
         terminal.set_viewport_area(area);
     }
-    terminal.note_history_rows(wrapped_rows);
+    terminal
+        .written_history
+        .record(&wrapped, area.width, usize::from(screen_size.height));
 
     Ok(true)
 }
@@ -266,6 +258,7 @@ where
     let start_row = available_rows - total_rows;
 
     let last_cursor_pos = terminal.last_known_cursor_pos;
+    let screen_rows = terminal.size()?.height;
     let writer = terminal.backend_mut();
 
     // Clear any stale rows above the written content.
@@ -273,10 +266,54 @@ where
         queue!(writer, MoveTo(0, row))?;
         queue!(writer, Clear(ClearType::UntilNewLine))?;
     }
+    write_lines_at(writer, &wrapped, start_row, width)?;
 
-    // Write the wrapped lines directly to their target positions.
+    // Restore cursor position.
+    queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+    // Everything above the viewport was cleared or written just now.
+    terminal.written_history.clear();
+    terminal.written_history.record(
+        &wrapped,
+        terminal.viewport_area.width,
+        usize::from(screen_rows),
+    );
+
+    Ok(total_rows)
+}
+
+/// Write the history rows Nori owns again, where they are: the rows directly above the viewport
+/// that it wrote and that are still on screen, from its record of what it wrote there. Nothing
+/// else is written to and nothing scrolls, so neither scrollback nor history still waiting to
+/// be written can be affected.
+pub(crate) fn repaint_owned_history<B>(
+    terminal: &mut crate::custom_terminal::Terminal<B>,
+) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + Write,
+{
+    let rows = terminal.owned_history_rows();
+    if rows == 0 {
+        return Ok(());
+    }
+    let lines = terminal.written_history.newest_rows(rows);
+    let start_row = terminal.viewport_area.top() - u16::try_from(rows).unwrap_or(u16::MAX);
+    let width = usize::from(terminal.viewport_area.width.max(1));
+    let last_cursor_pos = terminal.last_known_cursor_pos;
+    let writer = terminal.backend_mut();
+    write_lines_at(writer, &lines, start_row, width)?;
+    queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))
+}
+
+/// Write `lines`, each already wrapped for `width`, one after another from `start_row`, clearing
+/// every row they take first.
+fn write_lines_at(
+    writer: &mut impl Write,
+    lines: &[Line<'_>],
+    start_row: u16,
+    width: usize,
+) -> io::Result<()> {
     let mut row = start_row;
-    for line in &wrapped {
+    for line in lines {
         let physical_rows = physical_row_count(line, width) as u16;
         for offset in 0..physical_rows {
             queue!(writer, MoveTo(0, row + offset))?;
@@ -292,12 +329,7 @@ where
         write_line_spans(writer, line)?;
         row += physical_rows;
     }
-
-    // Restore cursor position.
-    queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
-    terminal.note_history_rows(usize::from(total_rows));
-
-    Ok(total_rows)
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
