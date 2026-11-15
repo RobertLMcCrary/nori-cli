@@ -68,8 +68,13 @@ pub(super) fn final_rows(
         let row_end = start + row.len();
         let next_start = row_end + spaces(&line[row_end..]);
         let first_word_end = next_start + next.split(' ').next().map_or(0, str::len);
-        // The next row's first word decided where this row ends; it must be all there.
-        if first_word_end >= plain || line.as_bytes()[first_word_end] != b' ' {
+        // The next row's first word decided where this row ends; it must be all there. So must
+        // what follows it: a `)` after the space cannot start a row, so it keeps the word before
+        // it company, and a URL later on the line undoes that.
+        if first_word_end >= plain
+            || line.as_bytes()[first_word_end] != b' '
+            || first_word_end + spaces(&line[first_word_end..]) >= plain
+        {
             break;
         }
         rows += 1;

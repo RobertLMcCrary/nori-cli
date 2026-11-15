@@ -463,3 +463,17 @@ proptest! {
         );
     }
 }
+
+/// A `)` after a space keeps the word before it from ending a row until a URL later on the
+/// line allows a break there; a row is final only once what follows its next word is plain too.
+#[test]
+fn a_row_is_not_final_while_a_closing_paren_follows_the_next_word() {
+    let markup = [(243usize, "https://x.io/a-b "), (155, ")")];
+    let doc = long_line(500, &markup);
+    let pieces = split_at_chars(&doc, &[38616]);
+    let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    assert_eq!(
+        styled(&streamed_lines(&refs, 1, Some(24))),
+        styled(&one_shot_lines(&doc, Some(24)))
+    );
+}
