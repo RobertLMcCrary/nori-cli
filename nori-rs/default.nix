@@ -1,32 +1,36 @@
 {
-  openssl,
-  rustPlatform,
-  pkg-config,
   lib,
+  rustPlatform,
+  stdenv,
+  pkg-config,
+  dbus,
   ...
 }:
-rustPlatform.buildRustPackage (_: {
-  env = {
-    PKG_CONFIG_PATH = "${openssl.dev}/lib/pkgconfig:$PKG_CONFIG_PATH";
-  };
-  pname = "nori-rs";
+rustPlatform.buildRustPackage {
+  pname = "nori";
   version = "0.0.0";
-  cargoLock.lockFile = ./Cargo.lock;
-  doCheck = false;
-  src = ./.;
-  nativeBuildInputs = [
-    pkg-config
-    openssl
+  src = lib.cleanSource ./.;
+
+  cargoLock = {
+    lockFile = ./Cargo.lock;
+    # The only git dependency is the crossterm fork pinned in Cargo.toml.
+    allowBuiltinFetchGit = true;
+  };
+  cargoBuildFlags = [
+    "--bin"
+    "nori"
   ];
 
-  cargoLock.outputHashes = {
-    "ratatui-0.29.0" = "sha256-HBvT5c8GsiCxMffNjJGLmHnvG77A6cqEL+1ARurBXho=";
-    "crossterm-0.28.1" = "sha256-6qCtfSMuXACKFb9ATID39XyFDIEMFDmbx6SSmNe+728=";
-  };
+  nativeBuildInputs = [ pkg-config ];
+  # TLS is rustls over ring and regexes are fancy-regex, so the only system
+  # library left is libdbus for the Linux keyring.
+  buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ dbus ];
+  doCheck = false;
 
-  meta = with lib; {
-    description = "Nori command‑line interface rust implementation";
-    license = licenses.asl20;
+  meta = {
+    description = "Nori command-line interface, an agent-agnostic terminal UI over ACP";
     homepage = "https://github.com/tilework-tech/nori-cli";
+    license = lib.licenses.asl20;
+    mainProgram = "nori";
   };
-})
+}
