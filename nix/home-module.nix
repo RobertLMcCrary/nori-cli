@@ -45,6 +45,16 @@ let
       )
     else if kind == "cursor" then
       adapters.cursor ({ inherit name; } // lib.optionalAttrs (executable != null) { inherit executable; })
+    else if kind == "opencode" then
+      adapters.opencode ({ inherit name; } // lib.optionalAttrs (executable != null) { inherit executable; })
+    else if kind == "claude-native" then
+      adapters.claudeNative (
+        {
+          inherit name;
+          package = agent.adapter.package;
+        }
+        // lib.optionalAttrs (executable != null) { inherit executable; }
+      )
     else
       null;
 
@@ -117,8 +127,10 @@ let
             type = types.nullOr (
               types.enum [
                 "claude"
+                "claude-native"
                 "codex"
                 "cursor"
+                "opencode"
               ]
             );
             default = null;
@@ -128,6 +140,11 @@ let
             type = types.nullOr types.str;
             default = null;
             description = "The agent's own launcher the adapter runs: a name on PATH or an absolute path.";
+          };
+          package = mkOption {
+            type = types.nullOr types.package;
+            default = null;
+            description = "The package providing bin/claude-code-acp-rs, for the `claude-native` adapter.";
           };
           codexHome = mkOption {
             type = types.nullOr types.str;
@@ -204,6 +221,10 @@ in
     assertions = lib.mapAttrsToList (slug: agent: {
       assertion = agent.command != null || agent.adapter.kind != null;
       message = "programs.nori.agents.${slug} needs a `command` or an `adapter.kind`.";
+    }) cfg.agents
+    ++ lib.mapAttrsToList (slug: agent: {
+      assertion = agent.adapter.kind != "claude-native" || agent.adapter.package != null;
+      message = "programs.nori.agents.${slug}.adapter.package is required for the claude-native adapter.";
     }) cfg.agents
     ++ lib.mapAttrsToList (slug: agent: {
       assertion = agent.adapter.kind != "codex" || agent.adapter.codexHome != null;

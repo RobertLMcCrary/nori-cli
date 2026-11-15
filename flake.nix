@@ -117,6 +117,11 @@
               home = "/tmp/codex";
             };
             cursor = adapters.cursor { name = "nori-cursor-acp"; };
+            opencode = adapters.opencode { name = "nori-opencode-acp"; };
+            claude-native = adapters.claudeNative {
+              name = "nori-claude-native-acp";
+              package = pkgs.writeShellScriptBin "claude-code-acp-rs" "";
+            };
           };
           module =
             assert failed == [ ];

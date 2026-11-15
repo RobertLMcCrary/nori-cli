@@ -48,6 +48,9 @@ writes `config.toml` from a Home Manager module. Nothing is fetched at run time.
 
 - `adapter.executable` points an adapter at an account's own launcher (a name on `PATH` or an
   absolute path); several accounts are several entries under `agents`.
+- `adapter.kind = "opencode"` runs `opencode acp`. `adapter.kind = "claude-native"` runs the Rust
+  Claude adapter (`claude-code-acp-rs`, no Node, `initialize` in about 20 ms); it needs
+  `adapter.package` to be a package providing `bin/claude-code-acp-rs`.
 - An agent can use its own `command` instead of an adapter.
 - `configMethod = "copy"` (the default) writes `config.toml` as a plain file on each activation so
   Nori can still save settings between them; `"symlink"` makes it read-only.
