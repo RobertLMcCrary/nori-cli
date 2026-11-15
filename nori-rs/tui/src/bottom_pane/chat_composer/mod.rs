@@ -553,6 +553,25 @@ impl ChatComposer {
     }
 }
 
+impl ChatComposer {
+    /// Rows an open popup adds to the composer's own height: what it takes beyond the footer it
+    /// stands in for.
+    pub(crate) fn popup_rows(&self, width: u16) -> u16 {
+        let popup_height = match &self.active_popup {
+            ActivePopup::None => return 0,
+            ActivePopup::Command(c) => c.calculate_required_height(width),
+            ActivePopup::Skill(c) => c.calculate_required_height(width),
+            ActivePopup::File(c) => c.calculate_required_height(),
+            ActivePopup::HistorySearch(c) => c.calculate_required_height(),
+        };
+        let footer_props = self.footer_props();
+        let footer_hint_height = self
+            .custom_footer_height()
+            .unwrap_or_else(|| footer_height(&footer_props));
+        popup_height.saturating_sub(footer_hint_height + Self::footer_spacing(footer_hint_height))
+    }
+}
+
 impl Renderable for ChatComposer {
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         if !self.input_enabled {

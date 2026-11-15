@@ -24,7 +24,7 @@ use tokio_stream::StreamExt;
 /// waits for the user to acknowledge.
 pub(crate) async fn run_worktree_blocked_popup(tui: &mut Tui, reason: &str) -> Result<()> {
     let mut screen = WorktreeBlockedScreen::new(tui.frame_requester(), reason.to_string());
-    tui.draw(u16::MAX, |frame| {
+    tui.draw(u16::MAX, 0, |frame| {
         frame.render_widget_ref(&screen, frame.area());
     })?;
 
@@ -37,7 +37,7 @@ pub(crate) async fn run_worktree_blocked_popup(tui: &mut Tui, reason: &str) -> R
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
                 TuiEvent::Paste(_) | TuiEvent::Mouse(_) => {}
                 TuiEvent::Draw => {
-                    tui.draw(u16::MAX, |frame| {
+                    tui.draw(u16::MAX, 0, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     })?;
                 }
@@ -53,7 +53,7 @@ pub(crate) async fn run_worktree_blocked_popup(tui: &mut Tui, reason: &str) -> R
 /// Run the worktree ask popup. Returns `true` if the user chose to create a worktree.
 pub(crate) async fn run_worktree_ask_popup(tui: &mut Tui) -> Result<bool> {
     let mut screen = WorktreeAskScreen::new(tui.frame_requester());
-    tui.draw(u16::MAX, |frame| {
+    tui.draw(u16::MAX, 0, |frame| {
         frame.render_widget_ref(&screen, frame.area());
     })?;
 
@@ -66,7 +66,7 @@ pub(crate) async fn run_worktree_ask_popup(tui: &mut Tui) -> Result<bool> {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
                 TuiEvent::Paste(_) | TuiEvent::Mouse(_) => {}
                 TuiEvent::Draw => {
-                    tui.draw(u16::MAX, |frame| {
+                    tui.draw(u16::MAX, 0, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     })?;
                 }

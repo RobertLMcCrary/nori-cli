@@ -443,6 +443,7 @@ impl Tui {
     pub fn draw(
         &mut self,
         height: u16,
+        popup_rows: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
         // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
@@ -484,6 +485,7 @@ impl Tui {
         let _ = queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate);
         let result = self.draw_frame(
             height,
+            popup_rows,
             draw_fn,
             #[cfg(unix)]
             prepared_resume.take(),
@@ -501,6 +503,7 @@ impl Tui {
     fn draw_frame(
         &mut self,
         height: u16,
+        popup_rows: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
         #[cfg(unix)] prepared_resume: Option<job_control::PreparedResumeAction>,
         mut pending_viewport_area: Option<ratatui::layout::Rect>,
@@ -518,7 +521,7 @@ impl Tui {
             terminal.clear()?;
         }
 
-        if self.history.write_frame(terminal, height)? {
+        if self.history.write_frame_with_popup(terminal, height, popup_rows)? {
             self.frame_requester().schedule_frame();
         }
         let terminal = &mut self.terminal;

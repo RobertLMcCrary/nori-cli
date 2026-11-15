@@ -319,7 +319,7 @@ pub(crate) async fn run_nori_onboarding_app(
 
     let mut onboarding_screen = NoriOnboardingScreen::new(tui, args);
 
-    tui.draw(u16::MAX, |frame| {
+    tui.draw(u16::MAX, 0, |frame| {
         frame.render_widget_ref(&onboarding_screen, frame.area());
     })?;
 
@@ -336,7 +336,7 @@ pub(crate) async fn run_nori_onboarding_app(
                     // Paste not handled in Nori onboarding
                 }
                 TuiEvent::Draw => {
-                    let _ = tui.draw(u16::MAX, |frame| {
+                    let _ = tui.draw(u16::MAX, 0, |frame| {
                         frame.render_widget_ref(&onboarding_screen, frame.area());
                     });
                 }

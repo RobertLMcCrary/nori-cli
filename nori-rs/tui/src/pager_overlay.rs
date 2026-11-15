@@ -564,7 +564,7 @@ impl StaticOverlay {
                 other => self.view.handle_key_event(tui, other),
             },
             TuiEvent::Draw => {
-                tui.draw(u16::MAX, |frame| {
+                tui.draw(u16::MAX, 0, |frame| {
                     self.render(frame.area(), frame.buffer);
                 })?;
                 Ok(())

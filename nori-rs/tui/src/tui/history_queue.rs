@@ -26,6 +26,17 @@ pub(crate) struct HistoryQueue {
     /// do it: moving the screen down later would put blank rows into the middle of the
     /// scrollback each time the prompt shrinks.
     pinned: bool,
+    /// Rows the viewport was stretched by for a popup that is open, drawn over what is on
+    /// screen instead of scrolling it away: `up` over history rows above it, `down` over blank
+    /// rows below it.
+    stretch: Stretch,
+}
+
+/// How far a transient popup stretched the viewport past the prompt's own rows.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+struct Stretch {
+    up: u16,
+    down: u16,
 }
 
 impl HistoryQueue {
@@ -57,6 +68,7 @@ impl HistoryQueue {
     /// Repaint what Nori owns if a repaint was asked for, place the viewport for a frame `height`
     /// rows tall, and write the queued history above it, up to a frame's worth. Returns whether
     /// history is left for the next frame to write.
+    #[cfg(test)]
     pub(crate) fn write_frame<B>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -65,6 +77,37 @@ impl HistoryQueue {
     where
         B: Backend<Error = io::Error> + io::Write,
     {
+        self.write_frame_with_popup(terminal, height, 0)
+    }
+
+    /// [`Self::write_frame`] for a viewport whose last `popup_rows` rows belong to a popup. The
+    /// popup is drawn over the screen above the prompt rather than scrolling it into the
+    /// scrollback, so the prompt stays where it is and the rows it covered come back, from the
+    /// record of what Nori wrote there, when the popup closes.
+    pub(crate) fn write_frame_with_popup<B>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        height: u16,
+        popup_rows: u16,
+    ) -> io::Result<bool>
+    where
+        B: Backend<Error = io::Error> + io::Write,
+    {
+        // Place the prompt on its own, as if no popup had ever been open.
+        let stretched = terminal.viewport_area;
+        let before = std::mem::take(&mut self.stretch);
+        if before != Stretch::default() {
+            let mut base = stretched;
+            base.y += before.up;
+            base.height -= before.up + before.down;
+            // Only where the prompt is, as far as placing it goes: the buffers still hold what
+            // the last frame drew, which a frame with the same popup compares itself with.
+            terminal.viewport_area = base;
+        }
+        let base_before = terminal.viewport_area;
+        let popup_rows = popup_rows.min(height.saturating_sub(1));
+        let height = height - popup_rows;
+
         // Repaint where the rows are now, before placing the viewport can scroll any of them
         // into the scrollback, which nothing can repaint.
         if std::mem::take(&mut self.repaint) {
@@ -145,6 +188,8 @@ impl HistoryQueue {
             terminal.clear()?;
             terminal.set_viewport_area(area);
         }
+        let stretch = self.stretch_for(terminal, popup_rows);
+        self.show_popup(terminal, (before, stretched, base_before), stretch)?;
 
         if self.lines.is_empty() {
             return Ok(false);
@@ -173,6 +218,66 @@ impl HistoryQueue {
             self.lines.drain(..batch_len);
         }
         Ok(inserted && !self.lines.is_empty())
+    }
+}
+
+impl HistoryQueue {
+    /// How far to stretch the viewport for `popup_rows` of popup: over the blank rows below it
+    /// first, then over the history above it, always leaving two rows for history to scroll in.
+    fn stretch_for<B>(&self, terminal: &Terminal<B>, popup_rows: u16) -> Stretch
+    where
+        B: Backend<Error = io::Error> + io::Write,
+    {
+        let area = terminal.viewport_area;
+        let screen = terminal.size().map_or(area.bottom(), |size| size.height);
+        let down = popup_rows.min(screen.saturating_sub(area.bottom()));
+        let up = (popup_rows - down).min(area.top().saturating_sub(2));
+        Stretch { up, down }
+    }
+
+    /// Stretch the viewport to `stretch`, having been `before` (when it was `stretched`). When a
+    /// popup shrinks or closes, what it drew and covered is erased and the history it covered is
+    /// written again above the prompt.
+    fn show_popup<B>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        (before, stretched, base_before): (Stretch, ratatui::layout::Rect, ratatui::layout::Rect),
+        stretch: Stretch,
+    ) -> io::Result<()>
+    where
+        B: Backend<Error = io::Error> + io::Write,
+    {
+        let base = terminal.viewport_area;
+        let mut area = base;
+        area.y -= stretch.up;
+        area.height += stretch.up + stretch.down;
+        if stretch == before && base == base_before {
+            terminal.viewport_area = area;
+            self.stretch = stretch;
+            return Ok(());
+        }
+        let uncovered = before.up > stretch.up;
+        if uncovered || (before.down > stretch.down) {
+            // The popup left rows it had drawn on; wipe them, from where the last frame began.
+            terminal.set_viewport_area(stretched);
+            terminal.clear()?;
+            terminal.set_viewport_area(base);
+            if uncovered {
+                crate::insert_history::repaint_owned_history(terminal)?;
+            }
+        }
+        if area != terminal.viewport_area {
+            if stretch == Stretch::default() {
+                terminal.clear()?;
+                terminal.set_viewport_area(area);
+            } else {
+                // The popup draws over what is there, so what is there goes first.
+                terminal.set_viewport_area(area);
+                terminal.clear()?;
+            }
+        }
+        self.stretch = stretch;
+        Ok(())
     }
 }
 
@@ -265,6 +370,79 @@ mod tests {
 
         assert_eq!(terminal.backend().scrollback_rows().len(), before);
         assert_eq!(terminal.viewport_area.height, 2);
+    }
+
+    #[test]
+    fn a_popup_covers_the_screen_and_gives_it_back_when_it_closes() {
+        let mut terminal = terminal_after_a_shell();
+        let mut queue = HistoryQueue::default();
+        queue.write_frame(&mut terminal, 2).expect("frame");
+        queue.push((0..5).map(|n| Line::from(format!("history {n}"))).collect());
+        queue.write_frame(&mut terminal, 2).expect("frame");
+        draw_prompt(&mut terminal);
+        let resting = screen(&terminal);
+        let scrolled = terminal.backend().scrollback_rows().len();
+
+        for _ in 0..3 {
+            queue
+                .write_frame_with_popup(&mut terminal, 6, 4)
+                .expect("frame");
+            draw_prompt(&mut terminal);
+        }
+        assert_eq!(terminal.viewport_area, Rect::new(0, HEIGHT - 6, WIDTH, 6));
+        assert_eq!(terminal.backend().scrollback_rows().len(), scrolled);
+
+        queue
+            .write_frame_with_popup(&mut terminal, 2, 0)
+            .expect("frame");
+        draw_prompt(&mut terminal);
+
+        assert_eq!(terminal.viewport_area, Rect::new(0, HEIGHT - 2, WIDTH, 2));
+        assert_eq!(screen(&terminal), resting);
+        assert_eq!(terminal.backend().scrollback_rows().len(), scrolled);
+    }
+
+    #[test]
+    fn a_popup_that_changes_between_frames_leaves_nothing_of_the_last_one() {
+        let mut terminal = terminal_after_a_shell();
+        let mut queue = HistoryQueue::default();
+        queue.write_frame(&mut terminal, 2).expect("frame");
+        let show = |terminal: &mut Terminal<VT100Backend>, rows: &[&str]| {
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    for (offset, row) in rows.iter().enumerate() {
+                        frame.buffer_mut().set_string(
+                            area.x,
+                            area.y + offset as u16,
+                            row,
+                            ratatui::style::Style::default(),
+                        );
+                    }
+                })
+                .expect("draw");
+        };
+
+        queue
+            .write_frame_with_popup(&mut terminal, 5, 3)
+            .expect("frame");
+        show(
+            &mut terminal,
+            &["> prompt", "Haiku 5.5", "Fastest", "Sonnet 5", "footer"],
+        );
+        queue
+            .write_frame_with_popup(&mut terminal, 5, 3)
+            .expect("frame");
+        show(
+            &mut terminal,
+            &["> prompt", "Opus 4.5", "Best", "Opus 4.8", "footer"],
+        );
+
+        let rows = screen(&terminal);
+        assert_eq!(
+            rows[HEIGHT as usize - 5..],
+            ["> prompt", "Opus 4.5", "Best", "Opus 4.8", "footer"]
+        );
     }
 
     #[test]

@@ -382,6 +382,13 @@ impl Drop for ChatWidget {
     }
 }
 
+impl ChatWidget {
+    /// Rows at the bottom of the viewport that belong to a popup or view that is open.
+    pub(crate) fn popup_rows(&self, width: u16) -> u16 {
+        self.bottom_pane.popup_rows(width)
+    }
+}
+
 impl Renderable for ChatWidget {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         self.as_renderable().render(area, buf);

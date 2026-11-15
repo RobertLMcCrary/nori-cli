@@ -892,6 +892,19 @@ fn agent_command_description(agent_name: &str, recording_enabled: bool) -> Line<
     ])
 }
 
+impl BottomPane {
+    /// Rows of a popup or view that is open, beyond the prompt's own height, which the screen
+    /// shows it over instead of pushing the history away.
+    pub(crate) fn popup_rows(&self, width: u16) -> u16 {
+        match self.active_view() {
+            Some(view) => view
+                .desired_height(width)
+                .saturating_sub(self.composer.desired_height(width)),
+            None => self.composer.popup_rows(width),
+        }
+    }
+}
+
 impl Renderable for BottomPane {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         self.as_renderable().render(area, buf);

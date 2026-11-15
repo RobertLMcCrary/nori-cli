@@ -139,7 +139,8 @@ impl App {
                         .chat_widget
                         .desired_height(screen.width)
                         .min(screen.height.saturating_sub(2).max(1));
-                    tui.draw(viewport_rows, |frame| {
+                    let popup_rows = self.chat_widget.popup_rows(screen.width);
+                    tui.draw(viewport_rows, popup_rows, |frame| {
                         self.chat_widget.render(frame.area(), frame.buffer);
                         if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
                             frame.set_cursor_position((x, y));
@@ -898,6 +899,7 @@ impl App {
                 // This will temporarily show the bottom pane in the viewport
                 tui.draw(
                     self.chat_widget.desired_height(tui.terminal.size()?.width),
+                    0,
                     |frame| {
                         self.chat_widget.render(frame.area(), frame.buffer);
                         if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
