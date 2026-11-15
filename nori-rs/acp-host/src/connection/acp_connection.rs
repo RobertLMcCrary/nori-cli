@@ -1156,7 +1156,23 @@ impl AcpConnection {
                 })))
                 .await;
         }
-        let response = response.context("Failed to set ACP session config option")?;
+        // The agent says why it refused (a rate limit, a model the account lacks) in the error's
+        // data; that is what the user needs to read, not the name of the request.
+        let response = response.map_err(|error| {
+            let detail = error.data.as_ref().and_then(|data| {
+                data.get("details")
+                    .or_else(|| data.get("detail"))
+                    .unwrap_or(data)
+                    .as_str()
+                    .map(str::to_owned)
+            });
+            match detail {
+                Some(detail) => anyhow::anyhow!("{detail}"),
+                None => {
+                    anyhow::Error::new(error).context("Failed to set ACP session config option")
+                }
+            }
+        })?;
 
         if let Ok(mut state) = self.session_config_state.write() {
             state.config_options = response.config_options;
