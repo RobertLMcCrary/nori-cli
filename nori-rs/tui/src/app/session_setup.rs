@@ -167,16 +167,20 @@ impl App {
 
         self.config.active_agent = agent_name.clone();
         self.config.agent = agent_name.clone();
-        if let Err(error) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_agent(&self.config.active_agent)
-            .apply()
-            .await
-        {
-            tracing::error!(%error, "failed to persist the selected agent");
-        }
-
         self.pending_session_activation = Some(PendingSessionActivation::New);
         self.deferred_spawn_pending = false;
+        // The connection only needs the in-memory config, so it starts before
+        // anything else here; the rest of the switch overlaps the adapter's boot.
+        if warm.is_none() {
+            self.begin_agent_preparation(crate::app_event::AgentPrepareIntent::Idle);
+        }
+        // Writing the choice to disk is for the next launch, not this one.
+        let persist = ConfigEditsBuilder::new(&self.config.nori_home).set_agent(&agent_name);
+        tokio::spawn(async move {
+            if let Err(error) = persist.apply().await {
+                tracing::error!(%error, "failed to persist the selected agent");
+            }
+        });
         let (initial_prompt, initial_images) = self.chat_widget.take_initial_input();
         let composer_draft = self.chat_widget.take_composer_draft();
         self.shutdown_current_conversation();
@@ -195,12 +199,9 @@ impl App {
             format!("Started new conversation with agent: {display_name}"),
             None,
         );
-        match warm {
-            Some(agent) => {
-                self.prepared_agent = Some(agent);
-                self.app_event_tx.send(AppEvent::NewSession);
-            }
-            None => self.begin_agent_preparation(crate::app_event::AgentPrepareIntent::Idle),
+        if let Some(agent) = warm {
+            self.prepared_agent = Some(agent);
+            self.app_event_tx.send(AppEvent::NewSession);
         }
         tui.frame_requester().schedule_frame();
     }

@@ -217,7 +217,7 @@ async fn send_session_started(
         return Ok(());
     }
 
-    let client = reqwest13::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(REQUEST_DEADLINE)
         .build()?;
     let token = match fresh_id_token(&auth) {
@@ -295,7 +295,7 @@ fn fresh_id_token(auth: &AuthSection) -> Option<&str> {
 }
 
 async fn refresh_id_token(
-    client: &reqwest13::Client,
+    client: &reqwest::Client,
     refresh_token: &str,
     endpoint: &str,
 ) -> anyhow::Result<String> {
@@ -385,7 +385,7 @@ mod tests {
                 .expect("write token response");
         });
 
-        let client = reqwest13::Client::new();
+        let client = reqwest::Client::new();
         let token = refresh_id_token(&client, "refresh-value", &endpoint)
             .await
             .expect("refresh ID token");

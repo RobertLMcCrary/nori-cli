@@ -65,8 +65,10 @@ impl TranscriptRecorder {
         cli_version: &str,
         acp_session_id: Option<String>,
     ) -> io::Result<Self> {
-        // Compute project ID from cwd
-        let project_id_info = compute_project_id(cwd).await?;
+        // Both only need the cwd, and each waits on git, so they run together.
+        let (project_id_info, git_info) =
+            tokio::join!(compute_project_id(cwd), collect_git_info(cwd));
+        let project_id_info = project_id_info?;
 
         // Create session ID (UUID)
         let session_id = generate_session_id();
@@ -102,9 +104,6 @@ impl TranscriptRecorder {
 
         // Create channel and spawn writer task
         let (tx, rx) = mpsc::channel::<TranscriptCmd>(256);
-
-        // Collect git info for session metadata
-        let git_info = collect_git_info(cwd).await;
 
         // Create session metadata
         let session_meta = SessionMetaEntry {

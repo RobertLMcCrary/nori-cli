@@ -184,6 +184,12 @@ impl AcpBackend {
         if let Some(server) = nori_client_server {
             server.commit(&goal_mcp_http_server).await;
         }
+        // Counting the history file does not depend on the session, so it
+        // runs while the agent creates one.
+        let history_task = tokio::spawn({
+            let nori_home = config.nori_home.clone();
+            async move { crate::message_history::history_metadata(&nori_home).await }
+        });
         let session_result = connection.create_session(&cwd, mcp_servers).await;
         let setup_forward_result =
             forward_setup_events_through_response(&mut event_rx, &backend_event_tx).await;
@@ -229,8 +235,7 @@ impl AcpBackend {
         let (approval_policy_tx, approval_policy_rx) = watch::channel(config.approval_policy);
 
         // Get history metadata
-        let (history_log_id, history_entry_count) =
-            crate::message_history::history_metadata(&config.nori_home).await;
+        let (history_log_id, history_entry_count) = history_task.await.unwrap_or_default();
 
         // Initialize transcript recorder (non-fatal if it fails).
         // A child keeps no transcript of its own: its parent's shows what it did.

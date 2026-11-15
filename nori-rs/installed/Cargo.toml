@@ -18,11 +18,7 @@ anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 dirs = { workspace = true }
 nori-harness = { workspace = true }
-reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = [
-    "form",
-    "json",
-    "rustls",
-] }
+reqwest = { workspace = true, features = ["json"] }
 semver = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
