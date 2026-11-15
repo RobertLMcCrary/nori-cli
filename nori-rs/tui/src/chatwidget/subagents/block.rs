@@ -40,6 +40,8 @@ pub(crate) struct SubagentBlock<'a> {
     pub(crate) now: Instant,
     /// Terminal rows, or zero when unknown (no cap).
     pub(crate) screen_rows: u16,
+    /// Esc stops these subagents, because the agent that started them is idle: say so.
+    pub(crate) stoppable: bool,
 }
 
 impl SubagentBlock<'_> {
@@ -136,6 +138,9 @@ impl SubagentBlock<'_> {
         }
         if shown.len() < total {
             lines.push(Line::from(format!("  +{} more running", total - shown.len())).dim());
+        }
+        if self.stoppable {
+            lines.push(Line::from("  esc to stop subagents").dim());
         }
         lines
     }

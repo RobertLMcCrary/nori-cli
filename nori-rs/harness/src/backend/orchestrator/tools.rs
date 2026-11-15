@@ -29,8 +29,11 @@ pub(crate) const INSTRUCTIONS: &str = "Delegated tasks: `delegate_task` runs a t
 
 /// `agent_capabilities` re-reads agents whose entry is older than this...
 const CAPABILITIES_FRESH_FOR: Duration = Duration::from_secs(120);
-/// ...waiting at most this long before answering with what it has.
+/// ...waiting at most this long for an agent Nori has never read...
 const CAPABILITIES_WAIT: Duration = Duration::from_secs(20);
+/// ...and this long when every agent was read before, answering with that if the agents are
+/// slow; the refresh goes on in the background.
+const CAPABILITIES_STALE_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -123,9 +126,21 @@ impl NoriClientService {
     )]
     async fn agent_capabilities(&self) -> Result<CallToolResult, McpError> {
         let inner = self.orchestrator().inner();
+        let never_read = crate::registry::list_available_agents()
+            .into_iter()
+            .filter(|agent| agent.is_installed)
+            .any(|agent| {
+                super::catalog::remembered(&inner.seed.config.nori_home, &agent.agent_name)
+                    .refreshed_at
+                    == 0
+            });
         // Re-read agents not read in the last two minutes, for as long as an answer can wait.
         let _ = tokio::time::timeout(
-            CAPABILITIES_WAIT,
+            if never_read {
+                CAPABILITIES_WAIT
+            } else {
+                CAPABILITIES_STALE_WAIT
+            },
             super::probe::refresh(
                 Arc::clone(&inner.seed.config),
                 inner.seed.cli_version.clone(),

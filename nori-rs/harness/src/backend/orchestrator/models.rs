@@ -140,6 +140,90 @@ pub(super) fn current_model(options: &[acp::SessionConfigOption]) -> Option<Stri
     )
 }
 
+/// Choose `requested` from the models the agent advertises, by value or by name. An agent that
+/// lists none but was given the model at spawn (`injected`) runs that one.
+pub(super) async fn select_model(
+    harness: &crate::runtime::HarnessHandle,
+    options: &[acp::SessionConfigOption],
+    requested: &str,
+    injected: bool,
+) -> Result<String, String> {
+    let Some(models) = Models::of(options) else {
+        if injected {
+            return Ok(requested.trim().to_owned());
+        }
+        return Err(format!(
+            "this agent does not let Nori choose its model, so `{requested}` cannot be selected; \
+             delegate without `model`"
+        ));
+    };
+    // A model forced at spawn that the agent runs, though it does not list it, is the choice.
+    if models.current.eq_ignore_ascii_case(requested.trim()) {
+        return Ok(current_model(options).unwrap_or_else(|| requested.to_owned()));
+    }
+    let Some(choice) = models.find(requested) else {
+        return Err(format!(
+            "this agent has no model `{requested}`; it offers: {}",
+            models.describe()
+        ));
+    };
+    if choice.value != models.current {
+        harness
+            .set_session_config_option(models.config_id.clone(), choice.value.clone())
+            .await
+            .map_err(|error| format!("the agent refused model `{}`: {error:#}", choice.value))?;
+    }
+    Ok(choice.name.clone())
+}
+
+/// Set the other settings a task asks for, each by setting id or name and by value or name.
+pub(super) async fn apply_options(
+    harness: &crate::runtime::HarnessHandle,
+    advertised: &[acp::SessionConfigOption],
+    requested: &[(String, String)],
+    may_set_mode: bool,
+) -> Result<(), String> {
+    for (setting, value) in requested {
+        let is_mode = advertised.iter().any(|option| {
+            option.category == Some(acp::SessionConfigOptionCategory::Mode)
+                && Models::named(std::slice::from_ref(option), setting).is_some()
+        });
+        if is_mode && !may_set_mode {
+            return Err(format!(
+                "`{setting}` is the agent's permission mode, and you run with approvals, so a \
+                 child cannot be given another"
+            ));
+        }
+        let Some(choices) = Models::named(advertised, setting) else {
+            let known: Vec<String> = Models::settings(advertised)
+                .into_iter()
+                .map(|setting| format!("`{}`", setting.config_id))
+                .collect();
+            return Err(format!(
+                "this agent has no setting `{setting}`; its settings are {}",
+                if known.is_empty() {
+                    "none".to_owned()
+                } else {
+                    known.join(", ")
+                }
+            ));
+        };
+        let Some(choice) = choices.find(value) else {
+            return Err(format!(
+                "`{setting}` has no value `{value}`; it takes {}",
+                choices.describe()
+            ));
+        };
+        if choice.value != choices.current {
+            harness
+                .set_session_config_option(choices.config_id.clone(), choice.value.clone())
+                .await
+                .map_err(|error| format!("the agent refused {setting} `{value}`: {error:#}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

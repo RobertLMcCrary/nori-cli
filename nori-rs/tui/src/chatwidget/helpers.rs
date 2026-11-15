@@ -551,6 +551,7 @@ impl ChatWidget {
                     tree: &self.subagents,
                     now: std::time::Instant::now(),
                     screen_rows: self.screen_rows.get(),
+                    stoppable: self.subagents_stoppable(),
                 }))
                 .inset(Insets::tlbr(1, 0, 0, 0)),
             );

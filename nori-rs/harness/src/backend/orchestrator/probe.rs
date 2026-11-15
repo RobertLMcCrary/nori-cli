@@ -3,9 +3,9 @@
 //!
 //! A probe is a bare session: no hooks, no MCP servers, no transcript. Each agent has at most
 //! one probe at a time, and an agent whose entry is fresh enough is left alone, so asking often
-//! costs nothing.
+//! costs nothing. Asking while a probe runs waits for that probe instead of starting another.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use nori_protocol::NoriEvent;
 use nori_protocol::SessionEvent;
+use tokio::sync::watch;
 
 use super::Seed;
 
@@ -22,11 +23,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Agents probed at once.
 const PARALLEL_PROBES: usize = 3;
 
-/// Agents with a probe running.
-static PROBING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+/// Agents with a probe running, each with what turns true when it ends.
+static PROBING: LazyLock<Mutex<HashMap<String, watch::Receiver<bool>>>> =
+    LazyLock::new(Default::default);
 
 /// Probe every installed agent whose catalog entry is older than `fresh_for`. Returns when they
-/// have all answered or given up; the caller decides how long to wait for that.
+/// have all answered or given up, including probes that were running already; the caller decides
+/// how long to wait for that.
 pub(crate) async fn refresh(
     config: Arc<crate::config::NoriConfig>,
     cli_version: String,
@@ -42,13 +45,14 @@ pub(crate) async fn refresh(
             let refreshed_at = super::catalog::remembered(&config.nori_home, agent).refreshed_at;
             now - refreshed_at >= fresh_for.as_secs() as i64
         })
-        .filter(|agent| {
-            PROBING
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(agent.clone())
-        })
         .map(|agent| {
+            let mut probing = PROBING.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(running) = probing.get(&agent) {
+                return running.clone();
+            }
+            let (ended_tx, ended) = watch::channel(false);
+            probing.insert(agent.clone(), ended.clone());
+            drop(probing);
             let config = Arc::clone(&config);
             let cli_version = cli_version.clone();
             let permits = Arc::clone(&permits);
@@ -65,7 +69,13 @@ pub(crate) async fn refresh(
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&agent);
-            })
+                let _ = ended_tx.send(true);
+            });
+            ended
+        })
+        .map(|mut ended| async move {
+            // A probe that was dropped without saying so has ended too.
+            let _ = ended.wait_for(|ended| *ended).await;
         });
     futures::future::join_all(probes).await;
 }

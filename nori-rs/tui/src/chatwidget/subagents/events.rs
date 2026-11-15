@@ -125,6 +125,18 @@ impl ChatWidget {
         }
     }
 
+    /// Whether Esc stops the running subagents: they run on while the agent that started them is
+    /// idle, so there is no turn for Esc to interrupt instead.
+    pub(crate) fn subagents_stoppable(&self) -> bool {
+        self.subagents.has_running() && !self.bottom_pane.is_task_running()
+    }
+
+    /// Stop the subagents that run while the agent is idle, as stopping the agent would.
+    pub(crate) fn stop_background_subagents(&mut self) {
+        self.submit_harness_action(crate::app_event::HarnessAction::Cancel);
+        self.add_info_message("Stopping the subagents".to_owned(), None);
+    }
+
     /// The suffix the status line carries while children run.
     pub(in crate::chatwidget) fn subagent_status_suffix(&self) -> String {
         match self.subagents_running_shown {

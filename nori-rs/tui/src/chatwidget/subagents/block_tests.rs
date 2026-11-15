@@ -58,6 +58,7 @@ fn render(tree: &SubagentTree, now: Instant, width: u16, screen_rows: u16) -> St
         tree,
         now,
         screen_rows,
+        stoppable: false,
     }
     .lines(width)
     .iter()

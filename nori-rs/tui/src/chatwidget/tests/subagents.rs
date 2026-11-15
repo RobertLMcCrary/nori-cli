@@ -69,6 +69,7 @@ fn block_lines(chat: &ChatWidget, width: u16) -> Vec<String> {
             tree: &chat.subagents,
             now: Instant::now(),
             screen_rows: 0,
+            stoppable: chat.subagents_stoppable(),
         }
         .lines(width),
     )
@@ -245,5 +246,39 @@ fn a_childs_permission_request_names_the_child() {
     assert_eq!(
         chat.subagent_label_for(&acp::SessionId::new("04953aff-63b8-4f90-a3e5-da4b0c353046")),
         None
+    );
+}
+
+#[test]
+fn subagents_left_running_by_an_idle_agent_can_be_stopped_with_esc() {
+    let (root, events) = replay_events("claude_subagents.jsonl");
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    chat.subagents.set_root(acp::SessionId::new(root));
+    let both_running = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Acp(AcpEvent::ChildNotification(_))))
+        .expect("a child update");
+    for event in events[..both_running].iter().cloned() {
+        chat.handle_session_event(generation, event);
+    }
+
+    // While the agent works, Esc interrupts its turn, and the block says nothing of it.
+    chat.bottom_pane.set_task_running(true);
+    assert!(!chat.subagents_stoppable());
+    let working = block_lines(&chat, 80);
+    assert!(
+        !working.iter().any(|line| line.contains("esc to stop")),
+        "{working:#?}"
+    );
+
+    // Once its turn is over the subagents run on, and Esc is what stops them.
+    chat.bottom_pane.set_task_running(false);
+    assert!(chat.subagents_stoppable());
+    let idle = block_lines(&chat, 80);
+    assert_eq!(
+        idle.last().map(String::as_str),
+        Some("  esc to stop subagents"),
+        "{idle:#?}"
     );
 }

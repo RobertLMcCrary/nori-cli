@@ -413,10 +413,15 @@ the same `nori-client` server: `agent_capabilities`, `delegate_task`,
   by probes (`orchestrator/probe.rs`): an installed agent is started in a
   bare session (no hooks, MCP servers, or transcript), its advertised options
   are read, and it is stopped. `agent_capabilities` re-reads agents not read in
-  two minutes, waiting up to 20 seconds, and reports each entry's age. The TUI
+  two minutes and reports each entry's age. It waits up to 20 seconds when an
+  installed agent has never been read, and otherwise 3 seconds, answering with
+  the previous reading while the refresh finishes in the background. The TUI
   calls `refresh_agent_catalog` when the user starts typing, which re-reads
   agents not read in ten minutes in the background. Each agent has at most one
-  probe at a time and three run at once.
+  probe at a time, a refresh waits for a probe already running instead of
+  skipping it, and three run at once. `delegate_task` rejects a model before
+  starting the agent only when a reading under ten minutes old lacks it; with
+  an older reading the started session decides.
 - **Progress.** While a task runs, its snapshot carries the child's latest tool
   call or line of text and its tool-call count. Once it ends, the snapshot
   lists the files the child's edit tools changed. Results that come in within

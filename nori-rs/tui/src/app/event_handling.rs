@@ -2089,7 +2089,13 @@ impl App {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             } => {
-                if self.should_handle_backtrack_esc(key_event) {
+                if self.should_handle_backtrack_esc(key_event)
+                    && self.chat_widget.subagents_stoppable()
+                {
+                    // Work still running comes before editing what was said.
+                    self.reset_backtrack_state();
+                    self.chat_widget.stop_background_subagents();
+                } else if self.should_handle_backtrack_esc(key_event) {
                     self.handle_backtrack_esc_key(tui);
                 } else {
                     self.chat_widget.handle_key_event(key_event);

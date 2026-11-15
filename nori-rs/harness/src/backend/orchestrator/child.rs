@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::Weak;
 use std::time::Duration;
 
-use nori_protocol::AcpEvent;
 use nori_protocol::NoriEvent;
 use nori_protocol::SessionEvent;
 use nori_protocol::SessionPhase;
@@ -23,6 +22,8 @@ use super::task::MAX_RESULT_BYTES;
 use super::task::TaskEnd;
 use super::task::TaskId;
 use crate::runtime::HarnessHandle;
+
+mod relay;
 
 /// How long an agent may take to start and open a session before the task fails. Agents that
 /// install themselves on first use (npx, uvx) need the margin.
@@ -109,7 +110,7 @@ pub(super) async fn launch(
         .is_ok_and(|agent| agent.supports_model_injection());
     let model = match model {
         Some(requested) => {
-            match select_model(
+            match super::models::select_model(
                 &session.handle,
                 &started.config_options,
                 requested,
@@ -129,7 +130,7 @@ pub(super) async fn launch(
     // A permission mode can only be set when the parent runs without approvals, so a child is
     // never given one broader than its parent's.
     let may_set_mode = spec_approval_policy == nori_config::AskForApproval::Never;
-    if let Err(error) = apply_options(
+    if let Err(error) = super::models::apply_options(
         &session.handle,
         &started.config_options,
         options,
@@ -153,90 +154,6 @@ pub(super) async fn launch(
         turns_rx,
     ));
     Ok(Launched { child, model })
-}
-
-/// Choose `requested` from the models the agent advertises, by value or by name. An agent that
-/// lists none but was given the model at spawn (`injected`) runs that one.
-async fn select_model(
-    harness: &HarnessHandle,
-    options: &[acp::SessionConfigOption],
-    requested: &str,
-    injected: bool,
-) -> Result<String, String> {
-    let Some(models) = super::models::Models::of(options) else {
-        if injected {
-            return Ok(requested.trim().to_owned());
-        }
-        return Err(format!(
-            "this agent does not let Nori choose its model, so `{requested}` cannot be selected; \
-             delegate without `model`"
-        ));
-    };
-    // A model forced at spawn that the agent runs, though it does not list it, is the choice.
-    if models.current.eq_ignore_ascii_case(requested.trim()) {
-        return Ok(super::models::current_model(options).unwrap_or_else(|| requested.to_owned()));
-    }
-    let Some(choice) = models.find(requested) else {
-        return Err(format!(
-            "this agent has no model `{requested}`; it offers: {}",
-            models.describe()
-        ));
-    };
-    if choice.value != models.current {
-        harness
-            .set_session_config_option(models.config_id.clone(), choice.value.clone())
-            .await
-            .map_err(|error| format!("the agent refused model `{}`: {error:#}", choice.value))?;
-    }
-    Ok(choice.name.clone())
-}
-
-/// Set the other settings a task asks for, each by setting id or name and by value or name.
-async fn apply_options(
-    harness: &HarnessHandle,
-    advertised: &[acp::SessionConfigOption],
-    requested: &[(String, String)],
-    may_set_mode: bool,
-) -> Result<(), String> {
-    for (setting, value) in requested {
-        let is_mode = advertised.iter().any(|option| {
-            option.category == Some(acp::SessionConfigOptionCategory::Mode)
-                && super::models::Models::named(std::slice::from_ref(option), setting).is_some()
-        });
-        if is_mode && !may_set_mode {
-            return Err(format!(
-                "`{setting}` is the agent's permission mode, and you run with approvals, so a \
-                 child cannot be given another"
-            ));
-        }
-        let Some(choices) = super::models::Models::named(advertised, setting) else {
-            let known: Vec<String> = super::models::Models::settings(advertised)
-                .into_iter()
-                .map(|setting| format!("`{}`", setting.config_id))
-                .collect();
-            return Err(format!(
-                "this agent has no setting `{setting}`; its settings are {}",
-                if known.is_empty() {
-                    "none".to_owned()
-                } else {
-                    known.join(", ")
-                }
-            ));
-        };
-        let Some(choice) = choices.find(value) else {
-            return Err(format!(
-                "`{setting}` has no value `{value}`; it takes {}",
-                choices.describe()
-            ));
-        };
-        if choice.value != choices.current {
-            harness
-                .set_session_config_option(choices.config_id.clone(), choice.value.clone())
-                .await
-                .map_err(|error| format!("the agent refused {setting} `{value}`: {error:#}"))?;
-        }
-    }
-    Ok(())
 }
 
 /// The text a turn ends with: what the child said after its last tool call, or, when it said
@@ -386,7 +303,7 @@ async fn run_actor(
                     }
                 }
                 let view = active.as_ref().map(|active| active.view_id.clone()).or_else(|| last_view.clone());
-                let Some(end) = relay(&orchestrator, &harness, &child_session, view.as_ref(), active.as_mut(), event).await else {
+                let Some(end) = relay::relay(&orchestrator, &harness, &child_session, view.as_ref(), active.as_mut(), event).await else {
                     continue;
                 };
                 if matches!(end, TaskEnd::Completed { .. }) && !delegations.is_empty() {
@@ -430,201 +347,6 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 fn completed() -> TaskEnd {
     TaskEnd::Completed {
         stop_reason: acp::StopReason::EndTurn,
-    }
-}
-
-/// Pass one child event on to the parent. Returns how the active turn ended, when this event
-/// ended it.
-async fn relay(
-    orchestrator: &Arc<Inner>,
-    harness: &HarnessHandle,
-    child_session: &acp::SessionId,
-    view: Option<&acp::SessionId>,
-    active: Option<&mut Active>,
-    event: SessionEvent,
-) -> Option<TaskEnd> {
-    match event {
-        SessionEvent::Acp(AcpEvent::Notification(acp::AgentNotification::SessionNotification(
-            mut notification,
-        ))) => {
-            if let Some(active) = active {
-                match &notification.update {
-                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk {
-                        content: acp::ContentBlock::Text(text),
-                        ..
-                    }) => {
-                        active.text.push(&text.text);
-                        if let (Some(line), Ok(mut progress)) =
-                            (active.text.last_line(), active.progress.lock())
-                        {
-                            progress.activity = line;
-                        }
-                    }
-                    acp::SessionUpdate::ToolCall(call) => {
-                        active.text.tool();
-                        if let Ok(mut progress) = active.progress.lock() {
-                            progress.tool_calls += 1;
-                            progress.activity = call.title.chars().take(160).collect();
-                            note_changes(&mut progress, call.kind, &call.content, &call.locations);
-                        }
-                    }
-                    acp::SessionUpdate::ToolCallUpdate(update) => {
-                        active.text.tool();
-                        if let Ok(mut progress) = active.progress.lock() {
-                            note_changes(
-                                &mut progress,
-                                update.fields.kind.unwrap_or(acp::ToolKind::Other),
-                                update.fields.content.as_deref().unwrap_or_default(),
-                                update.fields.locations.as_deref().unwrap_or_default(),
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let view = view?;
-            notification.session_id = view.clone();
-            orchestrator
-                .emit(SessionEvent::Acp(AcpEvent::ChildNotification(notification)))
-                .await;
-            None
-        }
-        // The child's own subagents are the parent's grandchildren; nested deeper they keep their
-        // own ids, which are unique already.
-        SessionEvent::Acp(AcpEvent::ChildNotification(notification)) => {
-            orchestrator
-                .emit(SessionEvent::Acp(AcpEvent::ChildNotification(notification)))
-                .await;
-            None
-        }
-        SessionEvent::Nori(NoriEvent::Subagent(mut wire)) => {
-            if let Some(view) = view {
-                retarget(&mut wire, child_session, view);
-            }
-            orchestrator
-                .emit(SessionEvent::Nori(NoriEvent::Subagent(wire)))
-                .await;
-            None
-        }
-        SessionEvent::Acp(AcpEvent::Request {
-            request_id,
-            request,
-        }) => {
-            let task = active.map(|active| active.task.clone());
-            orchestrator
-                .relay_request(harness, task, view.cloned(), request_id, request)
-                .await;
-            None
-        }
-        SessionEvent::Acp(AcpEvent::Response {
-            request_id,
-            response,
-        }) => {
-            let active = active?;
-            if request_id != active.request_id {
-                return None;
-            }
-            Some(match response {
-                Ok(acp::AgentResponse::PromptResponse(response)) => {
-                    match response.stop_reason {
-                        // A cancel Nori asked for has ended the task already; this one the child
-                        // chose, and the parent must hear of it.
-                        acp::StopReason::Cancelled => TaskEnd::Failed {
-                            error: "the child stopped before finishing".to_owned(),
-                        },
-                        stop_reason => TaskEnd::Completed { stop_reason },
-                    }
-                }
-                Ok(_) => TaskEnd::Completed {
-                    stop_reason: acp::StopReason::EndTurn,
-                },
-                Err(error) => TaskEnd::Failed {
-                    error: error.message,
-                },
-            })
-        }
-        SessionEvent::Nori(NoriEvent::RequestFailed(failure)) => {
-            let active = active?;
-            (failure.request_id.as_ref() == Some(&active.request_id)).then_some(TaskEnd::Failed {
-                error: failure.message,
-            })
-        }
-        SessionEvent::Nori(NoriEvent::SessionEnded(ended)) => {
-            active.map(|_| TaskEnd::Failed {
-                error: ended
-                    .message
-                    .unwrap_or_else(|| "the child's session ended".to_owned()),
-            })
-        }
-        SessionEvent::Acp(AcpEvent::Notification(_))
-        | SessionEvent::Nori(
-            NoriEvent::SessionStarted(_)
-            | NoriEvent::SessionPhaseChanged(_)
-            | NoriEvent::QueueChanged(_)
-            | NoriEvent::ReplayStarted(_)
-            | NoriEvent::ReplayFinished
-            | NoriEvent::ContextCompacted(_)
-            | NoriEvent::SessionForked(_)
-            | NoriEvent::GoalChanged(_)
-            | NoriEvent::CapabilitiesChanged(_)
-            | NoriEvent::Undo(_)
-            | NoriEvent::UserShell(_)
-            | NoriEvent::HookOutput(_)
-            | NoriEvent::PromptSummaryUpdated(_)
-            | NoriEvent::Notice(_)
-            // Results the child's own tasks handed to it are the child's business.
-            | NoriEvent::TaskResultsDelivered(_)
-            // The child's requests reach the parent relayed, with ids of the parent's own.
-            | NoriEvent::RequestWithdrawn(_),
-        ) => None,
-    }
-}
-
-/// Record the files a tool call changes: those its diffs are of, and the places an edit, delete,
-/// or move names.
-fn note_changes(
-    progress: &mut super::task::Progress,
-    kind: acp::ToolKind,
-    content: &[acp::ToolCallContent],
-    locations: &[acp::ToolCallLocation],
-) {
-    let diffs = content.iter().filter_map(|content| match content {
-        acp::ToolCallContent::Diff(diff) => Some(diff.path.display().to_string()),
-        _ => None,
-    });
-    let edited = matches!(
-        kind,
-        acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move
-    );
-    let places = locations
-        .iter()
-        .filter(|_| edited)
-        .map(|location| location.path.display().to_string());
-    for path in diffs.chain(places) {
-        if !progress.files_changed.contains(&path) {
-            progress.files_changed.push(path);
-        }
-    }
-}
-
-/// Re-parent the child's own subagent traffic onto the task's view of the child.
-fn retarget(wire: &mut SubagentWire, child_session: &acp::SessionId, view: &acp::SessionId) {
-    let swap = |id: &mut acp::SessionId| {
-        if id == child_session {
-            *id = view.clone();
-        }
-    };
-    match wire {
-        SubagentWire::Update(update) => swap(&mut update.parent_session_id),
-        SubagentWire::Message(message) => {
-            swap(&mut message.session_id);
-            if let Some(sender) = message.sender_session_id.as_mut() {
-                swap(sender);
-            }
-            if let Some(recipient) = message.recipient_session_id.as_mut() {
-                swap(recipient);
-            }
-        }
     }
 }
 

@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use nori_protocol::SubagentState;
 use nori_protocol::acp::v1 as acp;
-use serde::Serialize;
 
 use super::ChildKey;
 use super::ChildSlot;
@@ -83,56 +82,8 @@ pub(super) struct Delegation {
     pub(super) options: Vec<(String, String)>,
 }
 
-/// The agents a session can delegate to, for `agent_capabilities`.
-#[derive(Debug, Serialize)]
-pub(super) struct Capabilities {
-    pub(super) can_delegate: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) reason: Option<String>,
-    pub(super) depth: i64,
-    pub(super) max_depth: i64,
-    pub(super) running_tasks: i64,
-    pub(super) max_running_tasks: i64,
-    pub(super) agents: Vec<AgentEntry>,
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct AgentEntry {
-    /// The value to pass as `agent`.
-    pub(super) agent: String,
-    pub(super) name: String,
-    /// The agent this session runs on.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub(super) is_yours: bool,
-    /// The model a child gets when `model` is not given, when Nori is configured with one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) default_model: Option<String>,
-    /// Models the agent offered when Nori last ran it; empty when it has not run yet. Any model
-    /// it offers can be passed; an unknown one fails with the list.
-    pub(super) models: Vec<ModelEntry>,
-    /// How long ago, in seconds, Nori last read what the agent offers; absent when it never has.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) read_seconds_ago: Option<i64>,
-    /// The agent's other settings that `options` can set, with their values.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(super) settings: Vec<SettingEntry>,
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct ModelEntry {
-    pub(super) model: String,
-    pub(super) name: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct SettingEntry {
-    pub(super) setting: String,
-    pub(super) name: String,
-    pub(super) values: Vec<String>,
-}
-
 impl Inner {
-    fn delegation_refusal(&self) -> Option<String> {
+    pub(super) fn delegation_refusal(&self) -> Option<String> {
         if self.seed.depth >= MAX_DEPTH {
             return Some(format!(
                 "this session is a delegated task {} levels deep, the most there can be; do the \
@@ -152,49 +103,6 @@ impl Inner {
             return Err(busy(running));
         }
         Ok(())
-    }
-
-    pub(super) fn capabilities(&self) -> Capabilities {
-        let refusal = self.delegation_refusal();
-        let config = &self.seed.config;
-        let agents = crate::registry::list_available_agents()
-            .into_iter()
-            .filter(|agent| agent.is_installed)
-            .map(|agent| AgentEntry {
-                models: offered_models(&config.nori_home, &agent.agent_name),
-                read_seconds_ago: Some(
-                    super::catalog::remembered(&config.nori_home, &agent.agent_name).refreshed_at,
-                )
-                .filter(|refreshed_at| *refreshed_at > 0)
-                .map(|refreshed_at| super::catalog::now_seconds() - refreshed_at),
-                settings: super::catalog::remembered(&config.nori_home, &agent.agent_name)
-                    .settings
-                    .into_iter()
-                    .map(|setting| SettingEntry {
-                        setting: setting.id,
-                        name: setting.name,
-                        values: setting
-                            .values
-                            .into_iter()
-                            .map(|value| value.value)
-                            .collect(),
-                    })
-                    .collect(),
-                default_model: config.default_models.get(&agent.agent_name).cloned(),
-                is_yours: agent.agent_name == config.active_agent,
-                name: agent.display_name,
-                agent: agent.agent_name,
-            })
-            .collect();
-        Capabilities {
-            can_delegate: refusal.is_none(),
-            reason: refusal,
-            depth: self.seed.depth,
-            max_depth: MAX_DEPTH,
-            running_tasks: self.seed.tree.running.load(Ordering::Acquire),
-            max_running_tasks: MAX_RUNNING_TASKS,
-            agents,
-        }
     }
 
     /// Start a task on a new child.
@@ -241,12 +149,16 @@ impl Inner {
         let injects_model = crate::registry::get_agent_config(&agent_info.agent_name)
             .is_ok_and(|agent| agent.supports_model_injection());
         // A model the agent is known not to offer, and cannot be forced to run, fails before an
-        // agent is started for it.
+        // agent is started for it. Known from a recent reading only: a model the agent has added
+        // since is the started session's to accept.
         if let Some(model) = &delegation.model {
-            let offered =
-                super::catalog::remembered(&self.seed.config.nori_home, &agent_info.agent_name)
-                    .models;
-            if !injects_model
+            let remembered =
+                super::catalog::remembered(&self.seed.config.nori_home, &agent_info.agent_name);
+            let recent = super::catalog::now_seconds() - remembered.refreshed_at
+                < super::CATALOG_FRESH_FOR.as_secs() as i64;
+            let offered = remembered.models;
+            if recent
+                && !injects_model
                 && !offered.is_empty()
                 && super::models::find(&offered, model).is_none()
             {
@@ -527,30 +439,6 @@ impl Inner {
                 .await;
         }
     }
-}
-
-/// The models `agent` offered when it last ran, then any others Nori knows it can be given.
-fn offered_models(home: &std::path::Path, agent: &str) -> Vec<ModelEntry> {
-    let mut models: Vec<ModelEntry> = super::catalog::remembered(home, agent)
-        .models
-        .into_iter()
-        .map(|model| ModelEntry {
-            model: model.value,
-            name: model.name,
-        })
-        .collect();
-    let known = crate::registry::AgentKind::from_slug(agent)
-        .map(crate::registry::AgentKind::other_models)
-        .unwrap_or_default();
-    for other in known {
-        if !models.iter().any(|model| model.model == other.id) {
-            models.push(ModelEntry {
-                model: other.id.to_owned(),
-                name: other.label.to_owned(),
-            });
-        }
-    }
-    models
 }
 
 fn busy(running: i64) -> String {

@@ -631,7 +631,10 @@ one summary cell in the scrollback, with its full detail in the transcript
 overlay. The live block above the composer shows a header and an activity row
 per running child, capped at a third of the screen with a `+N more` row; a
 frame visits only the rows it shows. Permission requests from a child carry
-its label.
+its label. Delegated tasks run on after the turn that started them ends; while
+the agent is idle and children still run, the block ends with "esc to stop
+subagents", and Esc (with an empty composer) cancels them, taking precedence
+over Esc-Esc to edit the previous message.
 
 Tasks an agent delegates through Nori's own task tools are shown the same
 way: each task is a subagent labelled with its title and its agent and model

@@ -237,6 +237,7 @@ fn a_frame_costs_the_rows_that_changed_not_the_updates_that_arrived() {
             tree,
             now: base,
             screen_rows: 0,
+            stoppable: false,
         }
         .lines(80)
         .len()

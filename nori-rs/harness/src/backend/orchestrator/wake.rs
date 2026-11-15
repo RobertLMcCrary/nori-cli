@@ -1,6 +1,18 @@
 //! The completion wake: how finished tasks reach a parent that is not waiting on them.
 
+use std::time::Duration;
+use std::time::Instant;
+
+use super::Inner;
+use super::MAX_RETURNED_BYTES;
+use super::MAX_WAIT;
+use super::Orchestrator;
+use super::WakeTurn;
+use super::task::Delivery;
+use super::task::TaskId;
+use super::task::TaskRecord;
 use super::task::TaskSnapshot;
+use super::task::Wake;
 
 /// Results are inlined in a wake until together they reach this size; the rest are named, to be
 /// read with `task_status`.
@@ -77,6 +89,106 @@ fn escape(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;")
+}
+
+impl Orchestrator {
+    /// A completion wake, if results are owed: every owed result is marked delivered.
+    pub(crate) async fn take_wake(&self) -> Option<WakeTurn> {
+        let mut state = self.inner.state.lock().await;
+        let owed: Vec<&mut TaskRecord> = state
+            .tasks
+            .iter_mut()
+            .filter(|task| task.status.is_ended() && task.delivery == Delivery::Owed)
+            .filter(|task| task.wake == Wake::Always)
+            .collect();
+        if owed.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let text = wake_text(owed.iter().map(|task| task.snapshot(now)));
+        let tasks = owed
+            .into_iter()
+            .map(|task| {
+                task.delivery = Delivery::Delivered;
+                nori_protocol::DeliveredTask {
+                    task_id: task.id.to_string(),
+                    title: task.title.clone(),
+                    agent: task.agent_name.clone(),
+                }
+            })
+            .collect();
+        Some(WakeTurn {
+            text,
+            delivered: nori_protocol::TaskResultsDelivered { tasks },
+        })
+    }
+}
+
+impl Inner {
+    /// Wait until every task in `ids` has ended or `timeout` passes, then report them. Ended
+    /// tasks are delivered by this; those still running will wake the parent when they end.
+    pub(super) async fn wait(
+        &self,
+        ids: &[TaskId],
+        timeout: Duration,
+    ) -> Result<Vec<TaskSnapshot>, String> {
+        let deadline = tokio::time::Instant::now() + timeout.min(MAX_WAIT);
+        let mut changed = self.changed.subscribe();
+        {
+            // Whatever happens to this call, a task it was waiting on is not lost: it wakes the
+            // parent unless this call returns its result.
+            let mut state = self.state.lock().await;
+            for id in ids {
+                let task = state
+                    .tasks
+                    .iter_mut()
+                    .find(|task| &task.id == id)
+                    .ok_or_else(|| format!("there is no task `{id}`"))?;
+                task.wake = Wake::Always;
+            }
+        }
+        loop {
+            // A child waiting for the user's approval cannot finish until the user answers, so
+            // the waiter hears of it now.
+            let settled = {
+                let state = self.state.lock().await;
+                let waited = || state.tasks.iter().filter(|task| ids.contains(&task.id));
+                waited().all(|task| task.status.is_ended())
+                    || waited().any(|task| task.awaiting_approval)
+            };
+            if settled
+                || tokio::time::timeout_at(deadline, changed.changed())
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        let mut snapshots = Vec::with_capacity(ids.len());
+        let mut returned = 0;
+        for id in ids {
+            if let Some(task) = state.tasks.iter_mut().find(|task| &task.id == id) {
+                let mut snapshot = task.snapshot(now);
+                let size = snapshot.result.as_ref().map_or(0, String::len);
+                if task.status.is_ended() && returned + size > MAX_RETURNED_BYTES {
+                    // Too much for one answer; it stays owed, to be read with task_status.
+                    snapshot.result = None;
+                    snapshot.next = Some(READ_SEPARATELY);
+                } else if task.status.is_ended() {
+                    returned += size;
+                    if task.delivery == Delivery::Owed {
+                        task.delivery = Delivery::Delivered;
+                    }
+                } else {
+                    snapshot.next = Some(STILL_RUNNING);
+                }
+                snapshots.push(snapshot);
+            }
+        }
+        Ok(snapshots)
+    }
 }
 
 #[cfg(test)]
