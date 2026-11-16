@@ -285,6 +285,15 @@ pub fn extract_tool_info(name: &str, input: &serde_json::Value, cwd: Option<&Pat
             ToolInfo::new(title, kind).with_location(path)
         }
 
+        // Claude Code loading deferred tools: a search, as far as the user is concerned
+        "ToolSearch" => ToolInfo::new("ToolSearch".to_string(), ToolKind::Search),
+
+        // Nori's own tools, named as Nori names them
+        name if crate::mcp::host_tool_name(name).is_some() => ToolInfo::new(
+            crate::mcp::host_tool_name(name).unwrap_or(name).to_string(),
+            ToolKind::Other,
+        ),
+
         // MCP tools (format: mcp__server__tool)
         // Note: mcp__acp__* tools are already handled above via strip_acp_prefix
         name if name.starts_with("mcp__") && !name.starts_with(ACP_TOOL_PREFIX) => {
@@ -440,6 +449,15 @@ mod tests {
 
         assert_eq!(info.kind, ToolKind::Other);
         assert!(info.title.contains("custom_tool"));
+    }
+
+    #[test]
+    fn nori_host_tools_are_titled_by_their_own_name() {
+        let info = extract_tool_info("mcp__nori__git_commit", &json!({}), None);
+        assert_eq!(
+            (info.title.as_str(), info.kind),
+            ("git_commit", ToolKind::Other)
+        );
     }
 
     #[test]

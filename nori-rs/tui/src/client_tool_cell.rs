@@ -458,6 +458,12 @@ impl ClientToolCell {
                 spans.push(" ".into());
             }
             spans.push(style(detail.text, detail.tone));
+            spans.extend(
+                detail
+                    .suffix
+                    .into_iter()
+                    .map(|part| style(part.text, part.tone)),
+            );
             lines.push(Line::from(spans));
         }
         lines
@@ -2786,6 +2792,38 @@ mod tests {
             lines[0].ends_with("Committing 1 file  feat(math): add sub"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn git_diff_reads_as_files_with_their_line_counts() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,2 @@\n-old\n+new\n+more\ndiff --git a/notes.md b/notes.md\n--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1 @@\n+hello\n";
+        let cell = ClientToolCell::new(
+            native_snapshot(
+                "mcp__nori-client__git_diff",
+                serde_json::json!({}),
+                ToolPhase::Completed,
+                Some(diff),
+            ),
+            PathBuf::from("/tmp/test-cwd"),
+            false,
+        );
+        insta::assert_snapshot!(render_lines(&cell.display_lines(80)).join("\n"));
+    }
+
+    #[test]
+    fn git_log_reads_as_the_recent_commits() {
+        let log = r#"{"branch":"perf/instant-core","commits":[{"id":"87057b7961de821e","summary":"docs: brief for host-provided tools"},{"id":"24371e4d0000aaaa","summary":"feat(claude): offer mode and model as config options"},{"id":"3b8cb9320000bbbb","summary":"feat(codex): update the embedded Codex to rust-v0.169.0"}]}"#;
+        let cell = ClientToolCell::new(
+            native_snapshot(
+                "mcp__nori-client__git_log",
+                serde_json::json!({"limit": 3}),
+                ToolPhase::Completed,
+                Some(log),
+            ),
+            PathBuf::from("/tmp/test-cwd"),
+            false,
+        );
+        insta::assert_snapshot!(render_lines(&cell.display_lines(80)).join("\n"));
     }
 
     #[test]

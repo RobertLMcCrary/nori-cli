@@ -16,20 +16,39 @@ fn register_claude() {
         "claude",
         Arc::new(|spec, pipe| {
             Box::pin(async move {
-                let mut options = claude_code_acp::InProcessOptions::default();
-                for pair in &spec.config {
-                    match pair.split_once('=') {
-                        Some(("cli_path", path)) => options.cli_path = Some(path.into()),
-                        Some(("model", model)) => options.model = Some(model.to_owned()),
-                        _ => {}
-                    }
-                }
-                claude_code_acp::serve_in_process(pipe, options)
+                claude_code_acp::serve_in_process(pipe, claude_options(&spec))
                     .await
                     .map_err(std::io::Error::other)
             })
         }),
     );
+    // Claude Code takes about a second to start, so a session is started before it is needed.
+    nori_acp_host::in_process::register_in_process_prewarm(
+        "claude",
+        Arc::new(|spec, cwd, mcp_servers| {
+            claude_code_acp::prewarm(claude_options(&spec), cwd, mcp_servers);
+        }),
+    );
+}
+
+/// The driver's options for `spec`. Sessions get Nori's own tools directly, with no MCP server
+/// between them.
+#[cfg(feature = "native-claude")]
+fn claude_options(
+    spec: &nori_acp_host::in_process::InProcessSpec,
+) -> claude_code_acp::InProcessOptions {
+    let mut options = claude_code_acp::InProcessOptions {
+        host_tools: true,
+        ..Default::default()
+    };
+    for pair in &spec.config {
+        match pair.split_once('=') {
+            Some(("cli_path", path)) => options.cli_path = Some(path.into()),
+            Some(("model", model)) => options.model = Some(model.to_owned()),
+            _ => {}
+        }
+    }
+    options
 }
 
 #[cfg(feature = "native-codex")]
@@ -47,6 +66,7 @@ fn register_codex() {
                         config_overrides: spec.config,
                         codex_linux_sandbox_exe: None,
                         ignore_host_config: true,
+                        host_tools: true,
                     },
                 )
                 .await

@@ -23,7 +23,25 @@ impl AcpBackend {
                 prompt_text
             });
 
-        if prompt_text.is_empty() && content.is_empty() {
+        // Inline workflow clauses are for Nori, not the agent: the text goes on without them.
+        let (workflow_text, workflow_rules) = self.workflow_for_prompt(&prompt_text).await;
+        let (prompt_text, content) = if workflow_text == prompt_text {
+            (prompt_text, content)
+        } else {
+            let mut rest: Vec<acp::ContentBlock> = content
+                .into_iter()
+                .filter(|block| !matches!(block, acp::ContentBlock::Text(_)))
+                .collect();
+            if !workflow_text.trim().is_empty() {
+                rest.insert(
+                    0,
+                    acp::ContentBlock::Text(acp::TextContent::new(workflow_text.clone())),
+                );
+            }
+            (workflow_text, rest)
+        };
+
+        if prompt_text.trim().is_empty() && content.is_empty() {
             return Ok(());
         }
 
@@ -118,6 +136,10 @@ impl AcpBackend {
         let prompt_with_goal_context = self
             .prepend_goal_context_to_prompt(prompt_with_context)
             .await;
+        let prompt_with_goal_context = match workflow_rules {
+            Some(rules) => format!("{rules}\n\n{prompt_with_goal_context}"),
+            None => prompt_with_goal_context,
+        };
 
         // A compaction, fork, or resume leaves a checkpoint for the first prompt to open with.
         let pending_checkpoint = self.pending_compact_summary.lock().await.take();

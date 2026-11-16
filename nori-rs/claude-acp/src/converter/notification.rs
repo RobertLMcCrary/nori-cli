@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use claude_code_agent_sdk::{
     AssistantMessage, ContentBlock as SdkContentBlock, ImageBlock, ImageSource, Message,
-    ResultMessage, StreamEvent, ToolResultBlock, ToolResultContent, ToolUseBlock,
+    ResultMessage, StreamEvent, ToolResultBlock, ToolResultContent, ToolUseBlock, UserMessage,
 };
 use dashmap::DashMap;
 use regex::Regex;
@@ -172,10 +172,7 @@ impl NotificationConverter {
                 // System messages are typically internal, not sent as notifications
                 vec![]
             }
-            Message::User(_) => {
-                // User messages are echoed back, usually not needed
-                vec![]
-            }
+            Message::User(user) => self.convert_user_message(user, &sid),
             Message::ControlCancelRequest(_) => {
                 // Internal control messages
                 vec![]
@@ -194,6 +191,32 @@ impl NotificationConverter {
         );
 
         notifications
+    }
+
+    /// Convert a user message: Claude Code returns every tool's output in one, as `tool_result`
+    /// blocks, so this is where tool calls finish. Anything else in it is the CLI echoing input.
+    fn convert_user_message(
+        &self,
+        user: &UserMessage,
+        session_id: &SessionId,
+    ) -> Vec<SessionNotification> {
+        // The stream-json form keeps the blocks under `message.content`; the top-level field is
+        // for messages the SDK built itself.
+        let blocks = user.content.clone().or_else(|| {
+            user.extra
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(|content| serde_json::from_value(content.clone()).ok())
+        });
+        blocks
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|block| match block {
+                SdkContentBlock::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .flat_map(|result| self.make_tool_result(session_id, result))
+            .collect()
     }
 
     /// Convert an assistant message
@@ -636,6 +659,11 @@ impl NotificationConverter {
             .status(ToolCallStatus::InProgress) // Tool is being executed
             .raw_input(tool_use.input.clone());
 
+        // Nori's own tools say which they are, so the client need not parse the title.
+        if let Some(host_tool) = crate::mcp::host_tool_name(&tool_use.name) {
+            tool_call = tool_call.meta(nori_host_tools::tool_call_meta(host_tool));
+        }
+
         // Add locations if present
         if let Some(ref locations) = tool_info.locations
             && !locations.is_empty()
@@ -991,6 +1019,71 @@ mod tests {
         if let SessionUpdate::ToolCall(tool_call) = &notification.update {
             assert_eq!(tool_call.tool_call_id.0.as_ref(), "tool_456");
         }
+    }
+
+    #[test]
+    fn a_tool_result_in_a_user_message_finishes_the_call() {
+        let converter = NotificationConverter::new();
+        let session_id = SessionId::new("s");
+        let tool_use = ToolUseBlock {
+            id: "toolu_1".to_string(),
+            name: "mcp__nori__git_status".to_string(),
+            input: json!({}),
+        };
+        converter.cache_tool_use(&tool_use);
+        // As the CLI writes it in stream-json.
+        let message: Message = serde_json::from_value(json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "{\"branch\":\"main\",\"changes\":[]}",
+                    "is_error": false
+                }]
+            },
+            "parent_tool_use_id": null,
+            "session_id": "abc"
+        }))
+        .expect("a user message");
+        let notifications = converter.convert_message(&message, "s");
+        let [notification] = notifications.as_slice() else {
+            panic!("one update: {notifications:?}");
+        };
+        let SessionUpdate::ToolCallUpdate(update) = &notification.update else {
+            panic!("a tool call update");
+        };
+        assert_eq!(update.tool_call_id.0.as_ref(), "toolu_1");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+
+        // A plain echo of the user's text finishes nothing.
+        let echo: Message = serde_json::from_value(json!({
+            "type": "user",
+            "message": {"role": "user", "content": "hello"},
+            "session_id": "abc"
+        }))
+        .expect("an echo");
+        assert_eq!(converter.convert_message(&echo, &session_id.0).len(), 0);
+    }
+
+    #[test]
+    fn a_host_tool_call_carries_its_name_in_meta() {
+        let converter = NotificationConverter::new();
+        let tool_use = ToolUseBlock {
+            id: "tool_1".to_string(),
+            name: "mcp__nori__git_status".to_string(),
+            input: json!({}),
+        };
+        let notification = converter.make_tool_call(&SessionId::new("s"), &tool_use);
+        let SessionUpdate::ToolCall(tool_call) = notification.update else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(tool_call.title, "git_status");
+        assert_eq!(
+            nori_host_tools::host_tool_of(tool_call.meta.as_ref()),
+            Some("git_status")
+        );
     }
 
     #[test]

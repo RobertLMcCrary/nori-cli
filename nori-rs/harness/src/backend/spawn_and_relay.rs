@@ -191,7 +191,12 @@ impl AcpBackend {
             let nori_home = config.nori_home.clone();
             async move { crate::message_history::history_metadata(&nori_home).await }
         });
+        // The user's session goes first; other agents warm up behind it.
+        let prewarm_servers = (!config.delegation.is_child()).then(|| mcp_servers.clone());
         let session_result = connection.create_session(&cwd, mcp_servers).await;
+        if let Some(servers) = prewarm_servers {
+            prewarm::others(config.agent.clone(), cwd.clone(), &servers);
+        }
         let setup_forward_result =
             forward_setup_events_through_response(&mut event_rx, &backend_event_tx).await;
         let session_id = match session_result {
@@ -305,6 +310,7 @@ impl AcpBackend {
             notify_after_idle: config.notify_after_idle,
             edit_journal: Arc::new(EditJournal::new()),
             is_first_prompt: Arc::new(Mutex::new(true)),
+            workflow: Arc::default(),
             prompt_summary_enabled: config.prompt_summary_enabled,
             agent_name: config.agent.clone(),
             cli_version: config.cli_version.clone(),
@@ -329,6 +335,7 @@ impl AcpBackend {
             relay_task_abort: Arc::new(Mutex::new(None)),
             orchestrator,
         };
+        backend.load_workflow();
 
         let runtime_backend = backend.clone();
         let runtime_task = tokio::spawn(async move {

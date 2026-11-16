@@ -12,6 +12,11 @@ backend-owned MCP server named `nori-client`, served as streamable HTTP on
 `127.0.0.1`, so they can call `get_goal`, `create_goal`, and `update_goal`
 against the same state the TUI uses.
 
+Agents built into Nori's own process do not get this server. They get the same
+tools as host tools, called directly; see [host-tools.md](host-tools.md).
+Everything below about goals, capabilities and the connected gate applies to
+them too, with "initialized `nori-client`" read as "has the session".
+
 Nori's built-in Codex launch disables Codex-native goals through the ACP
 adapter configuration. For that launch, only `nori-client` controls Nori thread
 goals; similarly named native or unqualified tools must not be used for this
@@ -65,14 +70,14 @@ The agent should be able to discover this context through MCP list/read/get
 requests. Nori may include short MCP server instructions that point agents
 toward the resources and prompts. Its first ordinary user prompt still receives
 the shared source envelope. When active goal context is present, that envelope
-also states that Nori CLI owns the goal and routes reads and updates to the
-`nori-client` MCP server:
+also states that Nori CLI owns the goal and routes reads and updates to Nori's
+goal tools:
 
 ```text
 <context>
 Source: this message is from Nori CLI.
 
-When <goal_context> is present, Nori CLI is its authoritative owner. Do not use native or unqualified goal tools. Read it with `get_goal` from the `nori-client` MCP server, and update it with `update_goal` from the `nori-client` MCP server.
+When <goal_context> is present, Nori CLI owns the goal. Use only Nori's goal tools: read it with `get_goal` and update it with `update_goal`.
 </context>
 ```
 
@@ -110,10 +115,11 @@ not available, goal automation should be unavailable as behavior, not merely
 dimmed as UI — unless the agent advertises the `_session/goal` extension
 described below.
 
-When the requested work is verified complete, the agent must call
-`update_goal` from the `nori-client` MCP server with the exact status `complete`
-and verify the returned status. A genuine impasse uses the
-exact status `blocked` through the same server.
+When the requested work is verified complete, the agent must call Nori's
+`update_goal` with the exact status `complete` and verify the returned status.
+A genuine impasse uses the exact status `blocked`. The instruction text names
+the tools without a server, because a built-in agent reaches them as host
+tools.
 
 ## Goal Extension Bridge (`_session/goal`)
 

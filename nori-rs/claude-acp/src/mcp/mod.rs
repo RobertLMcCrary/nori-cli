@@ -14,6 +14,11 @@
 //! The `external` module provides support for connecting to external MCP servers
 //! to extend tool capabilities.
 //!
+//! ## Session tools
+//!
+//! The `session_tools` module hands the client's MCP servers to the CLI and, when Nori runs this
+//! driver in its own process, Nori's host tools as an in-process server.
+//!
 //! ## ACP Integration
 //!
 //! The `acp_server` module provides an MCP server that integrates with the ACP
@@ -23,10 +28,12 @@ mod acp_server;
 mod external;
 mod registry;
 mod server;
+mod session_tools;
 pub mod tools;
 
 pub use acp_server::{AcpMcpServer, get_disallowed_tools};
 pub use external::{ExternalMcpError, ExternalMcpManager, ExternalMcpServer};
 pub use registry::{ACP_TOOL_PREFIX, ToolContext, ToolRegistry, ToolResult, ToolStatus};
 pub use server::McpServer;
+pub use session_tools::{HostToolsBinding, SessionTools, host_tool_name, host_tool_prefix};
 pub use tools::Tool;

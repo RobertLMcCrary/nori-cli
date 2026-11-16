@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 mod delegation;
+mod native_history;
 mod native_tool;
 
 pub use delegation::DelegationCall;
@@ -633,7 +634,7 @@ impl PlanStatus {
 
 fn is_generic_tool_call(tool_call: &acp::ToolCall) -> bool {
     // Nori's own tools have a view of their own, so even a bare call is shown.
-    NativeCall::recognize(&tool_call.title, None).is_none()
+    nori_invocation(tool_call).is_none()
         && tool_call.raw_input.is_none()
         && tool_call.locations.is_empty()
         && tool_call.content.is_empty()
@@ -676,14 +677,8 @@ fn refine_edit_kind(kind: ToolKind, raw_input: &Option<serde_json::Value>) -> To
 
 fn tool_snapshot_from_tool_call(tool_call: &acp::ToolCall, phase: ToolPhase) -> ToolSnapshot {
     let artifacts = artifacts_from_tool_call(tool_call);
-    let invocation = match DelegationCall::recognize(&tool_call.title, tool_call.raw_input.as_ref())
-    {
-        Some(call) => Some(Invocation::Delegation(call)),
-        None => match NativeCall::recognize(&tool_call.title, tool_call.raw_input.as_ref()) {
-            Some(call) => Some(Invocation::Native(call)),
-            None => invocation_from_tool_call(tool_call, &artifacts),
-        },
-    };
+    let invocation =
+        nori_invocation(tool_call).or_else(|| invocation_from_tool_call(tool_call, &artifacts));
 
     ToolSnapshot {
         call_id: tool_call.tool_call_id.to_string(),
@@ -704,6 +699,20 @@ fn tool_snapshot_from_tool_call(tool_call: &acp::ToolCall, phase: ToolPhase) -> 
         raw_output: tool_call.raw_output.clone(),
         owner_request_id: None,
     }
+}
+
+/// A call to one of Nori's own tools: named in its `_meta` by an agent built into Nori, or
+/// recognized from its title when it came through the `nori-client` MCP server.
+fn nori_invocation(tool_call: &acp::ToolCall) -> Option<Invocation> {
+    let input = tool_call.raw_input.as_ref();
+    if let Some(tool) = nori_host_tools::host_tool_of(tool_call.meta.as_ref()) {
+        return DelegationCall::from_tool(tool, input)
+            .map(Invocation::Delegation)
+            .or_else(|| NativeCall::from_tool(tool, input).map(Invocation::Native));
+    }
+    DelegationCall::recognize(&tool_call.title, input)
+        .map(Invocation::Delegation)
+        .or_else(|| NativeCall::recognize(&tool_call.title, input).map(Invocation::Native))
 }
 
 fn invocation_from_tool_call(
@@ -878,7 +887,15 @@ fn structured_invocation_from_tool_call(tool_call: &acp::ToolCall) -> Option<Inv
                 .or_else(|| raw_input.get("query"))
                 .or_else(|| raw_input.get("glob"))
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
+                .map(|query| match query.strip_prefix("select:") {
+                    // An agent loading tools by name (`select:mcp__server__tool,...`): the names.
+                    Some(names) => names
+                        .split(',')
+                        .map(|name| name.trim().rsplit("__").next().unwrap_or(name))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    None => query.to_string(),
+                });
 
             if path.is_none()
                 && (parsed_command_is_listing(raw_input) || parsed_command_is_search(raw_input))
@@ -1290,6 +1307,45 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn a_host_tool_is_known_by_its_meta_whatever_its_title() {
+        let call = |title: &str, meta: Option<serde_json::Map<String, serde_json::Value>>| {
+            let mut tool_call = acp::ToolCall::new("call-1", title)
+                .raw_input(serde_json::json!({"paths": ["src/a.rs"]}));
+            tool_call.meta = meta;
+            nori_invocation(&tool_call)
+        };
+        assert_eq!(
+            call(
+                "git_diff",
+                Some(nori_host_tools::tool_call_meta("git_diff"))
+            ),
+            Some(Invocation::Native(NativeCall::GitDiff {
+                paths: vec!["src/a.rs".to_owned()]
+            }))
+        );
+        assert_eq!(
+            call(
+                "Tool: anything",
+                Some(nori_host_tools::tool_call_meta("task_list"))
+            ),
+            Some(Invocation::Delegation(DelegationCall::List))
+        );
+        // Without the meta, a bare name is not enough: it must come from `nori-client`.
+        assert_eq!(call("git_diff", None), None);
+        assert_eq!(
+            call("mcp__nori-client__git_diff", None),
+            Some(Invocation::Native(NativeCall::GitDiff {
+                paths: vec!["src/a.rs".to_owned()]
+            }))
+        );
+        // A name Nori does not have is left to the generic path.
+        assert_eq!(
+            call("x", Some(nori_host_tools::tool_call_meta("rm_rf"))),
+            None
+        );
+    }
 
     #[test]
     fn resources_say_whether_they_are_markdown() {

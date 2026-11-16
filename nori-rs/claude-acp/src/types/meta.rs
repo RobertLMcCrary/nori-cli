@@ -179,6 +179,14 @@ impl NewSessionMeta {
         }
     }
 
+    /// Whether nothing here changes how the CLI starts, so a session started ahead of time fits.
+    pub fn is_plain(&self) -> bool {
+        self.system_prompt.is_none()
+            && self.claude_code.is_none()
+            && !self.disable_built_in_tools
+            && !self.fork_session
+    }
+
     /// Get the text to append to the system prompt, if any
     pub fn get_system_prompt_append(&self) -> Option<&str> {
         self.system_prompt.as_ref()?.append.as_deref()

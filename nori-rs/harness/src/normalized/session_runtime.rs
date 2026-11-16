@@ -190,6 +190,8 @@ pub enum QueuedPromptKind {
     GoalContinuation,
     /// Results of delegated tasks, handed to the agent once it is idle.
     TaskResults,
+    /// A prompt the session's workflow hooks to what the last turn did.
+    WorkflowHook,
 }
 
 /// A user prompt waiting to be sent to ACP.

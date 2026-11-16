@@ -67,6 +67,22 @@ pub struct CodexAgent {
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>,
     /// Session working directories for filesystem sandboxing
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
+    /// Whether this agent runs inside its host's process and so can take the host's tools.
+    host_tools: bool,
+}
+
+/// `options` with the host's tools as dynamic tools and their instructions as the thread's.
+fn with_host_tools(
+    mut options: StartThreadOptions,
+    tools: Option<&Arc<dyn nori_host_tools::HostTools>>,
+) -> StartThreadOptions {
+    if let Some(tools) = tools {
+        options.dynamic_tools = crate::host_tools::dynamic_tools(tools.as_ref());
+        options.thread_instructions_provider = Some(Arc::new(crate::host_tools::HostInstructions(
+            Arc::clone(tools),
+        )));
+    }
+    options
 }
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
@@ -77,6 +93,7 @@ impl CodexAgent {
     pub async fn new(
         config: Config,
         codex_linux_sandbox_exe: Option<PathBuf>,
+        host_tools: bool,
     ) -> std::io::Result<Self> {
         let auth_manager =
             AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
@@ -142,6 +159,7 @@ impl CodexAgent {
             thread_manager,
             thread_store,
             state_db,
+            host_tools,
             sessions: Arc::default(),
             session_roots,
         })
@@ -360,6 +378,18 @@ impl CodexAgent {
         Ok(())
     }
 
+    /// The host's tools a session request's `_meta` names, when this agent can take them.
+    fn host_tools(
+        &self,
+        meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<Arc<dyn nori_host_tools::HostTools>> {
+        if self.host_tools {
+            nori_host_tools::from_session_meta(meta)
+        } else {
+            None
+        }
+    }
+
     /// Build a session config from base config, working directory, and MCP servers.
     /// This is shared between `new_session` and `load_session`.
     fn build_session_config(
@@ -507,10 +537,15 @@ impl CodexAgent {
             auth_methods.remove(0);
         }
 
+        let mut meta = serde_json::Map::new();
+        if self.host_tools {
+            nori_host_tools::advertise(&mut meta);
+        }
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
             .agent_info(Implementation::new("codex-acp", env!("CARGO_PKG_VERSION")).title("Codex"))
-            .auth_methods(auth_methods))
+            .auth_methods(auth_methods)
+            .meta((!meta.is_empty()).then_some(meta)))
     }
 
     async fn authenticate(
@@ -601,21 +636,25 @@ impl CodexAgent {
         self.check_auth().await?;
 
         let NewSessionRequest {
-            cwd, mcp_servers, ..
+            cwd,
+            mcp_servers,
+            meta,
+            ..
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
         let config = self.build_session_config(&cwd, mcp_servers)?;
         let num_mcp_servers = config.mcp_servers.len();
+        let host_tools = self.host_tools(meta.as_ref());
 
         let NewThread {
             thread_id,
             thread,
             session_configured: _,
-        } = Box::pin(
-            self.thread_manager
-                .start_thread(StartThreadOptions::new(config.clone())),
-        )
+        } = Box::pin(self.thread_manager.start_thread(with_host_tools(
+            StartThreadOptions::new(config.clone()),
+            host_tools.as_ref(),
+        )))
         .await
         .map_err(|_e| Error::internal_error())?;
 
@@ -635,6 +674,7 @@ impl CodexAgent {
             )),
             self.client_capabilities.clone(),
             config.clone(),
+            host_tools,
             cx,
         ));
         let load = thread.load().await?;
@@ -664,10 +704,12 @@ impl CodexAgent {
             session_id,
             cwd,
             mcp_servers,
+            meta,
             ..
         } = request;
 
-        self.restore_session(session_id, cwd, mcp_servers, cx, true)
+        let host_tools = self.host_tools(meta.as_ref());
+        self.restore_session(session_id, cwd, mcp_servers, host_tools, cx, true)
             .await
     }
 
@@ -684,11 +726,13 @@ impl CodexAgent {
             session_id,
             cwd,
             mcp_servers,
+            meta,
             ..
         } = request;
 
+        let host_tools = self.host_tools(meta.as_ref());
         let load = self
-            .restore_session(session_id, cwd, mcp_servers, cx, false)
+            .restore_session(session_id, cwd, mcp_servers, host_tools, cx, false)
             .await?;
 
         Ok(ResumeSessionResponse::new()
@@ -701,6 +745,7 @@ impl CodexAgent {
         session_id: SessionId,
         cwd: PathBuf,
         mcp_servers: Vec<McpServer>,
+        host_tools: Option<Arc<dyn nori_host_tools::HostTools>>,
         cx: ConnectionTo<Client>,
         replay_history: bool,
     ) -> Result<LoadSessionResponse, Error> {
@@ -728,17 +773,20 @@ impl CodexAgent {
 
         let config = self.build_session_config(&cwd, mcp_servers)?;
 
+        // As `resume_thread_with_history` does, plus the host's tools: a cold resume must be given
+        // them, and their instructions, again.
         let NewThread {
             thread_id: _,
             thread,
             session_configured: _,
-        } = Box::pin(self.thread_manager.resume_thread_with_history(
-            config.clone(),
-            history,
-            self.auth_manager.clone(),
-            None,
-            ClientMcpExtensions::default(),
-        ))
+        } = Box::pin(self.thread_manager.start_thread(with_host_tools(
+            StartThreadOptions {
+                initial_history: history,
+                client_mcp_extensions: ClientMcpExtensions::default(),
+                ..StartThreadOptions::new(config.clone())
+            },
+            host_tools.as_ref(),
+        )))
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
@@ -752,6 +800,7 @@ impl CodexAgent {
             )),
             self.client_capabilities.clone(),
             config.clone(),
+            host_tools,
             cx,
         ));
 

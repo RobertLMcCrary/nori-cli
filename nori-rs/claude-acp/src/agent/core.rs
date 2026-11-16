@@ -25,6 +25,8 @@ pub struct ClaudeAcpAgent {
     sessions: Arc<SessionManager>,
     /// Prompt manager for tracking and cancelling active prompts
     prompt_manager: Arc<PromptManager>,
+    /// Whether this agent runs inside its host's process and so can take the host's tools.
+    host_tools: bool,
 }
 
 impl ClaudeAcpAgent {
@@ -50,6 +52,7 @@ impl ClaudeAcpAgent {
             config,
             sessions: Arc::new(SessionManager::new()),
             prompt_manager: Arc::new(PromptManager::new()),
+            host_tools: false,
         }
     }
 
@@ -59,7 +62,20 @@ impl ClaudeAcpAgent {
             config,
             sessions: Arc::new(SessionManager::new()),
             prompt_manager: Arc::new(PromptManager::new()),
+            host_tools: false,
         }
+    }
+
+    /// Take the host's tools: only for an agent running inside the host's own process, where a
+    /// session's host-tools token can be resolved.
+    pub fn with_host_tools(mut self) -> Self {
+        self.host_tools = true;
+        self
+    }
+
+    /// Whether this agent takes the host's tools.
+    pub fn takes_host_tools(&self) -> bool {
+        self.host_tools
     }
 
     /// Get the agent configuration

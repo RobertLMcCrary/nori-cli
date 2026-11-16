@@ -12,4 +12,6 @@ mod runner;
 mod slash_commands;
 
 pub use core::ClaudeAcpAgent;
-pub use runner::{InProcessOptions, run_acp, run_acp_with_cli, serve_in_process, shutdown_otel};
+pub use runner::{
+    InProcessOptions, prewarm, run_acp, run_acp_with_cli, serve_in_process, shutdown_otel,
+};

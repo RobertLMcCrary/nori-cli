@@ -59,6 +59,7 @@ use task::TaskSnapshot;
 use task::TaskStatus;
 use task::Wake;
 pub(crate) use tools::INSTRUCTIONS as TASK_INSTRUCTIONS;
+pub(crate) use tools::always_load;
 
 /// Tasks running at once across a whole tree of delegations.
 const MAX_RUNNING_TASKS: i64 = 8;
@@ -207,6 +208,42 @@ impl Orchestrator {
             },
             signals_rx,
         )
+    }
+
+    /// Whether this is a delegated child's session, which works to its parent's task.
+    pub(crate) fn is_child(&self) -> bool {
+        self.inner.seed.is_child()
+    }
+
+    /// Whether the user trusts the session's project, so its own scripts may run.
+    pub(crate) fn project_trusted(&self) -> bool {
+        self.inner.seed.config.active_project.trust_level == Some(nori_config::TrustLevel::Trusted)
+    }
+
+    /// Hand `task` to `agent` (on `model`) in the background, as a delegation of this session's:
+    /// how a workflow's commit agent writes the commits while the session's agent goes on.
+    pub(crate) async fn delegate_background(
+        &self,
+        title: String,
+        task: String,
+        agent: String,
+        model: Option<String>,
+    ) -> Result<(), String> {
+        self.inner
+            .delegate(launch::Delegation {
+                task,
+                agent: Some(agent),
+                model,
+                title: Some(title),
+                role: Some(launch::Role::Implementation),
+                isolation: launch::Isolation::Shared,
+                mode: launch::Mode::Background,
+                timeout: None,
+                client_request_id: None,
+                options: Vec::new(),
+            })
+            .await
+            .map(drop)
     }
 
     /// Bind the parent session once it exists, and again when `/compact` replaces it.

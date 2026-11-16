@@ -34,13 +34,22 @@ impl AcpBackend {
             &self.mcp_servers,
             self.mcp_oauth_credentials_store_mode,
         );
-        let previous_goal_mcp_connected = {
+        let (previous_goal_mcp_connected, host_tools) = {
             let goal_mcp_http_server = self.goal_mcp_http_server.lock().await;
-            if let Some(server) = goal_mcp_http_server.as_ref() {
-                mcp_servers.push(server.as_mcp_server());
-                Some(self.goal_mcp_connected.swap(false, Ordering::Relaxed))
-            } else {
-                None
+            match goal_mcp_http_server.as_ref() {
+                // The new session reconnects to the MCP server, which marks it connected again.
+                Some(nori_client_mcp::NoriClient::Mcp(server)) => {
+                    mcp_servers.push(server.as_mcp_server());
+                    (
+                        Some(self.goal_mcp_connected.swap(false, Ordering::Relaxed)),
+                        false,
+                    )
+                }
+                // The connection hands host tools to every session it opens.
+                Some(nori_client_mcp::NoriClient::Host { .. }) => {
+                    (Some(self.goal_mcp_connected.load(Ordering::Relaxed)), true)
+                }
+                None => (None, false),
             }
         };
         let pending_nori_client_server = if previous_goal_mcp_connected.is_some() {
@@ -64,7 +73,11 @@ impl AcpBackend {
                 }
             }
         };
-        let nori_client_advertised = mcp_servers.iter().any(|server| {
+        let nori_client_advertised = host_tools
+            || pending_nori_client_server
+                .as_ref()
+                .is_some_and(nori_client_mcp::PendingNoriClientServer::is_host)
+            || mcp_servers.iter().any(|server| {
             matches!(
                 server,
                 acp::McpServer::Http(acp::McpServerHttp { name, .. })

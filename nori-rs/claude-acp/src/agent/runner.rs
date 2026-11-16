@@ -369,20 +369,32 @@ pub async fn serve_in_process(
     pipe: tokio::io::DuplexStream,
     options: InProcessOptions,
 ) -> Result<(), sacp::Error> {
-    let project_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut config = AgentConfig::from_settings_or_env(&project_dir);
-    config.cli_path = options.cli_path;
-    if let Some(model) = options.model {
-        config.model = Some(model);
-    }
+    let config = options.config();
     let (reader, writer) = tokio::io::split(pipe);
-    Box::pin(serve_over(
-        reader,
-        writer,
-        ClaudeAcpAgent::with_config(config),
-        false,
-    ))
-    .await
+    let agent = ClaudeAcpAgent::with_config(config);
+    let agent = if options.host_tools {
+        agent.with_host_tools()
+    } else {
+        agent
+    };
+    Box::pin(serve_over(reader, writer, agent, false)).await
+}
+
+/// Start a Claude session for `cwd` ahead of time, so the first new session a later in-process
+/// connection opens there finds its CLI already running (see [`crate::session::warm`]). A host
+/// calls this for an agent the user may switch to; the driver keeps one warm after that by
+/// itself. `mcp_servers` are the client's MCP servers as ACP sends them in `session/new`; with
+/// `options.host_tools` the host must have published its tool catalog first.
+pub fn prewarm(options: InProcessOptions, cwd: std::path::PathBuf, mcp_servers: serde_json::Value) {
+    let tools = crate::mcp::SessionTools {
+        mcp_servers: serde_json::from_value(mcp_servers).unwrap_or_default(),
+        host_tools: options
+            .host_tools
+            .then(|| Arc::new(crate::mcp::HostToolsBinding::default())),
+    };
+    let config = options.config();
+    let key = crate::session::warm::WarmKey::new(&cwd, &config, &tools);
+    crate::session::warm::refill(key, cwd, config, tools.mcp_servers);
 }
 
 /// What an in-process Claude driver is started with. Passed explicitly because a host runs
@@ -393,6 +405,22 @@ pub struct InProcessOptions {
     pub cli_path: Option<std::path::PathBuf>,
     /// The model to start with; unset, the CLI's own default.
     pub model: Option<String>,
+    /// Whether the host hands sessions its own tools (see `nori_host_tools`). Only a host in the
+    /// same process can.
+    pub host_tools: bool,
+}
+
+impl InProcessOptions {
+    /// The driver's configuration: the user's settings and environment, with these on top.
+    fn config(&self) -> AgentConfig {
+        let project_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut config = AgentConfig::from_settings_or_env(&project_dir);
+        config.cli_path.clone_from(&self.cli_path);
+        if let Some(model) = &self.model {
+            config.model = Some(model.clone());
+        }
+        config
+    }
 }
 
 /// The server, over any byte streams. With `reap_leftovers` it also stops every process still
@@ -463,6 +491,7 @@ where
     let agent_create_start = std::time::Instant::now();
     let config = Arc::new(agent.config().clone());
     let sessions = agent.sessions().clone();
+    let host_tools = agent.takes_host_tools();
     let prompt_manager = agent.prompt_manager().clone();
     let agent_create_elapsed = agent_create_start.elapsed();
 
@@ -496,7 +525,12 @@ where
                             "Received initialize request (protocol version: {})",
                             protocol_version
                         );
-                        let response = handlers::handle_initialize(request, &config);
+                        let mut response = handlers::handle_initialize(request, &config);
+                        if host_tools {
+                            let mut meta = response.meta.take().unwrap_or_default();
+                            nori_host_tools::advertise(&mut meta);
+                            response.meta = Some(meta);
+                        }
                         tracing::debug!("Sending initialize response");
                         request_cx.respond(response)
                     }

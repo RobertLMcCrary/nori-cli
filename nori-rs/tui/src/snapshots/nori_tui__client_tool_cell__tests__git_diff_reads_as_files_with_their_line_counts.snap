@@ -1,0 +1,7 @@
+---
+source: tui/src/client_tool_cell.rs
+expression: "render_lines(&cell.display_lines(80)).join(\"\\n\")"
+---
+± Diff  +3 −1
+  ├ src/a.rs  +2 −1
+  └ notes.md  +1 −0

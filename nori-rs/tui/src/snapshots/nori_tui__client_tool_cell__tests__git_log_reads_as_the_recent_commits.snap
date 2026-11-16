@@ -1,0 +1,8 @@
+---
+source: tui/src/client_tool_cell.rs
+expression: "render_lines(&cell.display_lines(80)).join(\"\\n\")"
+---
+⎇ History  perf/instant-core
+  ├ 87057b7 docs: brief for host-provided tools
+  ├ 24371e4 feat(claude): offer mode and model as config options
+  └ 3b8cb93 feat(codex): update the embedded Codex to rust-v0.169.0

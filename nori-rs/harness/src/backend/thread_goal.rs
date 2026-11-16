@@ -15,7 +15,7 @@ pub(crate) enum GoalStatus {
     Complete,
 }
 
-pub(super) const NORI_GOAL_CONTROL_INSTRUCTIONS: &str = "Nori CLI is the authoritative owner of this goal state.\n- Do not use native or unqualified `create_goal`, `get_goal`, or `update_goal` tools.\n- Before ending a goal turn, call `get_goal` from the `nori-client` MCP server.\n- When the requested work is verified complete, you MUST call `update_goal` from the `nori-client` MCP server with status `complete`, then verify that it returned status `complete`.\n- When genuinely blocked, call `update_goal` from the `nori-client` MCP server with status `blocked`, then verify that it returned status `blocked`.";
+pub(super) const NORI_GOAL_CONTROL_INSTRUCTIONS: &str = "Nori CLI owns this goal. Use only Nori's goal tools (`get_goal`, `update_goal`), never another goal tool.\n- Before ending a goal turn, call `get_goal`.\n- When the requested work is verified complete, you MUST call `update_goal` with status `complete`, then check that it returned `complete`.\n- When genuinely blocked, call `update_goal` with status `blocked`, then check that it returned `blocked`.";
 
 fn goal_control_context() -> String {
     format!("<goal_control>\n{NORI_GOAL_CONTROL_INSTRUCTIONS}\n</goal_control>")
@@ -865,7 +865,7 @@ mod tests {
         assert_eq!(
             goals.prompt_context(73),
             Some(
-                "<goal_context>\nStatus: active\nObjective: Keep going\nTime used: 1m 3s\nTokens used: 1.06K\n</goal_context>\n\n<goal_control>\nNori CLI is the authoritative owner of this goal state.\n- Do not use native or unqualified `create_goal`, `get_goal`, or `update_goal` tools.\n- Before ending a goal turn, call `get_goal` from the `nori-client` MCP server.\n- When the requested work is verified complete, you MUST call `update_goal` from the `nori-client` MCP server with status `complete`, then verify that it returned status `complete`.\n- When genuinely blocked, call `update_goal` from the `nori-client` MCP server with status `blocked`, then verify that it returned status `blocked`.\n</goal_control>"
+                "<goal_context>\nStatus: active\nObjective: Keep going\nTime used: 1m 3s\nTokens used: 1.06K\n</goal_context>\n\n<goal_control>\nNori CLI owns this goal. Use only Nori's goal tools (`get_goal`, `update_goal`), never another goal tool.\n- Before ending a goal turn, call `get_goal`.\n- When the requested work is verified complete, you MUST call `update_goal` with status `complete`, then check that it returned `complete`.\n- When genuinely blocked, call `update_goal` with status `blocked`, then check that it returned `blocked`.\n</goal_control>"
                     .to_string()
             )
         );
@@ -883,14 +883,7 @@ mod tests {
             .expect("active goal should have continuation prompt");
         assert!(prompt.contains("Continue working toward the active thread goal"));
         assert!(prompt.contains("<objective>\nKeep going\n</objective>"));
-        assert!(prompt.contains("Nori CLI is the authoritative owner of this goal state."));
-        assert!(prompt.contains(
-            "Do not use native or unqualified `create_goal`, `get_goal`, or `update_goal` tools."
-        ));
-        assert!(prompt.contains("call `get_goal` from the `nori-client` MCP server"));
-        assert!(prompt.contains(
-            "call `update_goal` from the `nori-client` MCP server with status `complete`"
-        ));
+        assert!(prompt.contains(NORI_GOAL_CONTROL_INSTRUCTIONS));
 
         goals
             .set_status(GoalStatus::Paused, 30)

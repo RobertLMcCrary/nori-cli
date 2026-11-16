@@ -14,6 +14,9 @@
 //! directory (`nori stdio-to-uds <socket>`, see [`set_stdio_bridge`]), where the
 //! same service is served. The tools are typed `#[tool]` handlers; there is no
 //! hand-rolled HTTP or JSON-RPC framing here.
+//!
+//! An agent built into Nori's own process gets the same tools with no server at all: they are
+//! handed to it as host tools (see [`super::host_tools`]), and this server is not started.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,7 +73,7 @@ const DUPLICATE_CREATE_GOAL_ERROR: &str = "cannot create a new goal because this
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
-struct CreateGoalRequest {
+pub(super) struct CreateGoalRequest {
     /// Required. The concrete objective to start pursuing. This starts a new
     /// active goal only when no goal is currently defined; if a goal already
     /// exists, this tool fails.
@@ -80,7 +83,7 @@ struct CreateGoalRequest {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
-struct UpdateGoalRequest {
+pub(super) struct UpdateGoalRequest {
     /// Required. Set to `complete` only when the objective is achieved and no
     /// required work remains. Set to `blocked` only after the same blocking
     /// condition has repeated and the agent is at an impasse.
@@ -93,7 +96,7 @@ struct UpdateGoalRequest {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(rename_all = "lowercase")]
-enum GoalCompletion {
+pub(super) enum GoalCompletion {
     Complete,
     Blocked,
 }
@@ -168,26 +171,32 @@ impl NoriClientService {
         self.shared.cwd.clone()
     }
 
-    fn new(shared: NoriClientShared) -> Self {
+    pub(super) fn new(shared: NoriClientShared) -> Self {
         Self {
             shared,
             tool_router: Self::tool_router() + Self::task_tool_router() + Self::git_tool_router(),
         }
     }
 
+    /// Every tool, as `tools/list` describes it. The same for every session.
+    pub(super) fn all_tools() -> Vec<rmcp::model::Tool> {
+        (Self::tool_router() + Self::task_tool_router() + Self::git_tool_router()).list_all()
+    }
+
     #[tool(
-        description = "Get the current goal for this thread, including status, token and elapsed-time usage."
+        description = "Read this thread's goal: objective, status, and token and time used.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn get_goal(&self) -> Result<CallToolResult, McpError> {
+    pub(super) async fn get_goal(&self) -> Result<CallToolResult, McpError> {
         let state = self.shared.thread_goal_state.lock().await;
         let goal = state.snapshot(thread_goal::now_seconds()).map(goal_json);
         Ok(tool_success(serde_json::json!({ "goal": goal })))
     }
 
     #[tool(
-        description = "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Fails if a goal exists; use update_goal only for status."
+        description = "Start a goal, only when the user or the system asks for one; never infer one from an ordinary task. Fails if a goal exists."
     )]
-    async fn create_goal(
+    pub(super) async fn create_goal(
         &self,
         Parameters(CreateGoalRequest { objective }): Parameters<CreateGoalRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -204,9 +213,9 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Update the existing goal. Use this tool only to mark the goal achieved or genuinely blocked. Pause, resume, budget-limited, and usage-limited transitions are controlled by the user or system, not this tool."
+        description = "Mark the goal `complete` (achieved, verified) or `blocked` (the same obstacle keeps recurring). Other transitions belong to the user or the system."
     )]
-    async fn update_goal(
+    pub(super) async fn update_goal(
         &self,
         Parameters(UpdateGoalRequest { status }): Parameters<UpdateGoalRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -265,10 +274,8 @@ impl ServerHandler for NoriClientService {
                 ..Default::default()
             },
             instructions: Some(format!(
-                "Use nori-client resources and prompts for Nori CLI harness context; use tools only for Nori-owned live state.\n\n{}\n\n{}\n\n{}",
-                thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS,
-                super::orchestrator::TASK_INSTRUCTIONS,
-                super::git_tools::INSTRUCTIONS,
+                "Use nori-client resources and prompts for Nori CLI harness context; use tools only for Nori-owned live state.\n\n{}",
+                tool_instructions()
             )),
         }
     }
@@ -335,6 +342,16 @@ impl ServerHandler for NoriClientService {
         }
         Ok(self.get_info())
     }
+}
+
+/// What every agent is told about the tools, however it reaches them.
+pub(super) fn tool_instructions() -> String {
+    format!(
+        "{}\n\n{}\n\n{}",
+        thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS,
+        super::orchestrator::TASK_INSTRUCTIONS,
+        super::git_tools::INSTRUCTIONS,
+    )
 }
 
 pub(super) fn tool_success(body: serde_json::Value) -> CallToolResult {
@@ -530,15 +547,32 @@ impl Drop for NoriClientServer {
     }
 }
 
+/// How the session's agent reaches the `nori-client` tools.
+pub(crate) enum NoriClient {
+    /// A loopback MCP server, for an agent in another process.
+    Mcp(NoriClientServer),
+    /// Host tools handed straight to an agent built into this process. The connection sends them
+    /// with every session request, so they need no entry in the session's MCP servers; holding
+    /// the registration keeps them findable.
+    Host {
+        _registration: nori_host_tools::Registration,
+    },
+}
+
 pub(super) struct PendingNoriClientServer {
-    server: Option<NoriClientServer>,
+    server: Option<NoriClient>,
     connected: Arc<AtomicBool>,
     previous_connected: bool,
     committed: bool,
 }
 
 impl PendingNoriClientServer {
-    pub(super) async fn commit(mut self, http_server: &Arc<Mutex<Option<NoriClientServer>>>) {
+    /// Whether the tools go to the agent as host tools rather than over MCP.
+    pub(super) fn is_host(&self) -> bool {
+        matches!(self.server, Some(NoriClient::Host { .. }))
+    }
+
+    pub(super) async fn commit(mut self, http_server: &Arc<Mutex<Option<NoriClient>>>) {
         *http_server.lock().await = self.server.take();
         self.committed = true;
     }
@@ -575,7 +609,7 @@ pub(super) fn capabilities_update_for_session(
 ) -> crate::normalized::SessionCapabilitiesView {
     capabilities_update_for_nori_client(
         connection,
-        reachable(connection),
+        reachable(connection) || super::host_tools::accepted_by(connection),
         connected.load(Ordering::Relaxed),
     )
 }
@@ -645,28 +679,34 @@ pub(super) async fn register_for_session(
     orchestrator: super::orchestrator::Orchestrator,
     cwd: &std::path::Path,
 ) -> Result<Option<PendingNoriClientServer>> {
-    if !reachable(connection) {
+    let host_tools = super::host_tools::accepted_by(connection);
+    if !host_tools && !reachable(connection) {
         return Ok(None);
     }
 
-    let next_server = NoriClientServer::spawn(
-        NoriClientShared::new(
-            thread_goal_state,
-            backend_event_tx,
-            Arc::clone(&connected),
-            agent_capabilities_view(connection),
-            true,
-            goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta())
-                .is_some(),
-            orchestrator,
-        )
-        .with_cwd(cwd.to_path_buf()),
-        connection.capabilities().mcp_capabilities.http,
+    let shared = NoriClientShared::new(
+        thread_goal_state,
+        backend_event_tx,
+        Arc::clone(&connected),
+        agent_capabilities_view(connection),
+        true,
+        goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta()).is_some(),
+        orchestrator,
     )
-    .await?;
-    let advertised_server = next_server.as_mcp_server();
-    let previous_connected = connected.swap(false, Ordering::Relaxed);
-    mcp_servers.push(advertised_server);
+    .with_cwd(cwd.to_path_buf());
+    let previous_connected = connected.load(Ordering::Relaxed);
+    let next_server = if host_tools {
+        NoriClient::Host {
+            _registration: super::host_tools::hand_to(connection, shared, &connected),
+        }
+    } else {
+        let server =
+            NoriClientServer::spawn(shared, connection.capabilities().mcp_capabilities.http)
+                .await?;
+        connected.store(false, Ordering::Relaxed);
+        mcp_servers.push(server.as_mcp_server());
+        NoriClient::Mcp(server)
+    };
 
     Ok(Some(PendingNoriClientServer {
         server: Some(next_server),
@@ -1066,12 +1106,7 @@ mod tests {
             .peer_info()
             .and_then(|info| info.instructions.as_deref())
             .expect("initialized nori-client instructions");
-        assert!(instructions.contains("Nori CLI is the authoritative owner of this goal state"));
-        assert!(instructions.contains(
-            "Do not use native or unqualified `create_goal`, `get_goal`, or `update_goal` tools"
-        ));
-        assert!(instructions.contains("`get_goal` from the `nori-client` MCP server"));
-        assert!(instructions.contains("`update_goal` from the `nori-client` MCP server"));
+        assert!(instructions.contains(thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS));
 
         let tools = client
             .list_all_tools()

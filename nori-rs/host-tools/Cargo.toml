@@ -1,0 +1,16 @@
+[package]
+name = "nori-host-tools"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+# Shared by Nori and the agents built into it, which speak different ACP library versions, so
+# this crate depends on nothing but std and serde_json.
+[dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

@@ -157,6 +157,25 @@ pub fn create_pre_tool_use_hook(
                         });
                     }
 
+                    // Nori's own tools are the host's: Nori decides what they may do, so they
+                    // never prompt, in any mode.
+                    if crate::mcp::host_tool_name(&tool_name).is_some() {
+                        return HookJsonOutput::Sync(SyncHookJsonOutput {
+                            continue_: Some(true),
+                            hook_specific_output: Some(HookSpecificOutput::PreToolUse(
+                                PreToolUseHookSpecificOutput {
+                                    permission_decision: Some("allow".to_string()),
+                                    permission_decision_reason: Some(
+                                        "Nori's own tool".to_string(),
+                                    ),
+                                    updated_input: None,
+                                    additional_context: None,
+                                },
+                            )),
+                            ..Default::default()
+                        });
+                    }
+
                     // Get current permission mode
                     let mode = permission.read().await.mode();
 

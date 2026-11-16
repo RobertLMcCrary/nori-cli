@@ -1400,7 +1400,7 @@ async fn http_mcp_agent_receives_goal_routing_context_once_without_fallback_guid
                 "<context>",
                 "Source: this message is from Nori CLI.",
                 "",
-                "When <goal_context> is present, Nori CLI is its authoritative owner. Do not use native or unqualified goal tools. Read it with `get_goal` from the `nori-client` MCP server, and update it with `update_goal` from the `nori-client` MCP server.",
+                "When <goal_context> is present, Nori CLI owns the goal. Use only Nori's goal tools: read it with `get_goal` and update it with `update_goal`.",
                 "</context>",
                 "",
                 "first prompt",

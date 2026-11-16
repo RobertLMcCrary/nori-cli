@@ -21,11 +21,9 @@ use super::task::TaskId;
 use crate::backend::nori_client_mcp::NoriClientService;
 
 /// What the server tells agents about delegation, after its other instructions.
-pub(crate) const INSTRUCTIONS: &str = "Delegated tasks: `delegate_task` runs a task on a child agent, which may be a different \
-     agent and model than yours (see `agent_capabilities`). Delegate independent work, then keep \
-     working or end your turn: each result is delivered to you as a message when its task \
-     finishes, so never poll. Give each child everything it needs in `task`; it sees none of \
-     your conversation. Tasks end with this session, and the user stopping you stops them.";
+pub(crate) const INSTRUCTIONS: &str = "Delegated tasks: hand independent work to a child agent with `delegate_task` (another agent \
+     or model if `agent_capabilities` offers a better fit), then keep working or end your turn. \
+     Tasks end with this session, and the user stopping you stops them.";
 
 /// `agent_capabilities` re-reads agents whose entry is older than this...
 const CAPABILITIES_FRESH_FOR: Duration = Duration::from_secs(120);
@@ -121,10 +119,9 @@ pub(crate) struct TaskSendRequest {
 impl NoriClientService {
     #[tool(
         description = "List the agents you can delegate tasks to, with the models and other settings (such as reasoning effort) each offers, and whether you can delegate now (depth and running-task limits).",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false),
-        meta = always_load()
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn agent_capabilities(&self) -> Result<CallToolResult, McpError> {
+    pub(crate) async fn agent_capabilities(&self) -> Result<CallToolResult, McpError> {
         let inner = self.orchestrator().inner();
         let never_read = crate::registry::list_available_agents()
             .into_iter()
@@ -152,11 +149,11 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Start a task on a child agent, which may run on a different agent and model than yours (see agent_capabilities). The child gets only `task`, none of your conversation, and cannot ask you questions. Returns at once with a `task_id`; the result is delivered to you as a message when the task finishes, so do not poll, and use `mode: wait` only when this turn cannot go on without it. With `isolation: shared` children edit your files directly: give parallel children disjoint files, or use `isolation: worktree`. Keep the `task_id` for task_send, task_status, and task_cancel. No secrets in `task`.",
+        description = "Start a task on a child agent (choices: `agent_capabilities`). The child sees only `task`, not this conversation, and cannot ask questions. Returns a `task_id` at once; the result arrives as a message, so don't poll, and use `mode: wait` only if you cannot go on without it. `isolation: shared` edits your files directly: give parallel children disjoint files, or use `isolation: worktree`. No secrets in `task`.",
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true),
         meta = always_load()
     )]
-    async fn delegate_task(
+    pub(crate) async fn delegate_task(
         &self,
         Parameters(request): Parameters<DelegateTaskRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -179,11 +176,11 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Read one delegated task: its status; while it runs, what its child is doing now (`activity`, `tool_calls`); the files its edit tools changed (not those its shell commands did); and once it has finished, the child's final message. Reading a finished task delivers its result, so it will not also arrive as a message.",
+        description = "Read one delegated task: `status`, the child's current `activity` and `tool_calls` while it runs, the files its edit tools changed, and its final message once finished. Reading a finished task delivers its result, so it is not also sent as a message.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false),
         meta = always_load()
     )]
-    async fn task_status(
+    pub(crate) async fn task_status(
         &self,
         Parameters(TaskIdRequest { task_id }): Parameters<TaskIdRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -196,11 +193,11 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Block until every listed task has finished, one of them is waiting for the user's approval, or the timeout passes, and return them. Only wait when you cannot continue without the results; finished results are delivered to you as messages anyway.",
+        description = "Block until the listed tasks finish, one awaits the user's approval, or the timeout passes. Only when you cannot continue without the results; they otherwise arrive as messages.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false),
         meta = always_load()
     )]
-    async fn task_wait(
+    pub(crate) async fn task_wait(
         &self,
         Parameters(request): Parameters<TaskWaitRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -221,10 +218,13 @@ impl NoriClientService {
 
     #[tool(
         description = "Send a follow-up to the child that ran a finished task. The child keeps its whole conversation. Starts a new task on that child and returns its `task_id`; its result is delivered like any other.",
-        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true),
-        meta = always_load()
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
     )]
-    async fn task_send(
+    pub(crate) async fn task_send(
         &self,
         Parameters(request): Parameters<TaskSendRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -250,10 +250,9 @@ impl NoriClientService {
             destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = false
-        ),
-        meta = always_load()
+        )
     )]
-    async fn task_cancel(
+    pub(crate) async fn task_cancel(
         &self,
         Parameters(TaskIdRequest { task_id }): Parameters<TaskIdRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -265,10 +264,9 @@ impl NoriClientService {
 
     #[tool(
         description = "List every task you delegated in this session with its status.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false),
-        meta = always_load()
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn task_list(&self) -> Result<CallToolResult, McpError> {
+    pub(crate) async fn task_list(&self) -> Result<CallToolResult, McpError> {
         Ok(json(&TaskList {
             tasks: self.orchestrator().inner().list().await,
         }))
@@ -280,9 +278,9 @@ struct TaskList {
     tasks: Vec<super::task::TaskSnapshot>,
 }
 
-/// Asks Claude Code to keep a tool loaded rather than behind its tool search, so the agent sees
-/// that it can delegate.
-fn always_load() -> rmcp::model::Meta {
+/// Asks Claude Code to keep a tool loaded rather than behind its tool search, for the tools an
+/// agent should always know it has. The rest are found by search when needed.
+pub(crate) fn always_load() -> rmcp::model::Meta {
     let mut meta = rmcp::model::Meta::new();
     meta.0.insert(
         "anthropic/alwaysLoad".to_owned(),

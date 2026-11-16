@@ -1,8 +1,9 @@
-//! Calls to the delegated-task tools of Nori's own `nori-client` MCP server.
+//! Calls to Nori's delegated-task tools.
 //!
-//! Agents name MCP tools their own way (`mcp__nori-client__delegate_task`,
-//! `nori-client.delegate_task`, `delegate_task (nori-client MCP Server)`), so a call is recognized
-//! by the server's name and a tool name appearing in its title. What a recognized call did is
+//! An agent built into Nori names the tool in the call's `_meta`. Over the `nori-client` MCP
+//! server, agents name tools their own way (`mcp__nori-client__delegate_task`,
+//! `nori-client.delegate_task`, `delegate_task (nori-client MCP Server)`), so such a call is
+//! recognized by the server's name and a tool name appearing in its title. What a recognized call did is
 //! shown in words; the child's work itself is shown as a subagent, not under the call.
 
 use serde::Deserialize;
@@ -45,6 +46,11 @@ impl DelegationCall {
         let tool = words
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .find(|word| TOOLS.contains(word))?;
+        Self::from_tool(tool, input)
+    }
+
+    /// The call to Nori's tool `tool`, with its arguments from `input`, when it is one of these.
+    pub(crate) fn from_tool(tool: &str, input: Option<&serde_json::Value>) -> Option<Self> {
         let text = |key: &str| {
             input
                 .and_then(|input| input.get(key))
@@ -89,7 +95,8 @@ impl DelegationCall {
                 task_id: text("task_id").unwrap_or_default(),
             },
             "task_list" => Self::List,
-            _ => Self::Capabilities,
+            "agent_capabilities" => Self::Capabilities,
+            _ => return None,
         })
     }
 

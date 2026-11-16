@@ -5,6 +5,7 @@
 
 mod config_types;
 mod edits;
+mod git_log;
 mod git_repo;
 mod git_root;
 mod git_write;
@@ -21,6 +22,7 @@ pub use config_types::ShellEnvironmentPolicyInherit;
 pub use config_types::ShellEnvironmentPolicyToml;
 pub use config_types::TrustLevel;
 pub use edits::NoriConfigEdits;
+pub use git_log::CommitSummary;
 pub use git_repo::GitRepo;
 pub use git_root::GitFacts;
 pub use git_root::resolve_root_git_project_for_trust;

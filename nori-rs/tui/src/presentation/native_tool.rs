@@ -1,9 +1,11 @@
 //! Nori's own tools, shown as what they did rather than as a tool call.
 //!
-//! Git and goal tools come from the `nori-client` MCP server, so an agent names them its own way
-//! (`mcp__nori-client__git_commit`, `nori-client.git_commit`, ...). A call is recognized the way
-//! delegation calls are: by the server's name and a tool name in the title. The view built here
-//! is plain data (a header and detail lines with a tone each); the cell turns tones into colors.
+//! An agent built into Nori names the tool in the call's `_meta` (`nori.hostTool`), and the call
+//! is recognized by that name. An agent in another process reaches the tools through the
+//! `nori-client` MCP server and names them its own way (`mcp__nori-client__git_commit`,
+//! `nori-client.git_commit`, ...), so there a call is recognized the way delegation calls are: by
+//! the server's name and a tool name in the title. The view built here is plain data (a header
+//! and detail lines with a tone each); the cell turns tones into colors.
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -13,6 +15,8 @@ use serde::Serialize;
 #[serde(tag = "call", rename_all = "snake_case")]
 pub enum NativeCall {
     GitStatus,
+    GitDiff { paths: Vec<String> },
+    GitLog,
     GitCommit { paths: Vec<String>, message: String },
     GetGoal,
     CreateGoal { objective: String },
@@ -30,6 +34,11 @@ impl NativeCall {
         let tool = words
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .find(|word| TOOLS.contains(word))?;
+        Self::from_tool(tool, input)
+    }
+
+    /// The call to Nori's tool `tool`, with its arguments from `input`, when it is one of these.
+    pub(crate) fn from_tool(tool: &str, input: Option<&serde_json::Value>) -> Option<Self> {
         let text = |key: &str| {
             input
                 .and_then(|input| input.get(key))
@@ -37,35 +46,43 @@ impl NativeCall {
                 .map(str::to_owned)
                 .unwrap_or_default()
         };
+        let paths = || {
+            input
+                .and_then(|input| input.get("paths"))
+                .and_then(serde_json::Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         Some(match tool {
             "git_status" => Self::GitStatus,
+            "git_diff" => Self::GitDiff { paths: paths() },
+            "git_log" => Self::GitLog,
             "git_commit" => Self::GitCommit {
-                paths: input
-                    .and_then(|input| input.get("paths"))
-                    .and_then(serde_json::Value::as_array)
-                    .map(|paths| {
-                        paths
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                paths: paths(),
                 message: text("message"),
             },
+            "get_goal" => Self::GetGoal,
             "create_goal" => Self::CreateGoal {
                 objective: text("objective"),
             },
             "update_goal" => Self::UpdateGoal {
                 status: text("status"),
             },
-            _ => Self::GetGoal,
+            _ => return None,
         })
     }
 }
 
-const TOOLS: [&str; 5] = [
+const TOOLS: [&str; 7] = [
     "git_status",
+    "git_diff",
+    "git_log",
     "git_commit",
     "get_goal",
     "create_goal",
@@ -87,28 +104,31 @@ pub(crate) enum Tone {
     Error,
 }
 
-/// One detail line: an optional one-letter marker, then text.
+/// One detail line: an optional one-letter marker, then text, then styled parts after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetailLine {
     pub marker: Option<(char, Tone)>,
     pub text: String,
     pub tone: Tone,
+    pub suffix: Vec<Part>,
 }
 
 impl DetailLine {
-    fn text(text: impl Into<String>, tone: Tone) -> Self {
+    pub(super) fn text(text: impl Into<String>, tone: Tone) -> Self {
         Self {
             marker: None,
             text: text.into(),
             tone,
+            suffix: Vec::new(),
         }
     }
 
-    fn file(marker: Option<(char, Tone)>, path: impl Into<String>) -> Self {
+    pub(super) fn file(marker: Option<(char, Tone)>, path: impl Into<String>) -> Self {
         Self {
             marker,
             text: path.into(),
             tone: Tone::Plain,
+            suffix: Vec::new(),
         }
     }
 }
@@ -120,7 +140,7 @@ pub(crate) struct Part {
     pub tone: Tone,
 }
 
-fn part(text: impl Into<String>, tone: Tone) -> Part {
+pub(super) fn part(text: impl Into<String>, tone: Tone) -> Part {
     Part {
         text: text.into(),
         tone,
@@ -142,7 +162,7 @@ impl NativeView {
         self.header.iter().map(|part| part.text.as_str()).collect()
     }
 
-    fn new(glyph: &'static str, header: Vec<Part>, detail: Vec<DetailLine>) -> Self {
+    pub(super) fn new(glyph: &'static str, header: Vec<Part>, detail: Vec<DetailLine>) -> Self {
         Self {
             glyph,
             header,
@@ -151,12 +171,12 @@ impl NativeView {
     }
 }
 
-const GIT: &str = "⎇";
+pub(super) const GIT: &str = "⎇";
 const COMMIT: &str = "◆";
 const GOAL: &str = "◎";
 
 /// Files a status lists before it says how many more there are.
-const FILES_SHOWN: usize = 8;
+pub(super) const FILES_SHOWN: usize = 8;
 
 /// The view of `call`. `result` is the text the tool returned, once it has; `failed` is the
 /// tool's own report that it did not work.
@@ -169,8 +189,12 @@ pub(crate) fn view(
     if failed {
         let (glyph, title) = match call {
             NativeCall::GitStatus => (GIT, "Could not read git status"),
+            NativeCall::GitDiff { .. } => (GIT, "Could not read the diff"),
+            NativeCall::GitLog => (GIT, "Could not read the history"),
             NativeCall::GitCommit { .. } => (COMMIT, "Commit failed"),
-            _ => (GOAL, "Goal tool failed"),
+            NativeCall::GetGoal | NativeCall::CreateGoal { .. } | NativeCall::UpdateGoal { .. } => {
+                (GOAL, "Goal tool failed")
+            }
         };
         return NativeView::new(
             glyph,
@@ -184,6 +208,8 @@ pub(crate) fn view(
     let json = result.and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
     match call {
         NativeCall::GitStatus => status_view(active, json.as_ref()),
+        NativeCall::GitDiff { paths } => super::native_history::diff_view(active, paths, result),
+        NativeCall::GitLog => super::native_history::log_view(active, json.as_ref()),
         NativeCall::GitCommit { paths, message } => {
             commit_view(active, paths, message, json.as_ref())
         }

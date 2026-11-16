@@ -283,7 +283,7 @@ pub struct AcpBackend {
     /// `nori-client` MCP endpoint.
     goal_mcp_connected: Arc<AtomicBool>,
     /// Loopback HTTP server exposing the backend-owned `nori-client` MCP tools.
-    goal_mcp_http_server: Arc<Mutex<Option<nori_client_mcp::NoriClientServer>>>,
+    goal_mcp_http_server: Arc<Mutex<Option<nori_client_mcp::NoriClient>>>,
     /// Goal extension capability the agent advertised at initialize, parsed
     /// once. `Some` enables driving goals via `_session/goal`.
     goal_ext_capability: Option<goal_ext::GoalExtCapability>,
@@ -308,6 +308,8 @@ pub struct AcpBackend {
     edit_journal: Arc<EditJournal>,
     /// Whether the first user prompt has been sent (for prompt summary)
     is_first_prompt: Arc<Mutex<bool>>,
+    /// The session's workflow, from the user's and the project's scripts.
+    workflow: Arc<Mutex<workflow::WorkflowState>>,
     /// Whether the first prompt should be summarized for the footer.
     prompt_summary_enabled: bool,
     /// Agent name stored for spawning summarization connection
@@ -390,9 +392,12 @@ pub mod browser_profile;
 pub mod browser_session;
 mod git_tools;
 mod goal_ext;
+mod host_tools;
 mod nori_client_context;
 mod nori_client_mcp;
 pub(crate) mod orchestrator;
+mod prewarm;
+mod workflow;
 pub use nori_client_mcp::set_stdio_bridge;
 pub use orchestrator::refresh_agent_catalog;
 pub mod prepared;

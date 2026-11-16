@@ -31,6 +31,8 @@ use crate::agent::flush;
 use crate::agent::slash_commands::{
     filter_commands, get_predefined_commands, transform_mcp_command_input,
 };
+use crate::mcp::SessionTools;
+use crate::session::warm;
 use crate::session::{PermissionMode, Session, SessionManager};
 use crate::terminal::TerminalClient;
 use crate::types::{AgentConfig, AgentError, NewSessionMeta};
@@ -38,6 +40,9 @@ use crate::types::{AgentConfig, AgentError, NewSessionMeta};
 /// The model id that means "whatever the Claude CLI picks for this account".
 /// Nothing is pinned to a dated model id, which would go stale.
 const DEFAULT_MODEL_ID: &str = "default";
+
+/// How long a session must go without a turn before the next session's CLI is started.
+const REFILL_QUIET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Aliases the Claude CLI resolves itself to its current model of each family.
 const MODEL_ALIASES: [(&str, &str, &str); 4] = [
@@ -153,32 +158,45 @@ pub async fn handle_new_session(
     // Get working directory from request
     let cwd = request.cwd;
 
-    // Generate session ID
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // The client's MCP servers and any host tools it was handed
+    let tools = SessionTools::from_request(request.mcp_servers, request.meta.as_ref());
 
-    tracing::debug!(
-        session_id = %session_id,
-        "Generated new session ID"
-    );
-
-    // Create the session
-    let session =
-        sessions.create_session(session_id.clone(), cwd.clone(), config, meta.as_ref())?;
-
-    // Store external MCP servers for later connection
-    if !request.mcp_servers.is_empty() {
-        session.set_external_mcp_servers(request.mcp_servers);
-    }
+    // A plain new session takes one whose CLI is already running, if one fits; then the next is
+    // started for whoever comes after.
+    let key = warm::WarmKey::new(&cwd, config, &tools);
+    let plain = meta.as_ref().is_none_or(NewSessionMeta::is_plain);
+    let session = match plain.then(|| warm::claim(&key)).flatten() {
+        Some(session) => {
+            session.adopt_tools(&tools);
+            sessions.adopt(Arc::clone(&session))?;
+            tracing::info!(session_id = %session.session_id, "Took a warm Claude session");
+            session
+        }
+        None => sessions.create_session(
+            uuid::Uuid::new_v4().to_string(),
+            cwd.clone(),
+            config,
+            meta.as_ref(),
+            &tools,
+        )?,
+    };
+    let session_id = session.session_id.clone();
 
     // Start the Claude CLI now, while the user is still typing, so the first prompt does not pay
-    // for it. A failure here is not reported: the first prompt tries again and reports it.
+    // for it. A failure here is not reported: the first prompt tries again and reports it. The
+    // next session's CLI starts once this one is up and quiet, so the two never compete.
     {
         let session = Arc::clone(&session);
         let session_id = session_id.clone();
         let connection_cx = connection_cx.clone();
+        let next = plain.then(|| (key, cwd.clone(), config.clone(), tools.mcp_servers.clone()));
         tokio::spawn(async move {
             if let Err(error) = prepare_session(&session, &session_id, &connection_cx).await {
                 tracing::debug!(session_id = %session_id, %error, "Warm-up did not finish");
+            }
+            if let Some((key, cwd, config, mcp_servers)) = next {
+                session.wait_until_idle(REFILL_QUIET).await;
+                warm::refill(key, cwd, config, mcp_servers);
             }
         });
     }
@@ -280,7 +298,8 @@ pub fn handle_load_session(
             session_id = %session_id,
             "Creating session with resume option"
         );
-        sessions.create_session(session_id.clone(), cwd.clone(), config, Some(&meta))?;
+        let tools = SessionTools::from_request(request.mcp_servers, request.meta.as_ref());
+        sessions.create_session(session_id.clone(), cwd.clone(), config, Some(&meta), &tools)?;
 
         let elapsed = start_time.elapsed();
         tracing::info!(
@@ -534,41 +553,8 @@ async fn prepare_session(
     // This enables the can_use_tool callback to send permission requests to the client
     session.set_connection_cx(connection_cx.clone());
 
-    // Connect external MCP servers first (if any)
-    // This ensures external tools are available when Claude CLI starts
-    let external_mcp_timeout = tokio::time::Duration::from_secs(5);
-    let external_mcp_start = Instant::now();
-
-    match tokio::time::timeout(external_mcp_timeout, session.connect_external_mcp_servers()).await {
-        Ok(Ok(())) => {
-            let elapsed = external_mcp_start.elapsed();
-            if elapsed.as_millis() > 100 {
-                tracing::info!(
-                    session_id = %session_id,
-                    external_mcp_elapsed_ms = elapsed.as_millis(),
-                    "External MCP servers connected successfully"
-                );
-            }
-        }
-        Ok(Err(e)) => {
-            let elapsed = external_mcp_start.elapsed();
-            tracing::error!(
-                session_id = %session_id,
-                error = %e,
-                elapsed_ms = elapsed.as_millis(),
-                "Error connecting to external MCP servers"
-            );
-            // Continue anyway - external MCP failures shouldn't block the session
-        }
-        Err(_) => {
-            tracing::error!(
-                session_id = %session_id,
-                timeout_secs = external_mcp_timeout.as_secs(),
-                "External MCP connection timed out, continuing without external tools"
-            );
-            // Continue anyway - timeout shouldn't block the session
-        }
-    }
+    // MCP servers need no connecting here: Claude Code connects to the client's servers itself,
+    // and Nori's host tools are in this process.
 
     // Connect if not already connected
     if !session.is_connected() {
@@ -634,6 +620,7 @@ pub async fn handle_prompt(
     // Reset cancelled flag at the start of each prompt
     // This ensures that cancelled state from previous prompt is cleared
     session.reset_cancelled();
+    let _turn = session.begin_turn();
 
     // Set the request_id on the session's converter
     // This will attach the request_id to all SessionNotification instances
@@ -1452,13 +1439,14 @@ pub fn handle_fork_session(
     let new_session_id = uuid::Uuid::new_v4().to_string();
 
     // Create the forked session
-    let session =
-        sessions.create_session(new_session_id.clone(), cwd.clone(), config, Some(&meta))?;
-
-    // Store external MCP servers if provided
-    if !request.mcp_servers.is_empty() {
-        session.set_external_mcp_servers(request.mcp_servers);
-    }
+    let tools = SessionTools::from_request(request.mcp_servers, request.meta.as_ref());
+    sessions.create_session(
+        new_session_id.clone(),
+        cwd.clone(),
+        config,
+        Some(&meta),
+        &tools,
+    )?;
 
     // Build response with available modes and models (same as new session)
     let available_modes = build_available_modes();
@@ -1520,16 +1508,20 @@ pub fn handle_resume_session(
     // Create meta with resume option
     let meta = NewSessionMeta::with_resume(&resume_session_id);
 
-    // Generate new session ID for the resumed session
-    let new_session_id = uuid::Uuid::new_v4().to_string();
+    // The response carries no session id, so the client keeps using the one it asked for: the
+    // resumed session must be found under it. Claude Code keeps the id when it resumes.
+    let new_session_id = resume_session_id.clone();
 
-    // Create the resumed session
-    let session =
-        sessions.create_session(new_session_id.clone(), cwd.clone(), config, Some(&meta))?;
-
-    // Store external MCP servers if provided
-    if !request.mcp_servers.is_empty() {
-        session.set_external_mcp_servers(request.mcp_servers);
+    // Create the resumed session, unless it is already live
+    if !sessions.has_session(&new_session_id) {
+        let tools = SessionTools::from_request(request.mcp_servers, request.meta.as_ref());
+        sessions.create_session(
+            new_session_id.clone(),
+            cwd.clone(),
+            config,
+            Some(&meta),
+            &tools,
+        )?;
     }
 
     // Build response with available modes and models

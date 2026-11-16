@@ -77,13 +77,15 @@ pub fn categorize_acp_error_chain(error: &anyhow::Error) -> AcpErrorDetails {
             continue;
         };
         // Agents say why in `data.detail`; Codex's in-process agent puts it in `data.message`
-        // under a generic "Internal error", which is where the usage-limit reset date lives.
-        let detail = acp_error.data.as_ref().and_then(|data| {
-            ["detail", "message"].into_iter().find_map(|key| {
+        // under a generic "Internal error", which is where the usage-limit reset date lives, and
+        // the Claude driver makes `data` the reason itself.
+        let detail = acp_error.data.as_ref().and_then(|data| match data {
+            serde_json::Value::String(reason) => Some(reason.clone()),
+            _ => ["detail", "message"].into_iter().find_map(|key| {
                 data.get(key)
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
-            })
+            }),
         });
         let message = Some(acp_error.message.clone());
         let category = match i32::from(acp_error.code) {
@@ -223,6 +225,18 @@ mod tests {
         assert_eq!(
             categorize_acp_error_chain(&error).category,
             AcpErrorCategory::SessionNotFound
+        );
+    }
+
+    #[test]
+    fn a_reason_given_as_the_whole_data_is_the_detail() {
+        let error = anyhow::Error::new(acp::Error::internal_error().data(serde_json::json!(
+            "Claude Code CLI not found. Please ensure 'claude' is in your PATH"
+        )));
+        let details = categorize_acp_error_chain(&error);
+        assert_eq!(
+            details.detail.as_deref(),
+            Some("Claude Code CLI not found. Please ensure 'claude' is in your PATH")
         );
     }
 

@@ -85,6 +85,13 @@ pub struct AcpConnection {
     /// ACP extensions (e.g. the `_session/goal` goal extension).
     initialize_meta: Option<acp::Meta>,
 
+    /// `_meta` sent with every session request (new, load, resume, fork): how a built-in agent is
+    /// handed the session's host tools.
+    session_meta: std::sync::RwLock<Option<acp::Meta>>,
+
+    /// Whether the agent is a built-in one, running in this process.
+    in_process: bool,
+
     /// Ordered inbox of raw ACP events from the transport layer.
     event_rx: mpsc::Receiver<ConnectionEvent>,
 
@@ -534,6 +541,8 @@ async fn establish_connection(
         cx,
         agent_capabilities: capabilities,
         initialize_meta,
+        session_meta: std::sync::RwLock::new(None),
+        in_process: false,
         event_rx,
         event_tx: connection_event_tx,
         session_config_state,
@@ -811,18 +820,7 @@ impl AcpConnection {
                 spec.agent
             )
         })?;
-        let mut spec = spec.clone();
-        // The environment the adapter would have read becomes explicit options, since a process
-        // shared with other agents has no per-agent environment.
-        match spec.agent.as_str() {
-            "codex" => spec
-                .config
-                .extend(crate::in_process::codex_overrides_from_env(&config.env)),
-            "claude" => spec
-                .config
-                .extend(crate::in_process::claude_overrides_from_env(&config.env)),
-            _ => {}
-        }
+        let spec = crate::in_process::with_environment(spec, &config.env);
         debug!(
             "Starting built-in agent {} in {}",
             spec.agent,
@@ -876,6 +874,7 @@ impl AcpConnection {
                 // The agent task takes the place of the subprocess handles: it is stopped when
                 // the connection is.
                 connection.stderr_task = Some(agent_task);
+                connection.in_process = true;
                 Ok(connection)
             }
             Err(error) => {
@@ -901,9 +900,11 @@ impl AcpConnection {
         cwd: &Path,
         mcp_servers: Vec<acp::McpServer>,
     ) -> Result<acp::SessionId> {
-        let request = self
-            .cx
-            .send_request(acp::NewSessionRequest::new(cwd).mcp_servers(mcp_servers));
+        let request = self.cx.send_request(
+            acp::NewSessionRequest::new(cwd)
+                .mcp_servers(mcp_servers)
+                .meta(self.session_meta()),
+        );
         let request_id = schema_request_id(request.id());
         let response = request.block_task().await;
         let _ = self
@@ -940,7 +941,9 @@ impl AcpConnection {
         // Replay updates can arrive before the response, and are the root's.
         self.set_root_session(acp::SessionId::new(session_id));
         let request = self.cx.send_request(
-            acp::LoadSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers),
+            acp::LoadSessionRequest::new(session_id.to_string(), cwd)
+                .mcp_servers(mcp_servers)
+                .meta(self.session_meta()),
         );
         let request_id = schema_request_id(request.id());
         if let Some(request_started) = request_started {
@@ -983,7 +986,9 @@ impl AcpConnection {
     ) -> Result<acp::SessionId> {
         self.set_root_session(acp::SessionId::new(session_id));
         let request = self.cx.send_request(
-            acp::ResumeSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers),
+            acp::ResumeSessionRequest::new(session_id.to_string(), cwd)
+                .mcp_servers(mcp_servers)
+                .meta(self.session_meta()),
         );
         let request_id = schema_request_id(request.id());
         let response = request.block_task().await;
@@ -1019,7 +1024,9 @@ impl AcpConnection {
         mcp_servers: Vec<acp::McpServer>,
     ) -> Result<acp::SessionId> {
         let request = self.cx.send_request(
-            acp::ForkSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers),
+            acp::ForkSessionRequest::new(session_id.to_string(), cwd)
+                .mcp_servers(mcp_servers)
+                .meta(self.session_meta()),
         );
         let request_id = schema_request_id(request.id());
         let response = request.block_task().await;
@@ -1181,6 +1188,26 @@ impl AcpConnection {
     /// advertise ACP extensions.
     pub fn initialize_meta(&self) -> Option<&acp::Meta> {
         self.initialize_meta.as_ref()
+    }
+
+    /// Send `meta` as the `_meta` of every later session request, or none.
+    pub fn set_session_meta(&self, meta: Option<acp::Meta>) {
+        *self
+            .session_meta
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = meta;
+    }
+
+    fn session_meta(&self) -> Option<acp::Meta> {
+        self.session_meta
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the agent runs inside this process, where host tools can be handed to it.
+    pub fn is_in_process(&self) -> bool {
+        self.in_process
     }
 
     /// Send an extension (`_`-prefixed) method request to the agent and

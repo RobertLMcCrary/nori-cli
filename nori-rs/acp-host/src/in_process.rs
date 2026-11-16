@@ -35,6 +35,59 @@ pub type Launcher = Arc<
         + Sync,
 >;
 
+/// Starts what an agent needs for a session ahead of time, for the working directory and the
+/// client's MCP servers (as the JSON array ACP sends in `session/new`). Returns at once.
+pub type Prewarmer = Arc<dyn Fn(InProcessSpec, PathBuf, serde_json::Value) + Send + Sync>;
+
+fn prewarmers() -> &'static RwLock<HashMap<String, Prewarmer>> {
+    static PREWARMERS: OnceLock<RwLock<HashMap<String, Prewarmer>>> = OnceLock::new();
+    PREWARMERS.get_or_init(Default::default)
+}
+
+/// Let the built-in agent `name` start sessions ahead of time.
+pub fn register_in_process_prewarm(name: &str, prewarmer: Prewarmer) {
+    prewarmers()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_owned(), prewarmer);
+}
+
+/// Have the built-in agent `config` runs start a session for `cwd` ahead of time, so switching to
+/// it later is instant. Does nothing for an agent that is not built in or cannot prewarm.
+pub fn prewarm(
+    config: &crate::registry::AcpAgentConfig,
+    cwd: PathBuf,
+    mcp_servers: serde_json::Value,
+) {
+    let Some(spec) = &config.in_process else {
+        return;
+    };
+    let Some(prewarmer) = prewarmers()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&spec.agent)
+        .cloned()
+    else {
+        return;
+    };
+    prewarmer(with_environment(spec, &config.env), cwd, mcp_servers);
+}
+
+/// `spec` with the environment an adapter would have read turned into explicit options, since
+/// a process shared with other agents has no per-agent environment.
+pub(crate) fn with_environment(
+    spec: &InProcessSpec,
+    env: &HashMap<String, String>,
+) -> InProcessSpec {
+    let mut spec = spec.clone();
+    match spec.agent.as_str() {
+        "codex" => spec.config.extend(codex_overrides_from_env(env)),
+        "claude" => spec.config.extend(claude_overrides_from_env(env)),
+        _ => {}
+    }
+    spec
+}
+
 fn launchers() -> &'static RwLock<HashMap<String, Launcher>> {
     static LAUNCHERS: OnceLock<RwLock<HashMap<String, Launcher>>> = OnceLock::new();
     LAUNCHERS.get_or_init(Default::default)

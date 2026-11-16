@@ -22,14 +22,14 @@ use claude_code_agent_sdk::{
 use sacp::Client;
 use sacp::ConnectionTo;
 use sacp::schema::{
-    CurrentModeUpdate, McpServer, SessionId, SessionModeId, SessionNotification, SessionUpdate,
+    CurrentModeUpdate, SessionId, SessionModeId, SessionNotification, SessionUpdate,
 };
 use tokio::sync::RwLock;
 use tracing::instrument;
 
 use crate::converter::NotificationConverter;
 use crate::hooks::{HookCallbackRegistry, create_post_tool_use_hook, create_pre_tool_use_hook};
-use crate::mcp::AcpMcpServer;
+use crate::mcp::{AcpMcpServer, HostToolsBinding, SessionTools};
 use crate::permissions::create_can_use_tool_callback;
 use crate::settings::{PermissionChecker, SettingsManager};
 use crate::terminal::TerminalClient;
@@ -94,13 +94,10 @@ pub struct Session {
     model_pending: std::sync::atomic::AtomicBool,
     /// ACP MCP server for tool execution with notifications
     acp_mcp_server: Arc<AcpMcpServer>,
+    /// Nori's tools, which a session started ahead of time gets when it is claimed.
+    host_tools: Option<Arc<HostToolsBinding>>,
     /// Background process manager
     background_processes: Arc<BackgroundProcessManager>,
-    /// External MCP servers to connect (from client request)
-    /// Set once during session initialization via set_external_mcp_servers()
-    external_mcp_servers: OnceLock<Vec<McpServer>>,
-    /// Whether external MCP servers have been connected
-    external_mcp_connected: AtomicBool,
     /// Connection context OnceLock for ACP requests (shared with hooks)
     /// Used by pre_tool_use_hook for permission requests
     connection_cx_lock: Arc<OnceLock<ConnectionTo<Client>>>,
@@ -120,6 +117,20 @@ pub struct Session {
     /// Set to true when cancel() is called, reset to false at start of new prompt
     /// Used to distinguish user cancellation from execution errors
     cancelled: AtomicBool,
+    /// Whether a turn is running, and a signal when one ends; see [`Session::wait_until_idle`].
+    turn_running: AtomicBool,
+    turn_ended: tokio::sync::Notify,
+}
+
+/// Marks a session's turn as running until dropped.
+#[derive(Debug)]
+pub struct TurnGuard(Arc<Session>);
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.0.turn_running.store(false, Ordering::SeqCst);
+        self.0.turn_ended.notify_waiters();
+    }
 }
 
 /// Generate a stable cache key from JSON value
@@ -173,6 +184,7 @@ impl Session {
         cwd: PathBuf,
         config: &AgentConfig,
         meta: Option<&NewSessionMeta>,
+        tools: &SessionTools,
     ) -> Result<Arc<Self>> {
         let start_time = Instant::now();
 
@@ -274,8 +286,9 @@ impl Session {
         // Create background process manager
         let background_processes = Arc::new(BackgroundProcessManager::new());
 
-        // Build MCP servers with our ACP server
-        let mut mcp_servers_dict = HashMap::new();
+        // The client's servers and Nori's host tools, then our ACP server, which no client server
+        // may replace.
+        let mut mcp_servers_dict = tools.cli_servers(&["acp"]);
         mcp_servers_dict.insert(
             "acp".to_string(),
             McpServerConfig::Sdk(McpSdkServerConfig {
@@ -440,6 +453,14 @@ impl Session {
             }
         }
 
+        // A new conversation takes the session's id, so loading or resuming it by that id later
+        // finds it. A resumed one keeps the id it was saved under.
+        if options.resume.is_none() {
+            options
+                .extra_args
+                .insert("session-id".to_string(), Some(session_id.clone()));
+        }
+
         // Create the client
         let client = ClaudeClient::new(options);
 
@@ -468,14 +489,15 @@ impl Session {
             current_model: tokio::sync::RwLock::new(None),
             model_pending: std::sync::atomic::AtomicBool::new(false),
             acp_mcp_server,
+            host_tools: tools.host_tools.clone(),
             background_processes,
-            external_mcp_servers: OnceLock::new(),
-            external_mcp_connected: AtomicBool::new(false),
             connection_cx_lock,
             cancel_sender: broadcast::channel(1).0,
             permission_cache,
             tool_use_id_cache,
             cancelled: AtomicBool::new(false),
+            turn_running: AtomicBool::new(false),
+            turn_ended: tokio::sync::Notify::new(),
         };
 
         // Wrap in Arc
@@ -487,59 +509,31 @@ impl Session {
         Ok(session_arc)
     }
 
-    /// Set external MCP servers to connect
-    ///
-    /// # Arguments
-    ///
-    /// * `servers` - List of MCP servers from the client request
-    pub fn set_external_mcp_servers(&self, servers: Vec<McpServer>) {
-        if !servers.is_empty() {
-            tracing::info!(
-                session_id = %self.session_id,
-                server_count = servers.len(),
-                "Storing external MCP servers for later connection"
-            );
+    /// Mark a turn as running until the guard is dropped.
+    pub fn begin_turn(self: &Arc<Self>) -> TurnGuard {
+        self.turn_running.store(true, Ordering::SeqCst);
+        TurnGuard(Arc::clone(self))
+    }
 
-            for server in &servers {
-                match server {
-                    McpServer::Stdio(s) => {
-                        tracing::debug!(
-                            session_id = %self.session_id,
-                            server_name = %s.name,
-                            command = ?s.command,
-                            args = ?s.args,
-                            "External MCP server (stdio)"
-                        );
-                    }
-                    McpServer::Http(s) => {
-                        tracing::debug!(
-                            session_id = %self.session_id,
-                            server_name = %s.name,
-                            url = %s.url,
-                            "External MCP server (http)"
-                        );
-                    }
-                    McpServer::Sse(s) => {
-                        tracing::debug!(
-                            session_id = %self.session_id,
-                            server_name = %s.name,
-                            url = %s.url,
-                            "External MCP server (sse)"
-                        );
-                    }
-                    _ => {
-                        tracing::debug!(
-                            session_id = %self.session_id,
-                            "External MCP server (unknown type)"
-                        );
-                    }
-                }
+    /// Wait until no turn is running and none has started for `quiet`: a moment when background
+    /// work (such as starting the next session's CLI) slows nobody down.
+    pub async fn wait_until_idle(&self, quiet: std::time::Duration) {
+        loop {
+            tokio::time::sleep(quiet).await;
+            let ended = self.turn_ended.notified();
+            if !self.turn_running.load(Ordering::SeqCst) {
+                return;
             }
+            ended.await;
         }
+    }
 
-        // Only set if not already set (configure_acp_server may be called multiple times)
-        if self.external_mcp_servers.get().is_none() {
-            drop(self.external_mcp_servers.set(servers));
+    /// Give a session started ahead of time the tools its request carried.
+    pub fn adopt_tools(&self, tools: &SessionTools) {
+        if let (Some(mine), Some(theirs)) = (&self.host_tools, &tools.host_tools)
+            && let Some(theirs) = theirs.tools()
+        {
+            mine.bind(theirs);
         }
     }
 
@@ -616,149 +610,6 @@ impl Session {
     /// Get a reference to the tool_use_id_cache for sharing with hooks
     pub fn tool_use_id_cache(&self) -> Arc<DashMap<String, String>> {
         Arc::clone(&self.tool_use_id_cache)
-    }
-
-    /// Connect to external MCP servers
-    ///
-    /// This should be called before the first prompt to ensure all
-    /// external MCP tools are available.
-    #[instrument(
-        name = "connect_external_mcp_servers",
-        skip(self),
-        fields(session_id = %self.session_id)
-    )]
-    pub async fn connect_external_mcp_servers(&self) -> Result<()> {
-        // Only connect once
-        if self.external_mcp_connected.load(Ordering::SeqCst) {
-            tracing::debug!(
-                session_id = %self.session_id,
-                "External MCP servers already connected"
-            );
-            return Ok(());
-        }
-
-        // Get servers (no lock needed with OnceLock)
-        let Some(servers) = self.external_mcp_servers.get() else {
-            tracing::debug!(
-                session_id = %self.session_id,
-                "No external MCP servers to connect"
-            );
-            self.external_mcp_connected.store(true, Ordering::SeqCst);
-            return Ok(());
-        };
-
-        // Clone server list to avoid holding reference
-        let servers_vec: Vec<_> = servers.clone();
-
-        let server_count = servers_vec.len();
-        let start_time = Instant::now();
-
-        tracing::info!(
-            session_id = %self.session_id,
-            server_count = server_count,
-            "Connecting to external MCP servers"
-        );
-
-        let external_manager = self.acp_mcp_server.mcp_server().external_manager();
-
-        let mut success_count = 0;
-        let mut error_count = 0;
-
-        for server in &servers_vec {
-            match server {
-                McpServer::Stdio(s) => {
-                    let server_start = Instant::now();
-
-                    tracing::info!(
-                        session_id = %self.session_id,
-                        server_name = %s.name,
-                        command = ?s.command,
-                        args = ?s.args,
-                        "Connecting to external MCP server (stdio)"
-                    );
-
-                    // Convert env variables
-                    let env: Option<HashMap<String, String>> = if s.env.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            s.env
-                                .iter()
-                                .map(|e| (e.name.clone(), e.value.clone()))
-                                .collect(),
-                        )
-                    };
-
-                    match external_manager
-                        .connect(
-                            s.name.clone(),
-                            s.command.to_string_lossy().as_ref(),
-                            &s.args,
-                            env.as_ref(),
-                            Some(self.cwd.as_path()),
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            success_count += 1;
-                            let elapsed = server_start.elapsed();
-                            tracing::info!(
-                                session_id = %self.session_id,
-                                server_name = %s.name,
-                                elapsed_ms = elapsed.as_millis(),
-                                "Successfully connected to external MCP server"
-                            );
-                        }
-                        Err(e) => {
-                            error_count += 1;
-                            let elapsed = server_start.elapsed();
-                            tracing::error!(
-                                session_id = %self.session_id,
-                                server_name = %s.name,
-                                error = %e,
-                                elapsed_ms = elapsed.as_millis(),
-                                "Failed to connect to external MCP server"
-                            );
-                        }
-                    }
-                }
-                McpServer::Http(s) => {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        server_name = %s.name,
-                        url = %s.url,
-                        "HTTP MCP servers not yet supported"
-                    );
-                }
-                McpServer::Sse(s) => {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        server_name = %s.name,
-                        url = %s.url,
-                        "SSE MCP servers not yet supported"
-                    );
-                }
-                _ => {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        "Unknown MCP server type - not supported"
-                    );
-                }
-            }
-        }
-
-        let total_elapsed = start_time.elapsed();
-        tracing::info!(
-            session_id = %self.session_id,
-            total_servers = server_count,
-            success_count = success_count,
-            error_count = error_count,
-            total_elapsed_ms = total_elapsed.as_millis(),
-            "Finished connecting external MCP servers"
-        );
-
-        self.external_mcp_connected.store(true, Ordering::SeqCst);
-        Ok(())
     }
 
     /// Connect to Claude CLI
@@ -1281,7 +1132,7 @@ fn cli_path_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     value.filter(|path| !path.is_empty()).map(PathBuf::from)
 }
 
-fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
 }
 
@@ -1317,8 +1168,7 @@ mod tests {
             "test-session-1".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None,
-        )
+            None, &SessionTools::default())
         .unwrap();
 
         assert_eq!(session.session_id, "test-session-1");
@@ -1334,8 +1184,7 @@ mod tests {
             "test-cancel-session".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None,
-        )
+            None, &SessionTools::default())
         .unwrap();
 
         // 1. Initially cancelled should be false
@@ -1372,8 +1221,7 @@ mod tests {
             "test-session-2".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None,
-        )
+            None, &SessionTools::default())
         .unwrap();
 
         // Note: Cancellation is now handled per-prompt via CancellationToken
@@ -1387,8 +1235,7 @@ mod tests {
             "test-session-3".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None,
-        )
+            None, &SessionTools::default())
         .unwrap();
 
         // Default is Default mode (standard behavior with permission prompts)
@@ -1485,8 +1332,7 @@ mod tests {
             "test-cleanup-session".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None,
-        )
+            None, &SessionTools::default())
         .unwrap();
 
         // Cleanup should succeed even with no processes
@@ -1504,8 +1350,7 @@ mod tests {
             "test-cleanup-with-bg".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None,
-        )
+            None, &SessionTools::default())
         .unwrap();
 
         // Create a mock background process using the process manager
@@ -1629,8 +1474,7 @@ mod tests {
             "test-bundled-cli".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None,
-        )
+            None, &SessionTools::default())
         .unwrap();
 
         // Session should exist without explicitly setting cli_path.

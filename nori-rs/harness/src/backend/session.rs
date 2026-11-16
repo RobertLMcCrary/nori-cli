@@ -9,7 +9,7 @@ async fn session_mcp_servers(
     thread_goal_state: &Arc<Mutex<thread_goal::ThreadGoalState>>,
     backend_event_tx: &mpsc::Sender<BackendEvent>,
     goal_mcp_connected: &Arc<std::sync::atomic::AtomicBool>,
-    goal_mcp_http_server: &Arc<Mutex<Option<nori_client_mcp::NoriClientServer>>>,
+    goal_mcp_http_server: &Arc<Mutex<Option<nori_client_mcp::NoriClient>>>,
     orchestrator: &orchestrator::Orchestrator,
 ) -> Result<Vec<acp::McpServer>> {
     let mut mcp_servers = crate::connection::mcp::to_acp_mcp_servers(
@@ -724,6 +724,7 @@ impl AcpBackend {
             notify_after_idle: config.notify_after_idle,
             edit_journal: Arc::new(EditJournal::new()),
             is_first_prompt: Arc::new(Mutex::new(is_first_prompt_val)),
+            workflow: Arc::default(),
             prompt_summary_enabled: config.prompt_summary_enabled,
             agent_name: config.agent.clone(),
             cli_version: config.cli_version.clone(),
@@ -748,6 +749,7 @@ impl AcpBackend {
             relay_task_abort: Arc::new(Mutex::new(None)),
             orchestrator,
         };
+        backend.load_workflow();
 
         let runtime_backend = backend.clone();
         let runtime_task = tokio::spawn(async move {

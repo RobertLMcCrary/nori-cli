@@ -17,6 +17,7 @@ mod prompt_manager;
 #[allow(clippy::module_inception)]
 mod session;
 mod usage;
+pub mod warm;
 mod wrapped_child;
 
 pub use background_processes::{

@@ -387,6 +387,11 @@ pub fn create_can_use_tool_callback(
                     return handle_exit_plan_mode(session, &tool_use_id, &tool_input).await;
                 }
 
+                // Nori's own tools are the host's: Nori decides what they may do.
+                if crate::mcp::host_tool_name(&tool_name).is_some() {
+                    return PermissionResult::Allow(PermissionResultAllow::default());
+                }
+
                 // Check permission handler first
                 let handler_guard = session.permission().await;
                 let result = handler_guard

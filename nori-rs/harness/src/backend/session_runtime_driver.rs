@@ -488,7 +488,8 @@ impl AcpBackend {
         match completed_turn.prompt.kind {
             QueuedPromptKind::User
             | QueuedPromptKind::GoalContinuation
-            | QueuedPromptKind::TaskResults => {
+            | QueuedPromptKind::TaskResults
+            | QueuedPromptKind::WorkflowHook => {
                 if let Some(last_agent_message) = &completed_turn.last_agent_message
                     && !last_agent_message.is_empty()
                     && !self.post_agent_response_hooks.is_empty()
@@ -576,6 +577,8 @@ impl AcpBackend {
                     }
                 }
 
+                // The workflow's follow-up comes first; the goal continues once it is done.
+                self.maybe_submit_workflow_hook(completed_turn).await;
                 self.maybe_submit_goal_continuation(completed_turn).await;
             }
             QueuedPromptKind::Compact => {
@@ -617,7 +620,9 @@ impl AcpBackend {
             .goal_mcp_connected
             .load(std::sync::atomic::Ordering::Relaxed);
         match completed_turn.prompt.kind {
-            QueuedPromptKind::User | QueuedPromptKind::TaskResults => {}
+            QueuedPromptKind::User
+            | QueuedPromptKind::TaskResults
+            | QueuedPromptKind::WorkflowHook => {}
             QueuedPromptKind::GoalContinuation if can_chain_continuation => {}
             QueuedPromptKind::GoalContinuation
             | QueuedPromptKind::Compact
@@ -708,9 +713,14 @@ impl AcpBackend {
                         ))
                 };
                 match prompt_kind {
-                    QueuedPromptKind::User => self
-                        .edit_journal
-                        .begin_turn(display_text.clone().unwrap_or_default()),
+                    QueuedPromptKind::User => {
+                        self.edit_journal
+                            .begin_turn(display_text.clone().unwrap_or_default());
+                        self.workflow_turn_started().await;
+                    }
+                    QueuedPromptKind::WorkflowHook => {
+                        self.edit_journal.begin_turn("workflow hook".to_string());
+                    }
                     QueuedPromptKind::GoalContinuation => {
                         self.edit_journal
                             .begin_turn("goal continuation".to_string());
@@ -928,6 +938,7 @@ impl AcpBackend {
                 format!("Delivering delegated task results failed: {err}"),
                 false,
             ),
+            QueuedPromptKind::WorkflowHook => (format!("Workflow hook failed: {err}"), false),
             QueuedPromptKind::User => {
                 let error_string = format!("{err:?}");
                 let AcpErrorDetails {

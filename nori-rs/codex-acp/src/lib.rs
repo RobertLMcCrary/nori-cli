@@ -10,6 +10,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
+mod host_tools;
 mod thread;
 
 /// Run the Codex ACP agent as a standalone process, over stdio.
@@ -31,7 +32,14 @@ pub async fn run_main(
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let agent = load_agent(codex_linux_sandbox_exe, None, false, cli_config_overrides).await?;
+    let agent = load_agent(
+        codex_linux_sandbox_exe,
+        None,
+        false,
+        false,
+        cli_config_overrides,
+    )
+    .await?;
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
@@ -58,6 +66,9 @@ pub struct InProcessOptions {
     /// That file is written for whichever Codex the machine has installed, and the one linked
     /// into this process may be older and fail to parse it.
     pub ignore_host_config: bool,
+    /// Whether the host hands sessions its own tools (see `nori_host_tools`). Only a host in the
+    /// same process can.
+    pub host_tools: bool,
 }
 
 /// Run the Codex ACP agent inside the calling process, over `transport`.
@@ -80,6 +91,7 @@ pub async fn serve_in_process(
         options.codex_linux_sandbox_exe,
         options.codex_home,
         options.ignore_host_config,
+        options.host_tools,
         overrides,
     )
     .await?;
@@ -112,6 +124,7 @@ async fn load_agent(
     codex_linux_sandbox_exe: Option<PathBuf>,
     codex_home: Option<PathBuf>,
     ignore_host_config: bool,
+    host_tools: bool,
     cli_config_overrides: CliConfigOverrides,
 ) -> std::io::Result<Arc<codex_agent::CodexAgent>> {
     // Parse CLI overrides and load configuration
@@ -157,6 +170,6 @@ async fn load_agent(
     );
 
     Ok(Arc::new(
-        codex_agent::CodexAgent::new(config, codex_linux_sandbox_exe).await?,
+        codex_agent::CodexAgent::new(config, codex_linux_sandbox_exe, host_tools).await?,
     ))
 }

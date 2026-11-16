@@ -32,9 +32,11 @@ members = [
     "utils/readiness",
     "utils/string",
     "harness",
+    "host-tools",
     "installed",
     "mock-acp-agent",
     "nori-protocol",
+    "script",
     "tui-pty-e2e",
 ]
 resolver = "2"
@@ -82,8 +84,10 @@ codex-windows-sandbox = { path = "windows-sandbox-rs" }
 core_test_support = { path = "core/tests/common" }
 mcp-types = { path = "mcp-types" }
 nori-harness = { path = "harness" }
+nori-host-tools = { path = "host-tools" }
 nori-exec = { path = "exec" }
 nori-installed = { path = "installed" }
+nori-script = { path = "script" }
 
 # External
 allocative = "0.3.3"
@@ -183,6 +187,8 @@ shlex = "1.3.0"
 similar = "2.7.0"
 socket2 = "0.6.0"
 starlark = "0.14.2"
+# Only `std`: no dylibs, JIT, git, HTTP, or markdown.
+steel-core = { version = "0.8.3", default-features = false, features = ["std"] }
 strum = "0.27.2"
 strum_macros = "0.27.2"
 # The pure-Rust fancy-regex engine instead of the C oniguruma one.

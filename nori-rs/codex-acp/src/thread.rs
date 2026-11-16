@@ -81,6 +81,7 @@ use codex_shell_command::parse_command::parse_command;
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
 use itertools::Itertools;
+use nori_host_tools::HostTools;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -347,6 +348,7 @@ pub struct Thread {
 }
 
 impl Thread {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
@@ -354,12 +356,13 @@ impl Thread {
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
+        host_tools: Option<Arc<dyn HostTools>>,
         cx: ConnectionTo<Client>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = mpsc::unbounded_channel();
 
-        let actor = ThreadActor::new(
+        let mut actor = ThreadActor::new(
             auth,
             SessionClient::new(session_id, cx, client_capabilities),
             thread.clone(),
@@ -369,6 +372,7 @@ impl Thread {
             resolution_tx,
             resolution_rx,
         );
+        actor.host_tools = host_tools;
         let handle = tokio::spawn(actor.spawn());
 
         Self {
@@ -889,6 +893,8 @@ struct PromptState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    /// The host's tools, which answer this turn's dynamic tool calls.
+    host_tools: Option<Arc<dyn HostTools>>,
 }
 
 impl PromptState {
@@ -912,6 +918,7 @@ impl PromptState {
             response_tx: Some(response_tx),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            host_tools: None,
         }
     }
 
@@ -1758,10 +1765,22 @@ impl PromptState {
         tool: String,
         arguments: serde_json::Value,
     ) {
+        // With host tools the call is Nori's own: it says which, and Nori's code answers it.
+        let call = match &self.host_tools {
+            Some(_) => ToolCall::new(call_id.clone(), tool.clone())
+                .meta(nori_host_tools::tool_call_meta(&tool)),
+            None => ToolCall::new(call_id.clone(), format!("Tool: {tool}")),
+        };
         client.send_tool_call(
-            ToolCall::new(call_id, format!("Tool: {tool}"))
-                .status(ToolCallStatus::InProgress)
-                .raw_input(serde_json::json!(&arguments)),
+            call.status(ToolCallStatus::InProgress)
+                .raw_input(arguments.clone()),
+        );
+        crate::host_tools::answer(
+            self.host_tools.clone(),
+            Arc::clone(&self.thread),
+            call_id,
+            tool,
+            arguments,
         );
     }
 
@@ -2214,7 +2233,14 @@ impl PromptState {
         } = event;
         let tool_status = image_generation_tool_status(&status);
         let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
-        let content = image_generation_content(revised_prompt, String::new(), saved_path);
+        // An inline image is flattened into the event as `result` (base64); one kept as a file
+        // has only a `fileId`, and is shown through `saved_path`.
+        let result = raw_output
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let content = image_generation_content(revised_prompt, result, saved_path);
 
         if self.active_image_generations.remove(&call_id) {
             client.send_tool_call_update(ToolCallUpdate::new(
@@ -2648,8 +2674,7 @@ impl SessionClient {
         }
     }
 
-    // Only the disabled translation tests build a thread around a stub client.
-    #[cfg(any())]
+    #[cfg(test)]
     fn with_client(
         session_id: SessionId,
         client: Arc<dyn ClientSender>,
@@ -2795,6 +2820,8 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// The host's tools, which answer this thread's dynamic tool calls.
+    host_tools: Option<Arc<dyn HostTools>>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2820,6 +2847,7 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            host_tools: None,
         }
     }
 
@@ -3298,12 +3326,14 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        let state = SubmissionState::Prompt(PromptState::new(
+        let mut prompt = PromptState::new(
             submission_id.clone(),
             self.thread.clone(),
             self.resolution_tx.clone(),
             response_tx,
-        ));
+        );
+        prompt.host_tools = self.host_tools.clone();
+        let state = SubmissionState::Prompt(prompt);
 
         self.submissions.insert(submission_id, state);
 
@@ -4125,6 +4155,14 @@ fn image_generation_content(
         content.push(ToolCallContent::Content(Content::new(ContentBlock::Image(
             image,
         ))));
+    } else if let Some(saved_path) = saved_path.filter(|path| !path.trim().is_empty()) {
+        // Kept as a file only: point at it.
+        content.push(ToolCallContent::Content(Content::new(
+            ContentBlock::ResourceLink(ResourceLink::new(
+                saved_path.clone(),
+                format!("file://{saved_path}"),
+            )),
+        )));
     }
 
     content
@@ -4160,10 +4198,9 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     Some((name, rest))
 }
 
-// These tests drive the translation of Codex events through a stub thread that records and compares
-// the `Op`s it is sent. Since Codex 0.169 an `Op` is neither `Clone` nor `PartialEq` (several carry a
-// reply channel), so the stub needs rebuilding around the new turn API before they can run again.
-#[cfg(any())]
+// These tests drive the translation of Codex events through a stub thread that records the
+// `Op`s it is sent as `Recorded` values and scripts the events it emits back.
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -4173,8 +4210,11 @@ mod tests {
 
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
+    use codex_core_api::TurnInput;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::{ThreadId, protocol::ThreadGoal};
+    use codex_utils_path_uri::{LegacyAppPathString, PathUri};
+    use pretty_assertions::assert_eq;
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -4335,7 +4375,7 @@ mod tests {
             }) if text == "Compact task completed"
         ));
         let ops = thread.ops.lock().unwrap();
-        assert_eq!(ops.as_slice(), &[Op::Compact]);
+        assert_eq!(ops.as_slice(), &[Recorded::Compact]);
 
         Ok(())
     }
@@ -4459,17 +4499,10 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
-            &[Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: INIT_COMMAND_PROMPT.to_string(),
-                    text_elements: vec![]
-                }],
-                final_output_json_schema: None,
-                environments: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            }],
+            &[Recorded::UserInput(vec![UserInput::Text {
+                text: INIT_COMMAND_PROMPT.to_string(),
+                text_elements: vec![]
+            }])],
             "ops don't match {ops:?}"
         );
 
@@ -4506,12 +4539,10 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
-            &[Op::Review {
-                review_request: ReviewRequest {
-                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::UncommittedChanges)),
-                    target: ReviewTarget::UncommittedChanges,
-                }
-            }],
+            &[Recorded::Review(ReviewRequest {
+                user_facing_hint: Some(user_facing_hint(&ReviewTarget::UncommittedChanges)),
+                target: ReviewTarget::UncommittedChanges,
+            })],
             "ops don't match {ops:?}"
         );
 
@@ -4552,16 +4583,14 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
-            &[Op::Review {
-                review_request: ReviewRequest {
-                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::Custom {
-                        instructions: instructions.to_owned()
-                    })),
-                    target: ReviewTarget::Custom {
-                        instructions: instructions.to_owned()
-                    },
-                }
-            }],
+            &[Recorded::Review(ReviewRequest {
+                user_facing_hint: Some(user_facing_hint(&ReviewTarget::Custom {
+                    instructions: instructions.to_owned()
+                })),
+                target: ReviewTarget::Custom {
+                    instructions: instructions.to_owned()
+                },
+            })],
             "ops don't match {ops:?}"
         );
 
@@ -4598,18 +4627,16 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
-            &[Op::Review {
-                review_request: ReviewRequest {
-                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::Commit {
-                        sha: "123456".to_owned(),
-                        title: None
-                    })),
-                    target: ReviewTarget::Commit {
-                        sha: "123456".to_owned(),
-                        title: None
-                    },
-                }
-            }],
+            &[Recorded::Review(ReviewRequest {
+                user_facing_hint: Some(user_facing_hint(&ReviewTarget::Commit {
+                    sha: "123456".to_owned(),
+                    title: None
+                })),
+                target: ReviewTarget::Commit {
+                    sha: "123456".to_owned(),
+                    title: None
+                },
+            })],
             "ops don't match {ops:?}"
         );
 
@@ -4646,16 +4673,14 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
-            &[Op::Review {
-                review_request: ReviewRequest {
-                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::BaseBranch {
-                        branch: "feature".to_owned()
-                    })),
-                    target: ReviewTarget::BaseBranch {
-                        branch: "feature".to_owned()
-                    },
-                }
-            }],
+            &[Recorded::Review(ReviewRequest {
+                user_facing_hint: Some(user_facing_hint(&ReviewTarget::BaseBranch {
+                    branch: "feature".to_owned()
+                })),
+                target: ReviewTarget::BaseBranch {
+                    branch: "feature".to_owned()
+                },
+            })],
             "ops don't match {ops:?}"
         );
 
@@ -4753,10 +4778,73 @@ mod tests {
         }
     }
 
+    /// The parts of a submitted `Op` that the tests assert on. `Op` itself is neither `Clone` nor
+    /// `PartialEq` since Codex 0.169 (several variants carry a reply channel), so the stub records
+    /// this projection instead.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Recorded {
+        UserInput(Vec<UserInput>),
+        Compact,
+        Review(ReviewRequest),
+        ExecApproval {
+            id: String,
+            turn_id: Option<String>,
+            decision: ReviewDecision,
+        },
+        ResolveElicitation {
+            server_name: String,
+            request_id: codex_protocol::mcp::RequestId,
+            decision: ElicitationAction,
+            content: Option<serde_json::Value>,
+            meta: Option<serde_json::Value>,
+        },
+        Interrupt,
+        Shutdown,
+        Other(String),
+    }
+
+    impl Recorded {
+        fn from_op(op: &Op) -> Self {
+            match op {
+                Op::TurnInput { request, .. } => match &request.input {
+                    TurnInput::UserInput { content, .. } => Self::UserInput(content.clone()),
+                    other => Self::Other(format!("{other:?}")),
+                },
+                Op::Compact => Self::Compact,
+                Op::Review { review_request } => Self::Review(review_request.clone()),
+                Op::ExecApproval {
+                    id,
+                    turn_id,
+                    decision,
+                } => Self::ExecApproval {
+                    id: id.clone(),
+                    turn_id: turn_id.clone(),
+                    decision: decision.clone(),
+                },
+                Op::ResolveElicitation {
+                    server_name,
+                    request_id,
+                    decision,
+                    content,
+                    meta,
+                } => Self::ResolveElicitation {
+                    server_name: server_name.clone(),
+                    request_id: request_id.clone(),
+                    decision: *decision,
+                    content: content.clone(),
+                    meta: meta.clone(),
+                },
+                Op::Interrupt => Self::Interrupt,
+                Op::Shutdown => Self::Shutdown,
+                other => Self::Other(format!("{other:?}")),
+            }
+        }
+    }
+
     struct StubCodexThread {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
-        ops: std::sync::Mutex<Vec<Op>>,
+        ops: std::sync::Mutex<Vec<Recorded>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
     }
@@ -4784,10 +4872,20 @@ mod tests {
                     .current_id
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                self.ops.lock().unwrap().push(op.clone());
+                self.ops.lock().unwrap().push(Recorded::from_op(&op));
 
                 match op {
-                    Op::UserInput { items, .. } => {
+                    Op::TurnInput { request, reply, .. } => {
+                        let TurnInput::UserInput { content: items, .. } = request.input else {
+                            unimplemented!("only user input turns are stubbed")
+                        };
+                        // Core accepts every turn input in these tests by starting a new turn.
+                        reply
+                            .send(Ok(TurnInputSubmission::Started {
+                                turn_id: id.to_string(),
+                                root_turn_id: id.to_string(),
+                            }))
+                            .ok();
                         *self.active_prompt_id.lock().unwrap() = Some(id.to_string());
                         let prompt = items
                             .into_iter()
@@ -4812,9 +4910,11 @@ mod tests {
                             send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                 call_id: "call-a".into(),
                                 process_id: None,
+                                plugin_id: None,
+                                script_path: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: PathUri::from_host_native_path(&cwd).unwrap(),
                                 parsed_cmd: vec![ParsedCommand::Unknown {
                                     cmd: "echo a".into(),
                                 }],
@@ -4825,9 +4925,11 @@ mod tests {
                             send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                 call_id: "call-b".into(),
                                 process_id: None,
+                                plugin_id: None,
+                                script_path: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: PathUri::from_host_native_path(&cwd).unwrap(),
                                 parsed_cmd: vec![ParsedCommand::Unknown {
                                     cmd: "echo b".into(),
                                 }],
@@ -4838,41 +4940,42 @@ mod tests {
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-a".into(),
                                 process_id: None,
+                                plugin_id: None,
+                                script_path: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: PathUri::from_host_native_path(&cwd).unwrap(),
                                 parsed_cmd: vec![],
                                 source: Default::default(),
                                 interaction_input: None,
-                                stdout: "a\n".into(),
-                                stderr: String::new(),
                                 aggregated_output: "a\n".into(),
                                 exit_code: 0,
                                 duration: std::time::Duration::from_millis(10),
-                                formatted_output: "a\n".into(),
                                 status: ExecCommandStatus::Completed,
                                 completed_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-b".into(),
                                 process_id: None,
+                                plugin_id: None,
+                                script_path: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: PathUri::from_host_native_path(&cwd).unwrap(),
                                 parsed_cmd: vec![],
                                 source: Default::default(),
                                 interaction_input: None,
-                                stdout: "b\n".into(),
-                                stderr: String::new(),
                                 aggregated_output: "b\n".into(),
                                 exit_code: 0,
                                 duration: std::time::Duration::from_millis(10),
-                                formatted_output: "b\n".into(),
                                 status: ExecCommandStatus::Completed,
                                 completed_at_ms: 0,
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                root_turn_id: None,
+                                error: None,
+                                started_at: None,
                                 turn_id,
                                 completed_at: None,
                                 duration_ms: None,
@@ -4896,11 +4999,21 @@ mod tests {
                                 call_id: "ig-1".into(),
                                 status: "completed".into(),
                                 revised_prompt: Some("A tiny blue square".into()),
-                                result: "Zm9v".into(),
+                                image: serde_json::from_value(
+                                    serde_json::json!({ "result": "Zm9v" }),
+                                )
+                                .unwrap(),
+                                transparent_background: None,
+                                failure: None,
                                 saved_path: Some(saved_path.try_into()?),
+                                input_images: Vec::new(),
+                                generation_id: None,
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
+                                root_turn_id: None,
+                                error: None,
+                                started_at: None,
                                 turn_id,
                                 completed_at: None,
                                 duration_ms: None,
@@ -4933,6 +5046,9 @@ mod tests {
                                     id: id.to_string(),
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
+                                        root_turn_id: None,
+                                        error: None,
+                                        started_at: None,
                                         turn_id,
                                         completed_at: None,
                                         duration_ms: None,
@@ -4947,10 +5063,17 @@ mod tests {
                                     msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                                         call_id: "call-id".to_string(),
                                         approval_id: Some("approval-id".to_string()),
+                                        kind: Default::default(),
+                                        model_context: None,
+                                        plugin_id: None,
+                                        script_path: None,
+                                        environment_id: None,
                                         turn_id: id.to_string(),
                                         started_at_ms: 0,
                                         command: vec!["echo".to_string(), "hi".to_string()],
-                                        cwd: std::env::current_dir().unwrap().try_into().unwrap(),
+                                        cwd: LegacyAppPathString::from_path(
+                                            &std::env::current_dir().unwrap(),
+                                        ),
                                         reason: None,
                                         network_approval_context: None,
                                         proposed_execpolicy_amendment: None,
@@ -4988,6 +5111,9 @@ mod tests {
                                         message: prompt,
                                         phase: None,
                                         memory_citation: None,
+                                        moderation: None,
+                                        delivery: None,
+                                        questions: None,
                                     }),
                                 })
                                 .unwrap();
@@ -4996,6 +5122,9 @@ mod tests {
                                     id: id.to_string(),
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
+                                        root_turn_id: None,
+                                        error: None,
+                                        started_at: None,
                                         turn_id: id.to_string(),
                                         completed_at: None,
                                         duration_ms: None,
@@ -5011,6 +5140,8 @@ mod tests {
                                 id: id.to_string(),
                                 msg: EventMsg::TurnStarted(TurnStartedEvent {
                                     model_context_window: None,
+                                    turn_attribution: None,
+                                    root_turn_id: None,
                                     collaboration_mode_kind: ModeKind::default(),
                                     turn_id: id.to_string(),
                                     trace_id: None,
@@ -5025,6 +5156,9 @@ mod tests {
                                     message: "Compact task completed".to_string(),
                                     phase: None,
                                     memory_citation: None,
+                                    moderation: None,
+                                    delivery: None,
+                                    questions: None,
                                 }),
                             })
                             .unwrap();
@@ -5033,6 +5167,9 @@ mod tests {
                                 id: id.to_string(),
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
+                                    root_turn_id: None,
+                                    error: None,
+                                    started_at: None,
                                     turn_id: id.to_string(),
                                     completed_at: None,
                                     duration_ms: None,
@@ -5045,13 +5182,22 @@ mod tests {
                         self.op_tx
                             .send(Event {
                                 id: id.to_string(),
-                                msg: EventMsg::EnteredReviewMode(review_request.clone()),
+                                msg: EventMsg::EnteredReviewMode(
+                                    codex_protocol::protocol::EnteredReviewModeEvent {
+                                        target: review_request.target.clone(),
+                                        user_facing_hint: review_request.user_facing_hint.clone(),
+                                        turn_id: None,
+                                        item_id: None,
+                                    },
+                                ),
                             })
                             .unwrap();
                         self.op_tx
                             .send(Event {
                                 id: id.to_string(),
                                 msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                                    turn_id: None,
+                                    item_id: None,
                                     review_output: Some(ReviewOutputEvent {
                                         findings: vec![],
                                         overall_correctness: String::new(),
@@ -5069,6 +5215,9 @@ mod tests {
                                 id: id.to_string(),
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
+                                    root_turn_id: None,
+                                    error: None,
+                                    started_at: None,
                                     turn_id: id.to_string(),
                                     completed_at: None,
                                     duration_ms: None,
@@ -5090,6 +5239,9 @@ mod tests {
                                     id: active_prompt_id.clone(),
                                     msg: EventMsg::TurnAborted(TurnAbortedEvent {
                                         turn_id: Some(active_prompt_id),
+                                        root_turn_id: None,
+                                        error: None,
+                                        started_at: None,
                                         reason:
                                             codex_protocol::protocol::TurnAbortReason::Interrupted,
                                         completed_at: None,
@@ -5279,10 +5431,15 @@ mod tests {
             ExecApprovalRequestEvent {
                 call_id: "call-id".to_string(),
                 approval_id: Some("approval-id".to_string()),
+                kind: Default::default(),
+                model_context: None,
+                plugin_id: None,
+                script_path: None,
+                environment_id: None,
                 turn_id: "turn-id".to_string(),
                 started_at_ms: 0,
                 command: vec!["echo".to_string(), "hi".to_string()],
-                cwd: std::env::current_dir()?.try_into()?,
+                cwd: LegacyAppPathString::from_path(&std::env::current_dir()?),
                 reason: None,
                 network_approval_context: None,
                 proposed_execpolicy_amendment: None,
@@ -5329,16 +5486,16 @@ mod tests {
         assert_eq!(option_ids, vec!["approved", "denied"]);
 
         let ops = thread.ops.lock().unwrap();
-        assert!(matches!(
+        assert_eq!(
             ops.last(),
-            Some(Op::ExecApproval {
-                id,
-                turn_id,
+            Some(&Recorded::ExecApproval {
+                id: "approval-id".to_string(),
+                turn_id: Some("turn-id".to_string()),
                 decision: ReviewDecision::Denied {
-                    rejection: String::new(),
+                    rejection: "The user declined to run it".to_string(),
                 },
-            }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
-        ));
+            })
+        );
 
         Ok(())
     }
@@ -5437,7 +5594,7 @@ mod tests {
 
         let op = thread.ops.lock().unwrap().last().cloned().unwrap();
         match op {
-            Op::ResolveElicitation {
+            Recorded::ResolveElicitation {
                 server_name,
                 request_id: codex_protocol::mcp::RequestId::String(id),
                 decision,
@@ -5510,7 +5667,7 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert!(matches!(
             ops.last(),
-            Some(Op::ResolveElicitation {
+            Some(Recorded::ResolveElicitation {
                 server_name,
                 request_id: codex_protocol::mcp::RequestId::String(request_id),
                 decision: ElicitationAction::Decline,
@@ -5543,10 +5700,15 @@ mod tests {
                 EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                     call_id: "call-id".to_string(),
                     approval_id: Some("approval-id".to_string()),
+                    kind: Default::default(),
+                    model_context: None,
+                    plugin_id: None,
+                    script_path: None,
+                    environment_id: None,
                     turn_id: "turn-id".to_string(),
                     started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
-                    cwd: std::env::current_dir()?.try_into()?,
+                    cwd: LegacyAppPathString::from_path(&std::env::current_dir()?),
                     reason: None,
                     network_approval_context: None,
                     proposed_execpolicy_amendment: None,
@@ -5570,6 +5732,9 @@ mod tests {
                     message: "still flowing".to_string(),
                     phase: None,
                     memory_citation: None,
+                    moderation: None,
+                    delivery: None,
+                    questions: None,
                 }),
             )
             .await;
@@ -5619,10 +5784,15 @@ mod tests {
                 EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                     call_id: "call-id".to_string(),
                     approval_id: Some("approval-id".to_string()),
+                    kind: Default::default(),
+                    model_context: None,
+                    plugin_id: None,
+                    script_path: None,
+                    environment_id: None,
                     turn_id: "turn-id".to_string(),
                     started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
-                    cwd: std::env::current_dir()?.try_into()?,
+                    cwd: LegacyAppPathString::from_path(&std::env::current_dir()?),
                     reason: None,
                     network_approval_context: None,
                     proposed_execpolicy_amendment: None,
@@ -5746,7 +5916,7 @@ mod tests {
         notify.notify_one();
 
         let ops = conversation.ops.lock().unwrap();
-        assert!(matches!(ops.last(), Some(Op::Shutdown)));
+        assert!(matches!(ops.last(), Some(Recorded::Shutdown)));
 
         Ok(())
     }
