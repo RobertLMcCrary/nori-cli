@@ -866,6 +866,8 @@ pub enum HotkeyAction {
     PreviousEffort,
     /// Have an agent land the working tree's changes as small, focused commits.
     CommitChanges,
+    /// Open the subagent switcher.
+    SwitchSubagent,
 }
 
 impl HotkeyAction {
@@ -894,6 +896,7 @@ impl HotkeyAction {
             Self::NextEffort => "Next Effort Level",
             Self::PreviousEffort => "Previous Effort Level",
             Self::CommitChanges => "Commit Changes",
+            Self::SwitchSubagent => "Switch Subagent",
         }
     }
 
@@ -926,6 +929,9 @@ impl HotkeyAction {
             Self::CommitChanges => {
                 "Have an agent commit the working tree's changes as small, focused commits"
             }
+            Self::SwitchSubagent => {
+                "Open the subagent switcher: find, preview and switch to a subagent"
+            }
         }
     }
 
@@ -954,6 +960,7 @@ impl HotkeyAction {
             Self::NextEffort => "next_effort",
             Self::PreviousEffort => "previous_effort",
             Self::CommitChanges => "commit_changes",
+            Self::SwitchSubagent => "switch_subagent",
         }
     }
 
@@ -982,6 +989,7 @@ impl HotkeyAction {
             Self::NextEffort => "ctrl+shift+n",
             Self::PreviousEffort => "ctrl+shift+p",
             Self::CommitChanges => "alt+g",
+            Self::SwitchSubagent => "ctrl+space",
         }
     }
 
@@ -1010,6 +1018,7 @@ impl HotkeyAction {
             Self::NextEffort,
             Self::PreviousEffort,
             Self::CommitChanges,
+            Self::SwitchSubagent,
         ]
     }
 }
@@ -1141,6 +1150,8 @@ pub struct HotkeyConfigToml {
     pub previous_effort: Option<HotkeyBinding>,
     /// Hotkey for having an agent commit the working tree's changes.
     pub commit_changes: Option<HotkeyBinding>,
+    /// Hotkey for opening the subagent switcher.
+    pub switch_subagent: Option<HotkeyBinding>,
 }
 
 /// Resolved hotkey configuration with defaults applied.
@@ -1190,6 +1201,8 @@ pub struct HotkeyConfig {
     pub previous_effort: HotkeyBinding,
     /// Hotkey for having an agent commit the working tree's changes.
     pub commit_changes: HotkeyBinding,
+    /// Hotkey for opening the subagent switcher.
+    pub switch_subagent: HotkeyBinding,
 }
 
 impl Default for HotkeyConfig {
@@ -1245,6 +1258,9 @@ impl Default for HotkeyConfig {
                 HotkeyAction::PreviousEffort.default_binding(),
             ),
             commit_changes: HotkeyBinding::from_str(HotkeyAction::CommitChanges.default_binding()),
+            switch_subagent: HotkeyBinding::from_str(
+                HotkeyAction::SwitchSubagent.default_binding(),
+            ),
         }
     }
 }
@@ -1327,6 +1343,10 @@ impl HotkeyConfig {
                 .commit_changes
                 .clone()
                 .unwrap_or(defaults.commit_changes),
+            switch_subagent: toml
+                .switch_subagent
+                .clone()
+                .unwrap_or(defaults.switch_subagent),
         }
     }
 
@@ -1355,6 +1375,7 @@ impl HotkeyConfig {
             HotkeyAction::NextEffort => &self.next_effort,
             HotkeyAction::PreviousEffort => &self.previous_effort,
             HotkeyAction::CommitChanges => &self.commit_changes,
+            HotkeyAction::SwitchSubagent => &self.switch_subagent,
         }
     }
 
@@ -1383,6 +1404,7 @@ impl HotkeyConfig {
             HotkeyAction::NextEffort => self.next_effort = binding,
             HotkeyAction::PreviousEffort => self.previous_effort = binding,
             HotkeyAction::CommitChanges => self.commit_changes = binding,
+            HotkeyAction::SwitchSubagent => self.switch_subagent = binding,
         }
     }
 
@@ -1417,6 +1439,7 @@ impl HotkeyConfig {
             (HotkeyAction::NextEffort, &self.next_effort),
             (HotkeyAction::PreviousEffort, &self.previous_effort),
             (HotkeyAction::CommitChanges, &self.commit_changes),
+            (HotkeyAction::SwitchSubagent, &self.switch_subagent),
         ]
     }
 }

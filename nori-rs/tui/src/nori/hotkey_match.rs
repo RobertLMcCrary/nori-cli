@@ -91,6 +91,10 @@ pub(crate) fn matches_binding(binding: &HotkeyBinding, event: &KeyEvent) -> bool
         return false;
     };
 
+    if is_nul_for_ctrl_space(event) {
+        return key_code == KeyCode::Char(' ') && modifiers == KeyModifiers::CONTROL;
+    }
+
     // A terminal that reports the shifted key (kitty's alternate keys) gives `N` for ctrl+shift+n.
     let same_key = match (event.code, key_code) {
         (KeyCode::Char(typed), KeyCode::Char(bound)) => {
@@ -99,6 +103,16 @@ pub(crate) fn matches_binding(binding: &HotkeyBinding, event: &KeyEvent) -> bool
         (typed, bound) => typed == bound,
     };
     same_key && modifiers_match(event, modifiers)
+}
+
+/// Ctrl+Space is not a character a terminal can type: it sends NUL, which terminals and crossterm
+/// report as space with control, as a bare `Null`, or as `@` with control (NUL is `^@`).
+fn is_nul_for_ctrl_space(event: &KeyEvent) -> bool {
+    match event.code {
+        KeyCode::Null => true,
+        KeyCode::Char('@') => event.modifiers == KeyModifiers::CONTROL,
+        _ => false,
+    }
 }
 
 /// Whether the event's modifiers are the binding's. Some terminals report ctrl+shift+n as an
@@ -121,6 +135,8 @@ pub(crate) fn key_event_to_binding(event: &KeyEvent) -> Option<HotkeyBinding> {
     }
 
     let key_name = match event.code {
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Null => return Some(HotkeyBinding::from_str("ctrl+space")),
         KeyCode::Char(c) => c.to_lowercase().to_string(),
         KeyCode::Enter => "enter".to_string(),
         KeyCode::Esc => "esc".to_string(),
@@ -298,6 +314,47 @@ mod tests {
         let mut event = press(KeyCode::Char('t'), KeyModifiers::CONTROL);
         event.kind = KeyEventKind::Release;
         assert!(key_event_to_binding(&event).is_none());
+    }
+
+    #[test]
+    fn ctrl_space_matches_however_the_terminal_reports_nul() {
+        let binding = HotkeyBinding::from_str("ctrl+space");
+        for event in [
+            press(KeyCode::Char(' '), KeyModifiers::CONTROL),
+            press(KeyCode::Null, KeyModifiers::NONE),
+            press(KeyCode::Null, KeyModifiers::CONTROL),
+            press(KeyCode::Char('@'), KeyModifiers::CONTROL),
+        ] {
+            assert!(matches_binding(&binding, &event), "{event:?}");
+        }
+        assert!(!matches_binding(
+            &binding,
+            &press(KeyCode::Char(' '), KeyModifiers::NONE)
+        ));
+        assert!(!matches_binding(
+            &binding,
+            &press(KeyCode::Char('@'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn nul_does_not_match_other_bindings() {
+        let binding = HotkeyBinding::from_str("ctrl+t");
+        assert!(!matches_binding(
+            &binding,
+            &press(KeyCode::Null, KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn space_bindings_round_trip() {
+        let event = press(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        let binding = key_event_to_binding(&event).unwrap();
+        assert_eq!(binding, HotkeyBinding::from_str("ctrl+space"));
+        assert_eq!(
+            key_event_to_binding(&press(KeyCode::Null, KeyModifiers::NONE)),
+            Some(HotkeyBinding::from_str("ctrl+space"))
+        );
     }
 
     #[test]

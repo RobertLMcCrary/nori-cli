@@ -2,6 +2,7 @@
 source: tui/src/nori/hotkey_picker.rs
 expression: "text.lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
 ---
+
   Hotkeys
   Configure keyboard shortcuts
 
@@ -27,4 +28,5 @@ expression: "text.lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
      Previous Model                  ctrl + p
      Next Effort Level               ctrl + shift + n
      Previous Effort Level           ctrl + shift + p
+     Commit Changes                  alt + g
   ↑↓/j/k move  enter rebind  r reset  esc close
