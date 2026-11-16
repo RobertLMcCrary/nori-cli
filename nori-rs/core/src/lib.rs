@@ -9,7 +9,6 @@ pub mod auth;
 pub mod config;
 pub mod config_loader;
 pub mod features;
-pub mod git_info;
 pub mod mcp;
 mod model_provider_info;
 pub use model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;

@@ -19,7 +19,7 @@ use crate::features::Feature;
 use crate::features::FeatureOverrides;
 use crate::features::Features;
 use crate::features::FeaturesToml;
-use crate::git_info::resolve_root_git_project_for_trust;
+use nori_config::resolve_root_git_project_for_trust;
 use crate::model_family::ModelFamily;
 use crate::model_family::derive_default_model_family;
 use crate::model_family::find_family_for_model;

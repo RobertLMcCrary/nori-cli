@@ -1,7 +1,18 @@
+//! Linked worktrees for auto-worktree sessions, managed in-process with `gix`.
+//!
+//! `gix` can read worktrees but has no call that creates one, so the pieces of
+//! `git worktree add -b` are done here: the branch, the administrative directory under
+//! `<common-dir>/worktrees/`, the `.git` file, and a checkout of HEAD with its index.
+
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::sync::atomic::AtomicBool;
+
+use gix::refs::transaction::Change;
+use gix::refs::transaction::LogChange;
+use gix::refs::transaction::PreviousValue;
+use gix::refs::transaction::RefEdit;
 
 use crate::errors::GitToolingError;
 
@@ -24,91 +35,163 @@ pub struct WorktreeInfo {
     pub branch: Option<String>,
 }
 
-/// Parse the porcelain output of `git worktree list --porcelain` into structured
-/// worktree info. The first record (main worktree) is always skipped.
-pub fn parse_worktree_list_porcelain(output: &str) -> Vec<WorktreeInfo> {
-    if output.trim().is_empty() {
-        return Vec::new();
-    }
-
-    let records: Vec<&str> = output.trim().split("\n\n").collect();
-
-    // Skip first record (main worktree)
-    records
-        .iter()
-        .skip(1)
-        .filter_map(|record| {
-            let record = record.trim();
-            if record.is_empty() {
-                return None;
-            }
-
-            let mut worktree_path = None;
-            let mut branch = None;
-
-            for line in record.lines() {
-                if let Some(path) = line.strip_prefix("worktree ") {
-                    worktree_path = Some(PathBuf::from(path));
-                } else if let Some(branch_ref) = line.strip_prefix("branch ") {
-                    branch = Some(
-                        branch_ref
-                            .strip_prefix("refs/heads/")
-                            .unwrap_or(branch_ref)
-                            .to_string(),
-                    );
-                }
-            }
-
-            worktree_path.map(|path| WorktreeInfo { path, branch })
-        })
-        .collect()
+fn gix_error(error: impl std::fmt::Display) -> GitToolingError {
+    GitToolingError::Gix(error.to_string())
 }
 
 /// List all git worktrees (excluding the main worktree) for the given repo root.
 pub fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeInfo>, GitToolingError> {
-    let output = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
-        .output()?;
-
-    if !output.status.success() {
-        return Err(GitToolingError::GitCommand {
-            command: "git worktree list --porcelain".to_string(),
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
+    let repo = open(repo_root)?;
+    let mut worktrees = Vec::new();
+    for proxy in repo.worktrees().map_err(gix_error)? {
+        let branch = std::fs::read_to_string(proxy.git_dir().join("HEAD"))
+            .ok()
+            .and_then(|head| {
+                head.trim()
+                    .strip_prefix("ref: refs/heads/")
+                    .map(str::to_string)
+            });
+        let path = proxy.base().map_err(gix_error)?;
+        worktrees.push(WorktreeInfo { path, branch });
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_worktree_list_porcelain(&stdout))
+    worktrees.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(worktrees)
 }
 
-/// Create a git worktree at the specified path with the given branch name.
+fn open(repo_root: &Path) -> Result<gix::Repository, GitToolingError> {
+    gix::open(repo_root).map_err(|_| GitToolingError::NotAGitRepository {
+        path: repo_root.to_path_buf(),
+    })
+}
+
+/// Create a git worktree at the specified path with the given branch name, as
+/// `git worktree add <path> -b <branch>` does: the branch starts at HEAD and is checked out
+/// there.
 pub fn create_worktree(
     repo_root: &Path,
     worktree_path: &Path,
     branch_name: &str,
 ) -> Result<PathBuf, GitToolingError> {
-    let output = Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            &worktree_path.to_string_lossy(),
-            "-b",
-            branch_name,
-        ])
-        .current_dir(repo_root)
-        .output()?;
-
-    if !output.status.success() {
-        return Err(GitToolingError::GitCommand {
-            command: format!("git worktree add {}", worktree_path.display()),
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
+    let repo = open(repo_root)?;
+    let head = repo.head_commit().map_err(gix_error)?;
+    let branch_ref = format!("refs/heads/{branch_name}");
+    let worktree_path = std::path::absolute(worktree_path)?;
+    if worktree_path.exists() && std::fs::read_dir(&worktree_path)?.next().is_some() {
+        return Err(GitToolingError::Gix(format!(
+            "{} already exists and is not empty",
+            worktree_path.display()
+        )));
     }
 
-    Ok(worktree_path.to_path_buf())
+    // The branch comes first: if it already exists, nothing else has been touched. gix treats
+    // creating a reference with the value it already has as a no-op, so ask explicitly.
+    if repo.find_reference(branch_ref.as_str()).is_ok() {
+        return Err(GitToolingError::Gix(format!(
+            "a branch named '{branch_name}' already exists"
+        )));
+    }
+    repo.reference(
+        branch_ref.as_str(),
+        head.id,
+        PreviousValue::MustNotExist,
+        format!(
+            "branch: Created from HEAD for worktree {}",
+            worktree_path.display()
+        ),
+    )
+    .map_err(gix_error)?;
+
+    let result = add_checkout(
+        &repo,
+        &worktree_path,
+        &format!("ref: {branch_ref}"),
+        head.tree_id().map_err(gix_error)?.detach(),
+    );
+    if result.is_err() {
+        // Leave no half-made branch behind for a retry to trip on.
+        let _ = repo.find_reference(branch_ref.as_str()).map(|r| r.delete());
+    }
+    result?;
+    Ok(worktree_path)
+}
+
+/// Create a worktree at `worktree_path` with HEAD detached at the current commit, as
+/// `git worktree add --detach <path> HEAD` does. No branch is made.
+pub fn create_detached_worktree(
+    repo_root: &Path,
+    worktree_path: &Path,
+) -> Result<PathBuf, GitToolingError> {
+    let repo = open(repo_root)?;
+    let head = repo.head_commit().map_err(gix_error)?;
+    let worktree_path = std::path::absolute(worktree_path)?;
+    add_checkout(
+        &repo,
+        &worktree_path,
+        &head.id.to_string(),
+        head.tree_id().map_err(gix_error)?.detach(),
+    )?;
+    Ok(worktree_path)
+}
+
+/// Make `worktree_path` a linked worktree whose HEAD file reads `head_line`, with `tree` checked
+/// out and indexed.
+fn add_checkout(
+    repo: &gix::Repository,
+    worktree_path: &Path,
+    head_line: &str,
+    tree: gix::ObjectId,
+) -> Result<(), GitToolingError> {
+    let common_dir = repo.common_dir().to_path_buf();
+    let name = unique_admin_name(&common_dir, worktree_path);
+    let admin_dir = common_dir.join("worktrees").join(&name);
+
+    std::fs::create_dir_all(worktree_path)?;
+    std::fs::create_dir_all(&admin_dir)?;
+    let dot_git = worktree_path.join(".git");
+    std::fs::write(&dot_git, format!("gitdir: {}\n", admin_dir.display()))?;
+    std::fs::write(admin_dir.join("HEAD"), format!("{head_line}\n"))?;
+    std::fs::write(admin_dir.join("commondir"), "../..\n")?;
+    std::fs::write(admin_dir.join("gitdir"), format!("{}\n", dot_git.display()))?;
+
+    let linked = gix::open(worktree_path).map_err(gix_error)?;
+    let mut index = linked.index_from_tree(&tree).map_err(gix_error)?;
+    let options = linked
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(gix_error)?;
+    let objects = linked
+        .objects
+        .clone()
+        .into_arc()
+        .map_err(|error| GitToolingError::Gix(error.to_string()))?;
+    gix::worktree::state::checkout(
+        &mut index,
+        worktree_path,
+        objects,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &AtomicBool::new(false),
+        options,
+    )
+    .map_err(gix_error)?;
+    index.write(Default::default()).map_err(gix_error)?;
+    Ok(())
+}
+
+/// The name of the administrative directory: the worktree's directory name, made unique the way
+/// git does it by appending a number.
+fn unique_admin_name(common_dir: &Path, worktree_path: &Path) -> String {
+    let base = worktree_path.file_name().map_or_else(
+        || "worktree".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let taken = |name: &str| common_dir.join("worktrees").join(name).exists();
+    if !taken(&base) {
+        return base;
+    }
+    (1..)
+        .map(|n| format!("{base}{n}"))
+        .find(|name| !taken(name))
+        .unwrap_or(base)
 }
 
 /// Ensure an entry exists in the repo's .gitignore file.
@@ -212,28 +295,65 @@ pub fn summary_to_branch_name(summary: &str) -> String {
     format!("auto/{truncated}-{timestamp}")
 }
 
-/// Rename a git worktree's branch in place.
+/// Rename a git worktree's branch in place, as `git branch -m` does.
 ///
-/// Runs `git branch -m` to rename the branch. The worktree directory is left
-/// unchanged so that processes running inside it are not disrupted.
+/// The worktree directory is left unchanged so that processes running inside it are not
+/// disrupted. Every worktree whose HEAD names the old branch follows it to the new name.
 pub fn rename_worktree_branch(
     repo_root: &Path,
     old_branch: &str,
     new_branch: &str,
 ) -> Result<(), GitToolingError> {
-    let output = Command::new("git")
-        .args(["branch", "-m", old_branch, new_branch])
-        .current_dir(repo_root)
-        .output()?;
+    let repo = open(repo_root)?;
+    let old_ref = format!("refs/heads/{old_branch}");
+    let new_ref = format!("refs/heads/{new_branch}");
 
-    if !output.status.success() {
-        return Err(GitToolingError::GitCommand {
-            command: format!("git branch -m {old_branch} {new_branch}"),
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
+    let old = repo
+        .find_reference(old_ref.as_str())
+        .map_err(|_| GitToolingError::Gix(format!("branch '{old_branch}' not found")))?;
+    let target = old.id().detach();
+    if repo.find_reference(new_ref.as_str()).is_ok() {
+        return Err(GitToolingError::Gix(format!(
+            "a branch named '{new_branch}' already exists"
+        )));
     }
 
+    let log = || LogChange {
+        message: format!("branch: renamed {old_ref} to {new_ref}").into(),
+        ..Default::default()
+    };
+    repo.edit_references([
+        RefEdit {
+            change: Change::Update {
+                log: log(),
+                expected: PreviousValue::MustNotExist,
+                new: gix::refs::Target::Object(target),
+            },
+            name: new_ref.as_str().try_into().map_err(gix_error)?,
+            deref: false,
+        },
+        RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(target)),
+                log: gix::refs::transaction::RefLog::AndReference,
+            },
+            name: old_ref.as_str().try_into().map_err(gix_error)?,
+            deref: false,
+        },
+    ])
+    .map_err(gix_error)?;
+
+    // HEAD files that pointed at the old name, in the main working tree and every linked one.
+    let mut heads = vec![repo.common_dir().join("HEAD")];
+    if let Ok(proxies) = repo.worktrees() {
+        heads.extend(proxies.iter().map(|proxy| proxy.git_dir().join("HEAD")));
+    }
+    let (from, to) = (format!("ref: {old_ref}"), format!("ref: {new_ref}\n"));
+    for head in heads {
+        if std::fs::read_to_string(&head).is_ok_and(|text| text.trim() == from) {
+            std::fs::write(&head, &to)?;
+        }
+    }
     Ok(())
 }
 
@@ -379,79 +499,6 @@ mod tests {
 
         let content = std::fs::read_to_string(temp.path().join(".gitignore")).unwrap();
         assert!(content.contains(".worktrees/"));
-    }
-
-    #[test]
-    fn test_parse_worktree_list_porcelain_multiple_worktrees() {
-        let output = "\
-worktree /home/user/project
-HEAD abc123def456
-branch refs/heads/main
-
-worktree /home/user/project/.worktrees/feature-auth
-HEAD def456abc789
-branch refs/heads/feature/auth
-
-worktree /home/user/project/.worktrees/bugfix-login
-HEAD 111222333444
-branch refs/heads/bugfix/login
-";
-        let worktrees = parse_worktree_list_porcelain(output);
-        assert_eq!(worktrees.len(), 2, "should skip main worktree, return 2");
-        assert_eq!(
-            worktrees[0].path,
-            PathBuf::from("/home/user/project/.worktrees/feature-auth")
-        );
-        assert_eq!(worktrees[0].branch, Some("feature/auth".to_string()));
-        assert_eq!(
-            worktrees[1].path,
-            PathBuf::from("/home/user/project/.worktrees/bugfix-login")
-        );
-        assert_eq!(worktrees[1].branch, Some("bugfix/login".to_string()));
-    }
-
-    #[test]
-    fn test_parse_worktree_list_porcelain_only_main() {
-        let output = "\
-worktree /home/user/project
-HEAD abc123def456
-branch refs/heads/main
-";
-        let worktrees = parse_worktree_list_porcelain(output);
-        assert_eq!(
-            worktrees.len(),
-            0,
-            "should return empty when only main worktree exists"
-        );
-    }
-
-    #[test]
-    fn test_parse_worktree_list_porcelain_empty() {
-        let worktrees = parse_worktree_list_porcelain("");
-        assert_eq!(worktrees.len(), 0, "should return empty for empty input");
-    }
-
-    #[test]
-    fn test_parse_worktree_list_porcelain_bare_and_detached() {
-        let output = "\
-worktree /home/user/project
-HEAD abc123def456
-branch refs/heads/main
-
-worktree /home/user/project/.worktrees/detached-work
-HEAD 999888777666
-detached
-";
-        let worktrees = parse_worktree_list_porcelain(output);
-        assert_eq!(worktrees.len(), 1);
-        assert_eq!(
-            worktrees[0].path,
-            PathBuf::from("/home/user/project/.worktrees/detached-work")
-        );
-        assert_eq!(
-            worktrees[0].branch, None,
-            "detached worktree should have no branch"
-        );
     }
 
     #[test]
@@ -622,5 +669,163 @@ detached
             !branches.contains("auto/old-name"),
             "old branch name should not exist"
         );
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// The worktree we build must be one the `git` binary accepts as its own and finds clean.
+    #[test]
+    fn test_created_worktree_is_a_real_clean_checkout() {
+        let temp = init_temp_repo();
+        std::fs::create_dir_all(temp.path().join("src/deep")).unwrap();
+        std::fs::write(temp.path().join("src/deep/a.txt"), "deep\n").unwrap();
+        std::fs::write(temp.path().join("run.sh"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                temp.path().join("run.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "-m", "more"]);
+
+        let path = temp.path().join(".worktrees").join("feature");
+        std::fs::create_dir_all(temp.path().join(".worktrees")).unwrap();
+        create_worktree(temp.path(), &path, "auto/feature").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path.join("README.md")).unwrap(),
+            "init"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("src/deep/a.txt")).unwrap(),
+            "deep\n"
+        );
+        assert_eq!(
+            git(&path, &["status", "--porcelain"]),
+            "",
+            "checkout must be clean"
+        );
+        assert_eq!(
+            git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "auto/feature"
+        );
+        assert_eq!(
+            git(&path, &["rev-parse", "HEAD"]),
+            git(temp.path(), &["rev-parse", "HEAD"]),
+            "the branch starts at HEAD"
+        );
+        let listed = git(temp.path(), &["worktree", "list", "--porcelain"]);
+        assert!(
+            listed.contains("branch refs/heads/auto/feature"),
+            "{listed}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "the executable bit is kept");
+        }
+    }
+
+    #[test]
+    fn test_create_worktree_refuses_an_existing_branch_and_changes_nothing() {
+        let temp = init_temp_repo();
+        git(temp.path(), &["branch", "taken"]);
+        let path = temp.path().join(".worktrees").join("taken");
+        std::fs::create_dir_all(temp.path().join(".worktrees")).unwrap();
+
+        assert!(create_worktree(temp.path(), &path, "taken").is_err());
+        assert!(!path.exists(), "no directory is left behind");
+        assert_eq!(
+            git(temp.path(), &["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_two_worktrees_with_the_same_directory_name_get_distinct_admin_dirs() {
+        let temp = init_temp_repo();
+        let a = temp.path().join("a").join("same");
+        let b = temp.path().join("b").join("same");
+        create_worktree(temp.path(), &a, "branch-a").unwrap();
+        create_worktree(temp.path(), &b, "branch-b").unwrap();
+
+        assert_eq!(
+            git(&a, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "branch-a"
+        );
+        assert_eq!(
+            git(&b, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "branch-b"
+        );
+        assert_eq!(list_worktrees(temp.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_rename_follows_the_worktree_that_has_the_branch_checked_out() {
+        let temp = init_temp_repo();
+        let path = temp.path().join("wt");
+        create_worktree(temp.path(), &path, "old-name").unwrap();
+
+        rename_worktree_branch(temp.path(), "old-name", "new-name").unwrap();
+
+        assert_eq!(
+            git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "new-name"
+        );
+        assert_eq!(
+            git(temp.path(), &["branch", "--list", "old-name"]).trim(),
+            ""
+        );
+        let info = list_worktrees(temp.path()).unwrap();
+        assert_eq!(info[0].branch.as_deref(), Some("new-name"));
+    }
+
+    #[test]
+    fn test_rename_refuses_a_taken_name() {
+        let temp = init_temp_repo();
+        git(temp.path(), &["branch", "one"]);
+        git(temp.path(), &["branch", "two"]);
+        assert!(rename_worktree_branch(temp.path(), "one", "two").is_err());
+        assert!(rename_worktree_branch(temp.path(), "missing", "x").is_err());
+    }
+
+    #[test]
+    fn test_detached_worktree_is_a_clean_checkout_at_head_with_no_branch() {
+        let temp = init_temp_repo();
+        let path = temp.path().join(".worktrees").join("task");
+        create_detached_worktree(temp.path(), &path).unwrap();
+
+        assert_eq!(git(&path, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "HEAD"
+        );
+        assert_eq!(
+            git(&path, &["rev-parse", "HEAD"]),
+            git(temp.path(), &["rev-parse", "HEAD"])
+        );
+        assert_eq!(git(temp.path(), &["branch", "--list"]).lines().count(), 1);
     }
 }

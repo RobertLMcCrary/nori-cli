@@ -12,22 +12,12 @@ pub(super) async fn create(cwd: &Path) -> Result<PathBuf, String> {
         "nori-task-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
-    // gix cannot add worktrees; git does, off the hot path.
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["worktree", "add", "--detach"])
-        .arg(&path)
-        .arg("HEAD")
-        .output()
+    let repo_root = root.clone();
+    let worktree = path.clone();
+    tokio::task::spawn_blocking(move || codex_git::create_detached_worktree(&repo_root, &worktree))
         .await
-        .map_err(|error| format!("could not run git to add a worktree: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git could not add a worktree: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
+        .map_err(|error| format!("adding a worktree was interrupted: {error}"))?
+        .map_err(|error| format!("could not add a worktree: {error}"))?;
     exclude_worktrees(cwd);
     Ok(path)
 }
