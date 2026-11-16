@@ -98,7 +98,19 @@ pub(crate) fn matches_binding(binding: &HotkeyBinding, event: &KeyEvent) -> bool
         }
         (typed, bound) => typed == bound,
     };
-    same_key && event.modifiers == modifiers
+    same_key && modifiers_match(event, modifiers)
+}
+
+/// Whether the event's modifiers are the binding's. Some terminals report ctrl+shift+n as an
+/// uppercase `N` with only ctrl set, dropping the shift they just folded into the letter, so a
+/// binding that needs shift also accepts an uppercase letter without it.
+fn modifiers_match(event: &KeyEvent, wanted: KeyModifiers) -> bool {
+    if event.modifiers == wanted {
+        return true;
+    }
+    matches!(event.code, KeyCode::Char(typed) if typed.is_uppercase())
+        && wanted.contains(KeyModifiers::SHIFT)
+        && event.modifiers | KeyModifiers::SHIFT == wanted
 }
 
 /// Convert a `KeyEvent` to a `HotkeyBinding` string for persistence.
@@ -299,5 +311,52 @@ mod tests {
         // Also verify the reverse: key_event_to_binding produces the same binding
         let roundtripped = key_event_to_binding(&event).unwrap();
         assert_eq!(roundtripped, binding);
+    }
+
+    #[test]
+    fn a_binding_with_shift_accepts_an_uppercase_letter_that_lost_its_shift_flag() {
+        let binding = HotkeyBinding::from_str("ctrl+shift+n");
+        let press = |code, modifiers| {
+            let mut event = KeyEvent::new(code, modifiers);
+            event.kind = KeyEventKind::Press;
+            event
+        };
+        assert!(matches_binding(
+            &binding,
+            &press(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )
+        ));
+        assert!(matches_binding(
+            &binding,
+            &press(
+                KeyCode::Char('N'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )
+        ));
+        assert!(
+            matches_binding(&binding, &press(KeyCode::Char('N'), KeyModifiers::CONTROL)),
+            "uppercase with ctrl only is ctrl+shift"
+        );
+        assert!(
+            !matches_binding(&binding, &press(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            "plain ctrl+n stays ctrl+n"
+        );
+        let plain = HotkeyBinding::from_str("ctrl+n");
+        assert!(matches_binding(
+            &plain,
+            &press(KeyCode::Char('n'), KeyModifiers::CONTROL)
+        ));
+        assert!(
+            !matches_binding(
+                &plain,
+                &press(
+                    KeyCode::Char('N'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                )
+            ),
+            "ctrl+n must not fire for ctrl+shift+n"
+        );
     }
 }

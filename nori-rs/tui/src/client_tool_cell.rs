@@ -376,9 +376,9 @@ impl ClientToolCell {
         let bullet = if active {
             spinner(self.start_time, self.animations_enabled)
         } else if self.snapshot.phase == crate::presentation::ToolPhase::Failed {
-            "•".red().bold()
+            "⇢".red().bold()
         } else {
-            "•".dim()
+            "⇢".cyan().bold()
         };
         let mut lines = vec![Line::from(vec![
             bullet,
@@ -401,7 +401,8 @@ impl ClientToolCell {
         lines
     }
 
-    /// One of Nori's git or goal tools: what it did, with a tone per line.
+    /// One of Nori's git or goal tools: what it did, with a glyph for what it is and a tone for
+    /// every piece of text, and its details hung off a small tree.
     fn render_native_lines(&self, call: &crate::presentation::NativeCall) -> Vec<Line<'static>> {
         use crate::presentation::NativeTone as Tone;
 
@@ -416,30 +417,42 @@ impl ClientToolCell {
                 crate::presentation::Artifact::Diff(_) => None,
             });
         let view = crate::presentation::native_view(call, active, failed, result);
-        let bullet = if active {
-            spinner(self.start_time, self.animations_enabled)
-        } else if failed {
-            "•".red().bold()
-        } else {
-            "•".green().bold()
-        };
         let style = |text: String, tone: Tone| -> Span<'static> {
             match tone {
                 Tone::Plain => text.into(),
+                Tone::Strong => text.bold(),
+                Tone::Accent => text.cyan().bold(),
                 Tone::Dim => text.dim(),
                 Tone::Added => text.green(),
                 Tone::Modified => text.cyan(),
-                Tone::Deleted => text.red(),
-                Tone::Error => text.red(),
+                Tone::Deleted | Tone::Error => text.red(),
             }
         };
-        let mut lines = vec![Line::from(vec![bullet, " ".into(), view.header.bold()])];
+        // The glyph says what kind of call this is; its color says how it went.
+        let glyph = if active {
+            spinner(self.start_time, self.animations_enabled)
+        } else if failed {
+            view.glyph.red().bold()
+        } else if view.glyph == "◆" {
+            view.glyph.green().bold()
+        } else {
+            view.glyph.cyan().bold()
+        };
+        let mut header = vec![glyph, " ".into()];
+        header.extend(
+            view.header
+                .into_iter()
+                .map(|part| style(part.text, part.tone)),
+        );
+        let mut lines = vec![Line::from(header)];
+        let count = view.detail.len();
         for (index, detail) in view.detail.into_iter().enumerate() {
-            let mut spans = vec![if index == 0 {
-                "  └ ".dim()
+            let connector = if index + 1 == count {
+                "  └ "
             } else {
-                "    ".into()
-            }];
+                "  ├ "
+            };
+            let mut spans = vec![connector.dim()];
             if let Some((marker, tone)) = detail.marker {
                 spans.push(style(marker.to_string(), tone));
                 spans.push(" ".into());
@@ -2722,10 +2735,10 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "• Git status · main".to_string(),
-                "  └ 2 changes".to_string(),
-                "    M a.rs".to_string(),
-                "    A b.rs".to_string(),
+                "⎇ Git status  main".to_string(),
+                "  ├ 2 changes".to_string(),
+                "  ├ M a.rs".to_string(),
+                "  └ A b.rs".to_string(),
             ]
         );
         assert!(
@@ -2752,9 +2765,9 @@ mod tests {
         assert_eq!(
             render_lines(&done.display_lines(80)),
             vec![
-                "• Committed 07a5d0f · feat(math): add sub".to_string(),
-                "  └ math.py".to_string(),
-                "    nothing left uncommitted".to_string(),
+                "◆ Committed 07a5d0f  feat(math): add sub".to_string(),
+                "  ├ math.py".to_string(),
+                "  └ ✓ nothing left uncommitted".to_string(),
             ]
         );
 
@@ -2770,7 +2783,7 @@ mod tests {
         );
         let lines = render_lines(&running.display_lines(80));
         assert!(
-            lines[0].ends_with("Committing 1 file · feat(math): add sub"),
+            lines[0].ends_with("Committing 1 file  feat(math): add sub"),
             "{lines:?}"
         );
     }
@@ -2790,7 +2803,7 @@ mod tests {
         assert_eq!(
             render_lines(&cell.display_lines(80)),
             vec![
-                "• Commit failed".to_string(),
+                "◆ Commit failed".to_string(),
                 "  └ none of those paths differ from HEAD".to_string(),
             ]
         );

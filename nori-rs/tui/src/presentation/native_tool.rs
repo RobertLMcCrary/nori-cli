@@ -72,10 +72,14 @@ const TOOLS: [&str; 5] = [
     "update_goal",
 ];
 
-/// How a detail line should look.
+/// How a piece of text should look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tone {
     Plain,
+    /// Bold: the thing a line is about.
+    Strong,
+    /// Cyan: a hash, a branch, an identifier.
+    Accent,
     Dim,
     Added,
     Modified,
@@ -99,14 +103,57 @@ impl DetailLine {
             tone,
         }
     }
+
+    fn file(marker: Option<(char, Tone)>, path: impl Into<String>) -> Self {
+        Self {
+            marker,
+            text: path.into(),
+            tone: Tone::Plain,
+        }
+    }
 }
 
-/// What a native call looks like: a header and detail lines.
+/// A run of header text and how to style it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Part {
+    pub text: String,
+    pub tone: Tone,
+}
+
+fn part(text: impl Into<String>, tone: Tone) -> Part {
+    Part {
+        text: text.into(),
+        tone,
+    }
+}
+
+/// What a native call looks like: a glyph, a header of styled parts, and detail lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeView {
-    pub header: String,
+    /// What kind of call this is, in one character.
+    pub glyph: &'static str,
+    pub header: Vec<Part>,
     pub detail: Vec<DetailLine>,
 }
+
+impl NativeView {
+    /// The header as plain text, for transcripts and tests.
+    pub(crate) fn header_text(&self) -> String {
+        self.header.iter().map(|part| part.text.as_str()).collect()
+    }
+
+    fn new(glyph: &'static str, header: Vec<Part>, detail: Vec<DetailLine>) -> Self {
+        Self {
+            glyph,
+            header,
+            detail,
+        }
+    }
+}
+
+const GIT: &str = "⎇";
+const COMMIT: &str = "◆";
+const GOAL: &str = "◎";
 
 /// Files a status lists before it says how many more there are.
 const FILES_SHOWN: usize = 8;
@@ -120,18 +167,19 @@ pub(crate) fn view(
     result: Option<&str>,
 ) -> NativeView {
     if failed {
-        return NativeView {
-            header: match call {
-                NativeCall::GitStatus => "Could not read git status",
-                NativeCall::GitCommit { .. } => "Commit failed",
-                _ => "Goal tool failed",
-            }
-            .to_owned(),
-            detail: result
+        let (glyph, title) = match call {
+            NativeCall::GitStatus => (GIT, "Could not read git status"),
+            NativeCall::GitCommit { .. } => (COMMIT, "Commit failed"),
+            _ => (GOAL, "Goal tool failed"),
+        };
+        return NativeView::new(
+            glyph,
+            vec![part(title, Tone::Strong)],
+            result
                 .and_then(first_line)
                 .map(|line| vec![DetailLine::text(line, Tone::Error)])
                 .unwrap_or_default(),
-        };
+        );
     }
     let json = result.and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
     match call {
@@ -140,26 +188,34 @@ pub(crate) fn view(
             commit_view(active, paths, message, json.as_ref())
         }
         NativeCall::GetGoal => goal_view(
-            if active { "Reading the goal" } else { "Goal" },
+            active,
             json.as_ref()
                 .and_then(|json| json.get("goal"))
                 .filter(|goal| !goal.is_null()),
         ),
-        NativeCall::CreateGoal { objective } => NativeView {
-            header: if active { "Setting a goal" } else { "Goal set" }.to_owned(),
-            detail: vec![DetailLine::text(objective.clone(), Tone::Dim)],
-        },
-        NativeCall::UpdateGoal { status } => NativeView {
-            header: format!(
-                "{} {status}",
-                if active {
-                    "Marking the goal"
-                } else {
-                    "Goal marked"
-                }
-            ),
-            detail: Vec::new(),
-        },
+        NativeCall::CreateGoal { objective } => NativeView::new(
+            GOAL,
+            vec![part(
+                if active { "Setting a goal" } else { "Goal set" },
+                Tone::Strong,
+            )],
+            vec![DetailLine::text(objective.clone(), Tone::Dim)],
+        ),
+        NativeCall::UpdateGoal { status } => NativeView::new(
+            GOAL,
+            vec![
+                part(
+                    if active {
+                        "Marking the goal "
+                    } else {
+                        "Goal marked "
+                    },
+                    Tone::Strong,
+                ),
+                part(status.clone(), Tone::Accent),
+            ],
+            Vec::new(),
+        ),
     }
 }
 
@@ -172,15 +228,18 @@ fn first_line(text: &str) -> Option<String> {
 
 fn status_view(active: bool, json: Option<&serde_json::Value>) -> NativeView {
     let Some(json) = json else {
-        return NativeView {
-            header: if active {
-                "Reading git status"
-            } else {
-                "Git status"
-            }
-            .to_owned(),
-            detail: Vec::new(),
-        };
+        return NativeView::new(
+            GIT,
+            vec![part(
+                if active {
+                    "Reading git status"
+                } else {
+                    "Git status"
+                },
+                Tone::Strong,
+            )],
+            Vec::new(),
+        );
     };
     let branch = json.get("branch").and_then(serde_json::Value::as_str);
     let changes = json
@@ -188,15 +247,20 @@ fn status_view(active: bool, json: Option<&serde_json::Value>) -> NativeView {
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let header = match branch {
-        Some(branch) => format!("Git status · {branch}"),
-        None => "Git status · detached HEAD".to_owned(),
-    };
+    let header = vec![
+        part("Git status", Tone::Strong),
+        part("  ", Tone::Plain),
+        match branch {
+            Some(branch) => part(branch, Tone::Accent),
+            None => part("detached HEAD", Tone::Dim),
+        },
+    ];
     if changes.is_empty() {
-        return NativeView {
+        return NativeView::new(
+            GIT,
             header,
-            detail: vec![DetailLine::text("working tree clean", Tone::Dim)],
-        };
+            vec![DetailLine::text("✓ working tree clean", Tone::Added)],
+        );
     }
     let mut detail = vec![DetailLine::text(
         format!(
@@ -220,11 +284,7 @@ fn status_view(active: bool, json: Option<&serde_json::Value>) -> NativeView {
             Some("deleted") => ('D', Tone::Deleted),
             _ => ('M', Tone::Modified),
         };
-        detail.push(DetailLine {
-            marker: Some(marker),
-            text: path.to_owned(),
-            tone: Tone::Plain,
-        });
+        detail.push(DetailLine::file(Some(marker), path));
     }
     if changes.len() > FILES_SHOWN {
         detail.push(DetailLine::text(
@@ -232,7 +292,7 @@ fn status_view(active: bool, json: Option<&serde_json::Value>) -> NativeView {
             Tone::Dim,
         ));
     }
-    NativeView { header, detail }
+    NativeView::new(GIT, header, detail)
 }
 
 fn commit_view(
@@ -248,14 +308,12 @@ fn commit_view(
         if paths.len() == 1 { "file" } else { "files" }
     );
     if active || json.is_none() {
-        return NativeView {
-            header: if summary.is_empty() {
-                format!("Committing {files}")
-            } else {
-                format!("Committing {files} · {summary}")
-            },
-            detail: Vec::new(),
-        };
+        let mut header = vec![part(format!("Committing {files}"), Tone::Strong)];
+        if !summary.is_empty() {
+            header.push(part("  ", Tone::Plain));
+            header.push(part(summary, Tone::Dim));
+        }
+        return NativeView::new(COMMIT, header, Vec::new());
     }
     let commit = json
         .and_then(|json| json.get("commit"))
@@ -264,19 +322,19 @@ fn commit_view(
     let remaining = json
         .and_then(|json| json.get("remaining_changes"))
         .and_then(serde_json::Value::as_u64);
-    let header = match (&commit, summary.is_empty()) {
-        (Some(id), false) => format!("Committed {id} · {summary}"),
-        (Some(id), true) => format!("Committed {id}"),
-        (None, _) => format!("Committed {files}"),
-    };
+    let mut header = vec![part("Committed", Tone::Strong), part(" ", Tone::Plain)];
+    match &commit {
+        Some(id) => header.push(part(id.clone(), Tone::Accent)),
+        None => header.push(part(files, Tone::Plain)),
+    }
+    if !summary.is_empty() {
+        header.push(part("  ", Tone::Plain));
+        header.push(part(summary, Tone::Plain));
+    }
     let mut detail: Vec<DetailLine> = paths
         .iter()
         .take(FILES_SHOWN)
-        .map(|path| DetailLine {
-            marker: None,
-            text: path.clone(),
-            tone: Tone::Plain,
-        })
+        .map(|path| DetailLine::file(None, path.clone()))
         .collect();
     if paths.len() > FILES_SHOWN {
         detail.push(DetailLine::text(
@@ -284,25 +342,29 @@ fn commit_view(
             Tone::Dim,
         ));
     }
-    if let Some(remaining) = remaining {
-        detail.push(DetailLine::text(
-            if remaining == 0 {
-                "nothing left uncommitted".to_owned()
-            } else {
-                format!("{remaining} still uncommitted")
-            },
+    match remaining {
+        Some(0) => detail.push(DetailLine::text("✓ nothing left uncommitted", Tone::Added)),
+        Some(left) => detail.push(DetailLine::text(
+            format!("{left} still uncommitted"),
             Tone::Dim,
-        ));
+        )),
+        None => {}
     }
-    NativeView { header, detail }
+    NativeView::new(COMMIT, header, detail)
 }
 
-fn goal_view(header: &str, goal: Option<&serde_json::Value>) -> NativeView {
+fn goal_view(active: bool, goal: Option<&serde_json::Value>) -> NativeView {
+    let title = if active { "Reading the goal" } else { "Goal" };
     let Some(goal) = goal else {
-        return NativeView {
-            header: format!("{header} · none set"),
-            detail: Vec::new(),
-        };
+        return NativeView::new(
+            GOAL,
+            vec![
+                part(title, Tone::Strong),
+                part("  ", Tone::Plain),
+                part("none set", Tone::Dim),
+            ],
+            Vec::new(),
+        );
     };
     let objective = goal
         .get("objective")
@@ -312,14 +374,19 @@ fn goal_view(header: &str, goal: Option<&serde_json::Value>) -> NativeView {
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    NativeView {
-        header: if status.is_empty() {
-            header.to_owned()
-        } else {
-            format!("{header} · {status}")
-        },
-        detail: vec![DetailLine::text(objective, Tone::Dim)],
+    let mut header = vec![part(title, Tone::Strong)];
+    if !status.is_empty() {
+        header.push(part("  ", Tone::Plain));
+        header.push(part(
+            status,
+            match status {
+                "complete" => Tone::Added,
+                "blocked" => Tone::Error,
+                _ => Tone::Accent,
+            },
+        ));
     }
+    NativeView::new(GOAL, header, vec![DetailLine::text(objective, Tone::Plain)])
 }
 
 #[cfg(test)]
@@ -364,7 +431,9 @@ mod tests {
         let result = r#"{"branch":"main","head":"abc","changes":[
             {"path":"a.rs","state":"modified"},{"path":"new.rs","state":"added"},{"path":"old.rs","state":"deleted"}]}"#;
         let view = view(&NativeCall::GitStatus, false, false, Some(result));
-        assert_eq!(view.header, "Git status · main");
+        assert_eq!(view.glyph, "⎇");
+        assert_eq!(view.header_text(), "Git status  main");
+        assert_eq!(view.header[2], part("main", Tone::Accent));
         assert_eq!(view.detail[0], DetailLine::text("3 changes", Tone::Dim));
         assert_eq!(view.detail[1].marker, Some(('M', Tone::Modified)));
         assert_eq!(view.detail[2].marker, Some(('A', Tone::Added)));
@@ -382,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             clean.detail,
-            vec![DetailLine::text("working tree clean", Tone::Dim)]
+            vec![DetailLine::text("✓ working tree clean", Tone::Added)]
         );
 
         let many: Vec<String> = (0..11)
@@ -403,9 +472,10 @@ mod tests {
             message: "feat(math): add subtraction\n\nwhy".into(),
         };
         let pending = view(&call, true, false, None);
+        assert_eq!(pending.glyph, "◆");
         assert_eq!(
-            pending.header,
-            "Committing 1 file · feat(math): add subtraction"
+            pending.header_text(),
+            "Committing 1 file  feat(math): add subtraction"
         );
 
         let done = view(
@@ -415,13 +485,29 @@ mod tests {
             Some(r#"{"commit":"07a5d0f9c0ffee","remaining_changes":2}"#),
         );
         assert_eq!(
-            done.header,
-            "Committed 07a5d0f · feat(math): add subtraction"
+            done.header_text(),
+            "Committed 07a5d0f  feat(math): add subtraction"
+        );
+        assert_eq!(
+            done.header[2],
+            part("07a5d0f", Tone::Accent),
+            "the hash stands out"
         );
         assert_eq!(done.detail[0].text, "math.py");
         assert_eq!(
             done.detail.last().map(|l| l.text.as_str()),
             Some("2 still uncommitted")
+        );
+
+        let clean = view(
+            &call,
+            false,
+            false,
+            Some(r#"{"commit":"07a5d0f9c0ffee","remaining_changes":0}"#),
+        );
+        assert_eq!(
+            clean.detail.last(),
+            Some(&DetailLine::text("✓ nothing left uncommitted", Tone::Added))
         );
     }
 
@@ -437,7 +523,7 @@ mod tests {
             true,
             Some("none of those paths differ from HEAD"),
         );
-        assert_eq!(failed.header, "Commit failed");
+        assert_eq!(failed.header_text(), "Commit failed");
         assert_eq!(
             failed.detail,
             vec![DetailLine::text(
@@ -448,18 +534,27 @@ mod tests {
     }
 
     #[test]
-    fn goal_calls_show_the_objective() {
+    fn goal_calls_show_the_objective_and_color_the_status() {
         let got = view(
             &NativeCall::GetGoal,
             false,
             false,
             Some(r#"{"goal":{"objective":"Ship it","status":"active"}}"#),
         );
-        assert_eq!(got.header, "Goal · active");
-        assert_eq!(got.detail, vec![DetailLine::text("Ship it", Tone::Dim)]);
+        assert_eq!(got.header_text(), "Goal  active");
+        assert_eq!(got.header[2].tone, Tone::Accent);
+        assert_eq!(got.detail, vec![DetailLine::text("Ship it", Tone::Plain)]);
+
+        let done = view(
+            &NativeCall::GetGoal,
+            false,
+            false,
+            Some(r#"{"goal":{"objective":"x","status":"complete"}}"#),
+        );
+        assert_eq!(done.header[2].tone, Tone::Added);
         assert_eq!(
-            view(&NativeCall::GetGoal, false, false, Some(r#"{"goal":null}"#)).header,
-            "Goal · none set"
+            view(&NativeCall::GetGoal, false, false, Some(r#"{"goal":null}"#)).header_text(),
+            "Goal  none set"
         );
     }
 }

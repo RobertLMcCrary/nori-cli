@@ -120,7 +120,7 @@ pub(crate) fn format_invocation(
         crate::presentation::Invocation::RawJson(value) => Some(format!("Input: {value}")),
         crate::presentation::Invocation::Delegation(call) => Some(call.header(false)),
         crate::presentation::Invocation::Native(call) => {
-            Some(crate::presentation::native_view(call, false, false, None).header)
+            Some(crate::presentation::native_view(call, false, false, None).header_text())
         }
     }
 }
