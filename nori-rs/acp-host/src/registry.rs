@@ -506,7 +506,13 @@ pub struct AcpAgentInfo {
 impl AcpAgentInfo {
     /// Create agent info from an AgentKind enum
     pub fn from_agent(agent: AgentKind) -> Self {
-        let (is_installed, managed_by) = detect_agent_installation(agent);
+        // A built-in agent that runs inside Nori has no CLI to find, so it counts as installed.
+        let in_process = native_name(agent).is_some_and(crate::in_process::in_process_available);
+        let (is_installed, managed_by) = if in_process {
+            (true, None)
+        } else {
+            detect_agent_installation(agent)
+        };
 
         Self {
             agent,
