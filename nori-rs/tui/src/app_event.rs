@@ -79,6 +79,18 @@ pub(crate) enum AppEvent {
     /// session picker instead of auto-claiming a fresh session.
     SessionClosed,
 
+    /// Have an agent commit the working tree's changes. `automatic` is a turn that just ended
+    /// with `[git] auto_commit` on, as opposed to the hotkey.
+    CommitChanges {
+        automatic: bool,
+    },
+
+    /// What changed in the working tree, ready to become a commit request.
+    CommitChangesReady {
+        automatic: bool,
+        changes: Vec<nori_config::ChangedFile>,
+    },
+
     /// Manage the app-owned remote ACP listener lifecycle.
     RemoteControlRequested(crate::remote_control::RemoteControlRequest),
 

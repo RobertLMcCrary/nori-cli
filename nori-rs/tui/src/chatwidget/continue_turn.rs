@@ -45,6 +45,10 @@ impl ChatWidget {
                 None,
             );
         }
+        if finished && self.config.git.auto_commit {
+            self.app_event_tx
+                .send(crate::app_event::AppEvent::CommitChanges { automatic: true });
+        }
     }
 
     /// Send the unfinished turn's prompt again if the agent never answered it, or ask the agent

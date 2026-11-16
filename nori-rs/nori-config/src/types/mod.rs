@@ -308,6 +308,10 @@ pub struct NoriConfigToml {
     #[serde(default)]
     pub hooks: HooksConfigToml,
 
+    /// How changes are committed and proposed
+    #[serde(default)]
+    pub git: GitConfigToml,
+
     /// Default model overrides per agent (e.g., claude-code = "haiku")
     #[serde(default)]
     pub default_models: HashMap<String, String>,
@@ -829,6 +833,8 @@ pub enum HotkeyAction {
     NextEffort,
     /// Step to the previous effort level the agent offers.
     PreviousEffort,
+    /// Have an agent land the working tree's changes as small, focused commits.
+    CommitChanges,
 }
 
 impl HotkeyAction {
@@ -856,6 +862,7 @@ impl HotkeyAction {
             Self::PreviousModel => "Previous Model",
             Self::NextEffort => "Next Effort Level",
             Self::PreviousEffort => "Previous Effort Level",
+            Self::CommitChanges => "Commit Changes",
         }
     }
 
@@ -885,6 +892,9 @@ impl HotkeyAction {
             Self::PreviousModel => "Switch to the previous model the agent offers",
             Self::NextEffort => "Step to the next effort level the agent offers",
             Self::PreviousEffort => "Step to the previous effort level the agent offers",
+            Self::CommitChanges => {
+                "Have an agent commit the working tree's changes as small, focused commits"
+            }
         }
     }
 
@@ -912,6 +922,7 @@ impl HotkeyAction {
             Self::PreviousModel => "previous_model",
             Self::NextEffort => "next_effort",
             Self::PreviousEffort => "previous_effort",
+            Self::CommitChanges => "commit_changes",
         }
     }
 
@@ -939,6 +950,7 @@ impl HotkeyAction {
             Self::PreviousModel => "ctrl+p",
             Self::NextEffort => "ctrl+shift+n",
             Self::PreviousEffort => "ctrl+shift+p",
+            Self::CommitChanges => "alt+g",
         }
     }
 
@@ -966,6 +978,7 @@ impl HotkeyAction {
             Self::PreviousModel,
             Self::NextEffort,
             Self::PreviousEffort,
+            Self::CommitChanges,
         ]
     }
 }
@@ -1095,6 +1108,8 @@ pub struct HotkeyConfigToml {
     pub next_effort: Option<HotkeyBinding>,
     /// Hotkey for stepping to the previous effort level the agent offers.
     pub previous_effort: Option<HotkeyBinding>,
+    /// Hotkey for having an agent commit the working tree's changes.
+    pub commit_changes: Option<HotkeyBinding>,
 }
 
 /// Resolved hotkey configuration with defaults applied.
@@ -1142,6 +1157,8 @@ pub struct HotkeyConfig {
     pub next_effort: HotkeyBinding,
     /// Hotkey for stepping to the previous effort level the agent offers.
     pub previous_effort: HotkeyBinding,
+    /// Hotkey for having an agent commit the working tree's changes.
+    pub commit_changes: HotkeyBinding,
 }
 
 impl Default for HotkeyConfig {
@@ -1196,6 +1213,7 @@ impl Default for HotkeyConfig {
             previous_effort: HotkeyBinding::from_str(
                 HotkeyAction::PreviousEffort.default_binding(),
             ),
+            commit_changes: HotkeyBinding::from_str(HotkeyAction::CommitChanges.default_binding()),
         }
     }
 }
@@ -1274,6 +1292,10 @@ impl HotkeyConfig {
                 .previous_effort
                 .clone()
                 .unwrap_or(defaults.previous_effort),
+            commit_changes: toml
+                .commit_changes
+                .clone()
+                .unwrap_or(defaults.commit_changes),
         }
     }
 
@@ -1301,6 +1323,7 @@ impl HotkeyConfig {
             HotkeyAction::PreviousModel => &self.previous_model,
             HotkeyAction::NextEffort => &self.next_effort,
             HotkeyAction::PreviousEffort => &self.previous_effort,
+            HotkeyAction::CommitChanges => &self.commit_changes,
         }
     }
 
@@ -1328,6 +1351,7 @@ impl HotkeyConfig {
             HotkeyAction::PreviousModel => self.previous_model = binding,
             HotkeyAction::NextEffort => self.next_effort = binding,
             HotkeyAction::PreviousEffort => self.previous_effort = binding,
+            HotkeyAction::CommitChanges => self.commit_changes = binding,
         }
     }
 
@@ -1361,6 +1385,7 @@ impl HotkeyConfig {
             (HotkeyAction::PreviousModel, &self.previous_model),
             (HotkeyAction::NextEffort, &self.next_effort),
             (HotkeyAction::PreviousEffort, &self.previous_effort),
+            (HotkeyAction::CommitChanges, &self.commit_changes),
         ]
     }
 }
@@ -2298,6 +2323,9 @@ pub struct NoriConfig {
     /// Scripts to run after the agent finishes its response.
     pub post_agent_response_hooks: Vec<PathBuf>,
 
+    /// How changes are committed and proposed.
+    pub git: GitConfig,
+
     /// Async (fire-and-forget) scripts to run when a session starts.
     pub async_session_start_hooks: Vec<PathBuf>,
 
@@ -2385,6 +2413,7 @@ impl Default for NoriConfig {
             post_tool_call_hooks: Vec::new(),
             pre_agent_response_hooks: Vec::new(),
             post_agent_response_hooks: Vec::new(),
+            git: GitConfig::default(),
             async_session_start_hooks: Vec::new(),
             async_session_end_hooks: Vec::new(),
             async_pre_user_prompt_hooks: Vec::new(),
@@ -2422,6 +2451,60 @@ impl NoriConfig {
 /// Each entry is a path to a script file. The interpreter is determined
 /// by file extension: `.sh` → bash, `.py` → python3, `.js` → node.
 /// Files with no recognized extension are executed directly.
+/// The `[git]` section: how an agent lands and proposes the work it did.
+///
+/// ```toml
+/// [git]
+/// auto_commit = true                    # commit after each turn that left changes
+/// commit_agent = "claude-code"          # which agent writes the commits (default: the current one)
+/// commit_rules = "Conventional Commits; one concern per commit; explain why"
+/// pr_rules = "Open a PR per branch; title under 70 chars; wait for green CI before merging"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GitConfigToml {
+    /// Land the changes a turn leaves behind as commits, without being asked.
+    #[serde(default)]
+    pub auto_commit: Option<bool>,
+
+    /// The agent that writes the commits. The current agent when unset.
+    #[serde(default)]
+    pub commit_agent: Option<String>,
+
+    /// Conventions for commits: message style, how finely to split, what to leave out.
+    #[serde(default)]
+    pub commit_rules: Option<String>,
+
+    /// What a pull request should look like, when work is ready to upstream, and how to check CI.
+    #[serde(default)]
+    pub pr_rules: Option<String>,
+}
+
+/// The resolved `[git]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitConfig {
+    pub auto_commit: bool,
+    pub commit_agent: Option<String>,
+    pub commit_rules: Option<String>,
+    pub pr_rules: Option<String>,
+}
+
+impl GitConfig {
+    pub fn from_toml(toml: GitConfigToml) -> Self {
+        let text = |value: Option<String>| {
+            value
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            auto_commit: toml.auto_commit.unwrap_or(false),
+            commit_agent: text(toml.commit_agent),
+            commit_rules: text(toml.commit_rules),
+            pr_rules: text(toml.pr_rules),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HooksConfigToml {

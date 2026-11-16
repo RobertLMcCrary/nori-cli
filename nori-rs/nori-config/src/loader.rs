@@ -252,6 +252,7 @@ impl NoriConfig {
             post_tool_call_hooks,
             pre_agent_response_hooks,
             post_agent_response_hooks,
+            git: super::types::GitConfig::from_toml(toml.git),
             async_session_start_hooks,
             async_session_end_hooks,
             async_pre_user_prompt_hooks,

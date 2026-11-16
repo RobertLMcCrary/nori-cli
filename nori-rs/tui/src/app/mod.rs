@@ -158,6 +158,10 @@ pub(crate) struct App {
     /// Plan drawer visibility mode.
     plan_drawer_mode: crate::chatwidget::PlanDrawerMode,
 
+    /// A commit request is running, so the turn that ends next is its own and must not trigger
+    /// another one.
+    commit_turn_pending: bool,
+
     system_info_tx: mpsc::Sender<SystemInfoRefreshRequest>,
 
     /// Guard to prevent showing the worktree cleanup warning more than once per session.
@@ -220,6 +224,7 @@ struct SystemInfoRefreshRequest {
     first_message: Option<String>,
 }
 
+mod commit_changes;
 mod config_persistence;
 mod event_handling;
 mod frame;
@@ -348,6 +353,7 @@ impl App {
             footer_segment_config,
             footer_layout_config,
             plan_drawer_mode: crate::chatwidget::PlanDrawerMode::Off,
+            commit_turn_pending: false,
             system_info_tx,
             worktree_warning_shown: false,
             deferred_spawn_pending: skillset_per_session,

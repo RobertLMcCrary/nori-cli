@@ -160,7 +160,6 @@ fn add_checkout(
         .map_err(gix_error)?;
     let objects = linked
         .objects
-        .clone()
         .into_arc()
         .map_err(|error| GitToolingError::Gix(error.to_string()))?;
     gix::worktree::state::checkout(

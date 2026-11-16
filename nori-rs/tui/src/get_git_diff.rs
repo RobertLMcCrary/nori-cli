@@ -8,7 +8,6 @@
 
 use std::io;
 use std::path::Path;
-use std::path::PathBuf;
 
 use nori_config::GitRepo;
 
@@ -26,7 +25,7 @@ pub(crate) async fn get_git_diff(dir: Option<&Path>) -> io::Result<(bool, String
         .map_err(io::Error::other)
 }
 
-fn diff_in(dir: &PathBuf) -> (bool, String) {
+fn diff_in(dir: &Path) -> (bool, String) {
     let Some(repo) = GitRepo::discover(dir).filter(|repo| repo.work_dir().is_some()) else {
         return (false, String::new());
     };

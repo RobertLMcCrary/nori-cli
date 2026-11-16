@@ -350,6 +350,12 @@ impl App {
                 });
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::CommitChanges { automatic } => {
+                self.request_commit(automatic);
+            }
+            AppEvent::CommitChangesReady { automatic, changes } => {
+                self.submit_commit_request(automatic, changes);
+            }
             AppEvent::RemoteControlRequested(request) => {
                 let tailnet = match request {
                     crate::remote_control::RemoteControlRequest::EnableLocal
@@ -2110,6 +2116,13 @@ impl App {
             let editor_binding = self.hotkey_config.binding_for(HotkeyAction::OpenEditor);
             if matches_binding(editor_binding, &key_event) {
                 self.open_external_editor(tui);
+                return;
+            }
+
+            let commit_binding = self.hotkey_config.binding_for(HotkeyAction::CommitChanges);
+            if matches_binding(commit_binding, &key_event) {
+                self.app_event_tx
+                    .send(AppEvent::CommitChanges { automatic: false });
                 return;
             }
 

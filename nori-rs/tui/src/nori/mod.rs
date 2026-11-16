@@ -8,6 +8,7 @@ pub(crate) mod agent_mode_history;
 pub(crate) mod agent_picker;
 pub(crate) mod exit_message;
 pub(crate) mod fork_picker;
+pub(crate) mod git_commit;
 pub(crate) mod onboarding;
 pub(crate) mod resume_session_picker;
 pub(crate) mod session_config_history;

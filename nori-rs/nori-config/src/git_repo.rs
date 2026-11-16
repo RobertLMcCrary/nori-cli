@@ -409,9 +409,9 @@ fn write_file_diff(
     if old_bytes == new {
         return;
     }
-    let new_id = new.map(|data| {
-        gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::object::Kind::Blob, data)
-            .expect("blob hash")
+    // Hashing a blob cannot fail; if it somehow does, the index line shows no id.
+    let new_id = new.and_then(|data| {
+        gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::object::Kind::Blob, data).ok()
     });
     let abbrev = |id: Option<gix::ObjectId>| {
         id.map_or_else(
@@ -621,9 +621,9 @@ mod tests {
         let mut repo = gix::init(dir).expect("init");
         {
             let mut config = repo.config_snapshot_mut();
-            config.set_raw_value(&"user.name", "Test").expect("name");
+            config.set_raw_value("user.name", "Test").expect("name");
             config
-                .set_raw_value(&"user.email", "test@example.com")
+                .set_raw_value("user.email", "test@example.com")
                 .expect("email");
         }
         let tree = repo.empty_tree().id;
@@ -662,7 +662,7 @@ mod tests {
         let head = repo.head_id().expect("head").to_string();
 
         let git = GitRepo::discover(&dir).expect("discovered");
-        assert_eq!(git.work_dir(), Some(dir.clone()));
+        assert_eq!(git.work_dir(), Some(dir));
         assert_eq!(git.branch().as_deref(), Some("main"));
         assert_eq!(git.head_commit(), Some(head));
         assert!(!git.is_linked_worktree());
