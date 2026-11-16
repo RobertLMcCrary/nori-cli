@@ -794,6 +794,16 @@ where
                                     Ok(serde_json::to_value(response)?)
                                 }).await
                             }
+                            "session/set_config_option" => {
+                                let cx = connection_cx.clone();
+                                dispatch_unstable_request(message, |params| async {
+                                    let request: agent_client_protocol_schema::SetSessionConfigOptionRequest =
+                                        serde_json::from_value(params)?;
+                                    let response = handlers::handle_set_config_option(request, &config, &sessions, cx).await
+                                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                    Ok(serde_json::to_value(response)?)
+                                }).await
+                            }
                             "session/fork" => {
                                 let cx = connection_cx.clone();
                                 dispatch_unstable_request(message, |params| async {

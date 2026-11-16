@@ -89,6 +89,9 @@ pub struct Session {
     permission_checker: Arc<RwLock<PermissionChecker>>,
     /// Current model ID for this session (can be changed at runtime via setSessionModel)
     current_model: tokio::sync::RwLock<Option<String>>,
+    /// A chosen model the running CLI has not been told about yet. The CLI can only be told
+    /// once a query exists, so a switch made between prompts waits for the next one.
+    model_pending: std::sync::atomic::AtomicBool,
     /// ACP MCP server for tool execution with notifications
     acp_mcp_server: Arc<AcpMcpServer>,
     /// Background process manager
@@ -463,6 +466,7 @@ impl Session {
             hook_callback_registry,
             permission_checker,
             current_model: tokio::sync::RwLock::new(None),
+            model_pending: std::sync::atomic::AtomicBool::new(false),
             acp_mcp_server,
             background_processes,
             external_mcp_servers: OnceLock::new(),
@@ -1032,12 +1036,36 @@ impl Session {
 
         tracing::info!(model_id = %model_id, "Session model updated");
 
-        // Also set model on the SDK client for next prompt
+        // Tell the running CLI now if it can be told, otherwise on the next prompt.
+        self.model_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.apply_pending_model().await;
+    }
+
+    /// Send a chosen model to the CLI if it has not had it yet.
+    ///
+    /// Called right after a query is sent, because the CLI only takes a model change once a query
+    /// exists; a failure leaves it pending for the next prompt.
+    pub async fn apply_pending_model(&self) {
+        if !self
+            .model_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some(model_id) = self.current_model().await else {
+            return;
+        };
         let client = self.client.read().await;
         // "default" is the CLI's own choice, which is expressed by not naming one.
         let requested = (model_id != "default").then_some(model_id.as_str());
-        if let Err(e) = client.set_model(requested).await {
-            tracing::warn!(error = %e, "Failed to set model on SDK client");
+        match client.set_model(requested).await {
+            Ok(()) => tracing::info!(model_id = %model_id, "Model applied to the CLI"),
+            Err(error) => {
+                tracing::debug!(%error, "Model not applied yet; it waits for the next prompt");
+                self.model_pending
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
 

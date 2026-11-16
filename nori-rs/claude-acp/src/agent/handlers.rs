@@ -215,9 +215,12 @@ pub async fn handle_new_session(
         });
     }
 
+    let config_options = build_config_options("default", &model_state);
+
     Ok(NewSessionResponse::new(session_id)
         .modes(mode_state)
-        .models(model_state))
+        .models(model_state)
+        .config_options(config_options))
 }
 
 /// Handle session/load request
@@ -294,9 +297,12 @@ pub fn handle_load_session(
     // Build available models
     let model_state = build_available_models(config);
 
+    let config_options = build_config_options("default", &model_state);
+
     Ok(LoadSessionResponse::new()
         .modes(mode_state)
-        .models(model_state))
+        .models(model_state)
+        .config_options(config_options))
 }
 
 /// Build available permission modes
@@ -350,6 +356,110 @@ fn build_available_models(config: &AgentConfig) -> SessionModelState {
     }
 
     SessionModelState::new(current_model_id, available_models)
+}
+
+/// The mode and model as ACP config options.
+///
+/// Clients that follow the stable protocol (Nori among them) read these, not the older `modes`
+/// and `models` fields, so without them `/model` and the mode switch have nothing to open.
+fn build_config_options(
+    current_mode: &str,
+    models: &SessionModelState,
+) -> Vec<agent_client_protocol_schema::SessionConfigOption> {
+    use agent_client_protocol_schema::{
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    };
+
+    let modes: Vec<SessionConfigSelectOption> = build_available_modes()
+        .into_iter()
+        .map(|mode| {
+            SessionConfigSelectOption::new(mode.id.0.to_string(), mode.name)
+                .description(mode.description)
+        })
+        .collect();
+    let model_options: Vec<SessionConfigSelectOption> = models
+        .available_models
+        .iter()
+        .map(|model| {
+            SessionConfigSelectOption::new(model.model_id.0.to_string(), model.name.clone())
+                .description(model.description.clone())
+        })
+        .collect();
+
+    vec![
+        SessionConfigOption::select("mode", "Mode", current_mode.to_string(), modes)
+            .description("How Claude asks before it acts".to_string())
+            .category(SessionConfigOptionCategory::Mode),
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            models.current_model_id.0.to_string(),
+            model_options,
+        )
+        .description("The Claude model for the next prompt".to_string())
+        .category(SessionConfigOptionCategory::Model),
+    ]
+}
+
+/// Handle session/set_config_option: the stable way to change the mode or the model.
+///
+/// The response carries the full option list with the new values, which is what the client shows.
+pub async fn handle_set_config_option(
+    request: agent_client_protocol_schema::SetSessionConfigOptionRequest,
+    config: &AgentConfig,
+    sessions: &Arc<SessionManager>,
+    connection_cx: ConnectionTo<Client>,
+) -> Result<agent_client_protocol_schema::SetSessionConfigOptionResponse, AgentError> {
+    let session_id = request.session_id.0.to_string();
+    let value = request.value.0.to_string();
+
+    match request.config_id.0.as_ref() {
+        "mode" => {
+            handle_set_mode(
+                SetSessionModeRequest::new(session_id.clone(), value),
+                sessions,
+                connection_cx,
+            )
+            .await?;
+        }
+        "model" => {
+            handle_set_session_model(
+                agent_client_protocol_schema::SetSessionModelRequest::new(
+                    session_id.clone(),
+                    value,
+                ),
+                sessions,
+            )
+            .await?;
+        }
+        other => {
+            return Err(AgentError::InvalidMode(format!(
+                "unknown config option {other}"
+            )));
+        }
+    }
+
+    let session = sessions.get_session_or_error(&session_id)?;
+    let mut models = build_available_models(config);
+    if let Some(current) = session.current_model().await {
+        if !models
+            .available_models
+            .iter()
+            .any(|model| model.model_id.0.as_ref() == current)
+        {
+            models
+                .available_models
+                .push(ModelInfo::new(current.clone(), current.clone()));
+        }
+        models.current_model_id = current.into();
+    }
+    let mode = session.permission_mode().await;
+    Ok(
+        agent_client_protocol_schema::SetSessionConfigOptionResponse::new(build_config_options(
+            mode.as_str(),
+            &models,
+        )),
+    )
 }
 
 /// Send available commands update to client
@@ -567,6 +677,8 @@ pub async fn handle_prompt(
                 .map_err(AgentError::from)?;
         }
     }
+    // A model chosen since the last prompt goes to the CLI now that a query exists.
+    session.apply_pending_model().await;
     let query_elapsed = query_start.elapsed();
     tracing::debug!(
         session_id = %session_id,
@@ -1374,10 +1486,13 @@ pub fn handle_fork_session(
         "Session forked successfully"
     );
 
+    let config_options = build_config_options("default", &model_state);
+
     Ok(
         agent_client_protocol_schema::ForkSessionResponse::new(new_session_id)
             .modes(mode_state)
-            .models(model_state),
+            .models(model_state)
+            .config_options(config_options),
     )
 }
 
@@ -1443,9 +1558,12 @@ pub fn handle_resume_session(
         "Session resumed successfully"
     );
 
+    let config_options = build_config_options("default", &model_state);
+
     Ok(agent_client_protocol_schema::ResumeSessionResponse::new()
         .modes(mode_state)
-        .models(model_state))
+        .models(model_state)
+        .config_options(config_options))
 }
 
 /// Handle session/list request
