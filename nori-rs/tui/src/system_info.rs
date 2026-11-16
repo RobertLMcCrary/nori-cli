@@ -370,41 +370,37 @@ pub(crate) struct WorktreeCleanupWarning {
     pub(crate) free_percent: i32,
 }
 
-/// Parse the output of `df -Pk <dir>` into structured disk space info.
-///
-/// Expected format (POSIX):
-/// ```text
-/// Filesystem     1024-blocks      Used Available Capacity Mounted on
-/// /dev/sda1       500000000 450000000  50000000      90% /
-/// ```
-fn parse_df_output(output: &str) -> Option<DiskSpaceInfo> {
-    let lines: Vec<&str> = output.trim().lines().collect();
-    if lines.len() < 2 {
+/// How full the filesystem holding `dir` is: used space over used plus the space available to
+/// unprivileged users, rounded up, as POSIX `df` computes it. On APFS this is the whole
+/// container's figure, where `df` shows only the volume's own share.
+#[cfg(unix)]
+fn get_disk_space(dir: &std::path::Path) -> Option<DiskSpaceInfo> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated string and `stats` is a valid out-pointer.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
         return None;
     }
-
-    // Parse the data line (skip header)
-    let parts: Vec<&str> = lines[1].split_whitespace().collect();
-    if parts.len() < 5 {
-        return None;
-    }
-
-    let used_percent: i32 = parts[4].trim_end_matches('%').parse().ok()?;
-
+    // SAFETY: statvfs returned success, so the struct is initialized.
+    let stats = unsafe { stats.assume_init() };
+    let used_percent = used_percent(
+        u64::from(stats.f_blocks),
+        u64::from(stats.f_bfree),
+        u64::from(stats.f_bavail),
+    )?;
     Some(DiskSpaceInfo { used_percent })
 }
 
-/// Get disk space info for a directory by running `df -Pk`.
-#[cfg(unix)]
-fn get_disk_space(dir: &std::path::Path) -> Option<DiskSpaceInfo> {
-    let output = Command::new("df").arg("-Pk").arg(dir).output().ok()?;
-
-    if !output.status.success() {
+/// POSIX `df` capacity: `ceil(used * 100 / (used + available))`.
+fn used_percent(blocks: u64, free: u64, available: u64) -> Option<i32> {
+    let used = blocks.checked_sub(free)?;
+    let denominator = used.checked_add(available)?;
+    if denominator == 0 {
         return None;
     }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_df_output(&stdout)
+    i32::try_from((used * 100).div_ceil(denominator)).ok()
 }
 
 /// Evaluate whether a worktree cleanup warning should be shown.
@@ -722,42 +718,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_df_output_typical() {
-        let output = "\
-Filesystem     1024-blocks      Used Available Capacity Mounted on
-/dev/sda1       500000000 450000000  50000000      90% /
-";
-        let info = parse_df_output(output).expect("should parse valid df output");
-        assert_eq!(info.used_percent, 90);
-    }
-
-    #[test]
-    fn test_parse_df_output_empty() {
-        assert!(
-            parse_df_output("").is_none(),
-            "empty output should return None"
-        );
-    }
-
-    #[test]
-    fn test_parse_df_output_header_only() {
-        let output = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n";
-        assert!(
-            parse_df_output(output).is_none(),
-            "header-only should return None"
-        );
-    }
-
-    #[test]
-    fn test_parse_df_output_malformed() {
-        let output = "not a valid df output at all\n";
-        assert!(
-            parse_df_output(output).is_none(),
-            "malformed output should return None"
-        );
-    }
-
-    #[test]
     fn test_worktree_cleanup_warning_low_disk_with_worktrees() {
         let warning = evaluate_worktree_cleanup_warning(5, 94);
         assert!(
@@ -875,5 +835,26 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
             );
         }
         // Other fields may or may not be populated depending on environment
+    }
+
+    #[test]
+    fn used_percent_rounds_up_like_df() {
+        assert_eq!(used_percent(1000, 100, 100), Some(90));
+        assert_eq!(used_percent(1000, 999, 999), Some(1));
+        assert_eq!(used_percent(1000, 1000, 1000), Some(0));
+        assert_eq!(used_percent(0, 0, 0), None);
+        // Blocks reserved for root count as used for the percentage but not as available.
+        assert_eq!(used_percent(1000, 200, 100), Some(89));
+    }
+
+    /// On APFS `df` reports only the volume's own share (2% on a machine whose container is 99%
+    /// full), so the reading is checked for plausibility rather than against `df`.
+    #[cfg(unix)]
+    #[test]
+    fn disk_space_is_a_percentage_for_a_real_directory() {
+        let used = get_disk_space(&std::env::temp_dir())
+            .expect("statvfs")
+            .used_percent;
+        assert!((0..=100).contains(&used), "{used}% is not a percentage");
     }
 }
