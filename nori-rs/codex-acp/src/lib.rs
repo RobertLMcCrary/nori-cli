@@ -160,9 +160,3 @@ async fn load_agent(
         codex_agent::CodexAgent::new(config, codex_linux_sandbox_exe).await?,
     ))
 }
-
-// Re-export the MCP server types for compatibility
-pub use codex_mcp_server::{
-    CodexToolCallParam, CodexToolCallReplyParam, ExecApprovalElicitRequestParams,
-    ExecApprovalResponse, PatchApprovalElicitRequestParams, PatchApprovalResponse,
-};

@@ -16,22 +16,26 @@ use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
-    find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
+    find_thread_path_by_id_str, init_state_db, resolve_installation_id,
 };
-use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
-use codex_extension_api::empty_extension_registry;
+use codex_core_api::{
+    CodexAppsToolsCache, CodexHomeUserInstructionsProvider, EnvironmentManager,
+    ExecServerRuntimeOptions, ExtensionRegistryBuilder, ModelCatalogSettings, StartThreadOptions,
+    ThreadStoreBuilder, build_startup_models, install_image_generation_extension,
+    local_agent_graph_store_from_state_db, passthrough_image_store,
+};
+use codex_history::InitialHistory;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
 };
-use codex_protocol::{
-    ThreadId,
-    protocol::{InitialHistory, SessionSource},
-};
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::{ThreadId, protocol::SessionSource};
 use codex_thread_store::{
     ListThreadsParams, SortDirection as StoreSortDirection, ThreadSortKey as StoreThreadSortKey,
     ThreadStore,
 };
+use codex_utils_path_uri::LegacyAppPathString;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -74,37 +78,62 @@ impl CodexAgent {
         config: Config,
         codex_linux_sandbox_exe: Option<PathBuf>,
     ) -> std::io::Result<Self> {
-        let auth_manager = AuthManager::shared(
-            config.codex_home.to_path_buf(),
-            false,
-            config.cli_auth_credentials_store_mode,
-            Some(config.chatgpt_base_url.clone()),
-        )
-        .await;
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+                .await
+                .map_err(std::io::Error::other)?;
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
         let state_db = init_state_db(&config).await;
-        let local_runtime_paths =
-            ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?;
+        // The process that hosts this agent is the executable commands re-enter for `apply_patch`.
+        let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
+            config
+                .codex_self_exe
+                .clone()
+                .or_else(|| std::env::current_exe().ok()),
+            codex_linux_sandbox_exe.or_else(|| config.codex_linux_sandbox_exe.clone()),
+        )?;
+        let thread_store = ThreadStoreBuilder::from_config(&config, state_db.clone()).build();
         let environment_manager = Arc::new(
-            EnvironmentManager::from_codex_home(&config.codex_home, Some(local_runtime_paths))
-                .await
-                .map_err(std::io::Error::other)?,
+            EnvironmentManager::from_codex_home(
+                config.codex_home.clone(),
+                Some(local_runtime_paths),
+                config.http_client_factory(),
+            )
+            .await
+            .map_err(std::io::Error::other)?,
         );
-        let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
+            config.codex_home.clone(),
+        ));
+        let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+        install_image_generation_extension(
+            &mut extensions,
+            auth_manager.clone(),
+            |config: &Config| Some(config.codex_home.clone()),
+        );
+        let startup = build_startup_models(
+            &config,
+            Arc::clone(&auth_manager),
+            installation_id,
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        );
         let thread_manager = ThreadManager::new(
             &config,
-            auth_manager.clone(),
+            startup,
+            CodexAppsToolsCache::default(),
             SessionSource::Unknown,
             environment_manager,
-            empty_extension_registry(),
-            None,
-            thread_store.clone(),
-            state_db.clone(),
-            installation_id,
-            None,
+            Arc::new(extensions.build()),
+            user_instructions_provider,
+            /*analytics_events_client*/ None,
+            passthrough_image_store(),
+            Arc::clone(&thread_store),
+            local_agent_graph_store_from_state_db(state_db.as_ref()),
+            /*attestation_provider*/ None,
+            /*external_time_provider*/ None,
         );
         Ok(Self {
             auth_manager,
@@ -365,8 +394,13 @@ impl CodexAgent {
                                     Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
                                 },
                                 env_http_headers: None,
+                                http_headers_helper: None,
                             },
                             required: false,
+                            auth: Default::default(),
+                            startup_readiness: Default::default(),
+                            tool_input_schema_max_bytes: None,
+                            omit_tools_from: None,
                             enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
@@ -404,9 +438,13 @@ impl CodexAgent {
                                     Some(env.into_iter().map(|env| (env.name, env.value)).collect())
                                 },
                                 env_vars: vec![],
-                                cwd: Some(cwd.to_path_buf()),
+                                cwd: Some(LegacyAppPathString::from_path(&cwd.to_path_buf())),
                             },
                             required: false,
+                            auth: Default::default(),
+                            startup_readiness: Default::default(),
+                            tool_input_schema_max_bytes: None,
+                            omit_tools_from: None,
                             enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
@@ -441,7 +479,6 @@ impl CodexAgent {
         let InitializeRequest {
             protocol_version,
             client_capabilities,
-            client_info: _, // TODO: save and pass into Codex somehow
             ..
         } = request;
         debug!("Received initialize request with protocol version {protocol_version:?}",);
@@ -502,8 +539,10 @@ impl CodexAgent {
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.to_path_buf(),
                     codex_login::auth::CLIENT_ID.to_string(),
-                    None,
+                    self.config.auth_config().effective_chatgpt_workspaces(),
                     self.config.cli_auth_credentials_store_mode,
+                    self.config.auth_keyring_backend_kind(),
+                    self.config.auth_route_config(),
                 );
 
                 let server =
@@ -522,6 +561,7 @@ impl CodexAgent {
                     &self.config.codex_home,
                     &api_key,
                     self.config.cli_auth_credentials_store_mode,
+                    self.config.auth_keyring_backend_kind(),
                 )
                 .map_err(Error::into_internal_error)?;
             }
@@ -533,6 +573,7 @@ impl CodexAgent {
                     &self.config.codex_home,
                     &api_key,
                     self.config.cli_auth_credentials_store_mode,
+                    self.config.auth_keyring_backend_kind(),
                 )
                 .map_err(Error::into_internal_error)?;
             }
@@ -571,9 +612,12 @@ impl CodexAgent {
             thread_id,
             thread,
             session_configured: _,
-        } = Box::pin(self.thread_manager.start_thread(config.clone()))
-            .await
-            .map_err(|_e| Error::internal_error())?;
+        } = Box::pin(
+            self.thread_manager
+                .start_thread(StartThreadOptions::new(config.clone())),
+        )
+        .await
+        .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
         // Record the session root for filesystem sandboxing.
@@ -585,7 +629,10 @@ impl CodexAgent {
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
-            Arc::new(self.thread_manager.get_models_manager()),
+            Arc::new(crate::thread::LiveModels::new(
+                self.thread_manager.get_models_manager(),
+                self.config.http_client_factory(),
+            )),
             self.client_capabilities.clone(),
             config.clone(),
             cx,
@@ -666,13 +713,12 @@ impl CodexAgent {
         .map_err(|e| Error::internal_error().data(e.to_string()))?
         .ok_or_else(|| Error::resource_not_found(None))?;
 
+        let history = RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
         let rollout_items = if replay_history {
-            let history = RolloutRecorder::get_rollout_history(&rollout_path)
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
             match &history {
-                InitialHistory::Resumed(resumed) => resumed.history.clone(),
+                InitialHistory::Resumed(resumed) => resumed.history.to_vec(),
                 InitialHistory::Forked(items) => items.clone(),
                 InitialHistory::Cleared | InitialHistory::New => Vec::new(),
             }
@@ -686,11 +732,12 @@ impl CodexAgent {
             thread_id: _,
             thread,
             session_configured: _,
-        } = Box::pin(self.thread_manager.resume_thread_from_rollout(
+        } = Box::pin(self.thread_manager.resume_thread_with_history(
             config.clone(),
-            rollout_path,
+            history,
             self.auth_manager.clone(),
             None,
+            ClientMcpExtensions::default(),
         ))
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -699,7 +746,10 @@ impl CodexAgent {
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
-            Arc::new(self.thread_manager.get_models_manager()),
+            Arc::new(crate::thread::LiveModels::new(
+                self.thread_manager.get_models_manager(),
+                self.config.http_client_factory(),
+            )),
             self.client_capabilities.clone(),
             config.clone(),
             cx,
@@ -746,8 +796,11 @@ impl CodexAgent {
                 allowed_sources: allowed_sources.to_vec(),
                 model_providers: None,
                 cwd_filters: cwd.map(|cwd| vec![cwd]),
+                section: None,
+                project_id: None,
                 archived: false,
                 search_term: None,
+                relation_filter: None,
                 use_state_db_only: false,
             })
             .await

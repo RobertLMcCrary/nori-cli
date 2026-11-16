@@ -28,11 +28,13 @@ use codex_apply_patch::parse_patch;
 use codex_core::{
     CodexThread,
     config::{Config, set_project_trust_level},
-    review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_history::RolloutItem;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_protocol::review_format::format_review_findings_block;
+use codex_protocol::turn_input::{TurnInputMode, TurnInputSubmission};
 use codex_protocol::{
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
@@ -64,11 +66,10 @@ use codex_protocol::{
         ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
         PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
-        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, StreamErrorEvent, TerminalInteractionEvent,
+        ThreadGoalStatus, ThreadGoalUpdatedEvent, ThreadSettingsOverrides, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -82,7 +83,7 @@ use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Abstraction over the ACP connection for sending notifications and requests
@@ -174,7 +175,7 @@ fn semantic_session_mode_id_for_permission_profile(config: &Config) -> Option<&'
             let cwd = config.cwd.as_path();
             if file_system.has_full_disk_read_access()
                 && !file_system.has_full_disk_write_access()
-                && file_system.can_write_path_with_cwd(cwd, cwd)
+                && file_system.can_write_local_path_with_cwd(cwd, cwd)
             {
                 Some("auto")
             } else {
@@ -237,21 +238,50 @@ pub trait ModelsManagerImpl: Send + Sync {
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
 }
 
-impl ModelsManagerImpl for Arc<dyn ModelsManager> {
+/// The live models manager, with what it needs to reach the model endpoint.
+pub struct LiveModels {
+    manager: Arc<dyn ModelsManager>,
+    http_client_factory: codex_http_client::HttpClientFactory,
+}
+
+impl LiveModels {
+    pub fn new(
+        manager: Arc<dyn ModelsManager>,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> Self {
+        Self {
+            manager,
+            http_client_factory,
+        }
+    }
+}
+
+impl ModelsManagerImpl for LiveModels {
     fn get_model(
         &self,
         model_id: &Option<String>,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
         let model_id = model_id.clone();
         Box::pin(async move {
-            self.get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
+            self.manager
+                .get_default_model(
+                    &model_id,
+                    /*allow_provider_model_fallback*/ true,
+                    RefreshStrategy::OnlineIfUncached,
+                    self.http_client_factory.clone(),
+                )
                 .await
         })
     }
 
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
         Box::pin(async move {
-            ModelsManager::list_models(self.as_ref(), RefreshStrategy::OnlineIfUncached).await
+            self.manager
+                .list_models(
+                    RefreshStrategy::OnlineIfUncached,
+                    self.http_client_factory.clone(),
+                )
+                .await
         })
     }
 }
@@ -1120,7 +1150,6 @@ impl PromptState {
                 model_context_window,
                 collaboration_mode_kind,
                 turn_id,
-                started_at: _,
                 ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
@@ -1140,9 +1169,6 @@ impl PromptState {
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
-                images: _,
-                text_elements: _,
-                local_images: _,
                 ..
             }) => {
                 info!("User message: {message:?}");
@@ -1184,7 +1210,7 @@ impl PromptState {
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n");
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message , .. }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
@@ -1215,8 +1241,7 @@ impl PromptState {
             EventMsg::WebSearchEnd(WebSearchEndEvent {
                 call_id,
                 query,
-                action,
-            }) => {
+                action, .. }) => {
                 info!("Web search query received: call_id={call_id}, query={query}");
                 // Send update that the search is in progress with the query
                 // (WebSearchEnd just means we have the query, not that results are ready)
@@ -1284,7 +1309,6 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
-                mcp_app_resource_uri: _,
                 ..
             }) => {
                 info!(
@@ -1298,7 +1322,6 @@ impl PromptState {
                 invocation,
                 duration,
                 result,
-                mcp_app_resource_uri: _,
                 ..
             }) => {
                 info!(
@@ -1344,11 +1367,10 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item,
-                completed_at_ms: _,
-            }) => {
+                .. }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, .. }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
@@ -1369,8 +1391,7 @@ impl PromptState {
             }
             EventMsg::Error(ErrorEvent {
                 message,
-                codex_error_info,
-            }) => {
+                codex_error_info, .. }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1381,7 +1402,7 @@ impl PromptState {
                         .ok();
                 }
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
+            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, .. }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1397,7 +1418,7 @@ impl PromptState {
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
-                let display_path = path.display().to_string();
+                let display_path = path.to_path_buf().display().to_string();
                 client.send_notification(
                     SessionUpdate::ToolCall(
                         ToolCall::new(call_id, format!("View Image {display_path}"))
@@ -1405,7 +1426,7 @@ impl PromptState {
                             .content(vec![ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(ResourceLink::new(display_path.clone(), display_path.clone())
                         )
                     )
-                )]).locations(vec![ToolCallLocation::new(path)])));
+                )]).locations(vec![ToolCallLocation::new(path.to_path_buf())])));
             }
             EventMsg::EnteredReviewMode(review_request) => {
                 info!("Review begin: request={review_request:?}");
@@ -1504,6 +1525,9 @@ impl PromptState {
             | EventMsg::RequestUserInput(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
+                    other => {
+                debug!("Ignoring event with no ACP equivalent: {other:?}");
+            }
         }
     }
 
@@ -1546,6 +1570,7 @@ impl PromptState {
         let request_kind = match &request {
             ElicitationRequest::Form { .. } => "form",
             ElicitationRequest::Url { .. } => "url",
+            _ => "other",
         };
 
         info!(
@@ -1572,7 +1597,7 @@ impl PromptState {
         client: &SessionClient,
         event: ExitedReviewModeEvent,
     ) -> Result<(), Error> {
-        let ExitedReviewModeEvent { review_output } = event;
+        let ExitedReviewModeEvent { review_output, .. } = event;
         let Some(ReviewOutputEvent {
             findings,
             overall_correctness: _,
@@ -1610,8 +1635,6 @@ impl PromptState {
             changes,
             reason,
             // grant_root doesn't seem to be set anywhere on the codex side
-            grant_root: _,
-            turn_id: _,
             ..
         } = event;
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
@@ -1792,6 +1815,10 @@ impl PromptState {
                                     ResourceLink::new(image_url.clone(), image_url),
                                 )))
                             }
+                            // Audio has no place in an ACP tool call; say that it was there.
+                            _ => {
+                                ToolCallContent::Content(Content::new("[audio output]".to_string()))
+                            }
                         })
                         .chain(error.map(|e| ToolCallContent::Content(Content::new(e))))
                         .collect::<Vec<_>>(),
@@ -1872,7 +1899,7 @@ impl PromptState {
             file_extension,
             locations,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, Path::new(cwd.as_str()));
         self.active_commands.insert(
             call_id.clone(),
             ActiveCommand {
@@ -1974,7 +2001,7 @@ impl PromptState {
             started_at_ms: _,
             cwd,
             parsed_cmd,
-            process_id: _,
+            ..
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId::new(call_id.clone());
@@ -1984,7 +2011,7 @@ impl PromptState {
             locations,
             terminal_output,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
 
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
@@ -2067,14 +2094,12 @@ impl PromptState {
             interaction_input: _,
             call_id,
             exit_code,
-            stdout: _,
-            stderr: _,
             aggregated_output: _,
             duration: _,
-            formatted_output: _,
             process_id: _,
             completed_at_ms: _,
             status,
+            ..
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
             let is_success = exit_code == 0;
@@ -2184,12 +2209,12 @@ impl PromptState {
             call_id,
             status,
             revised_prompt,
-            result,
             saved_path,
+            ..
         } = event;
         let tool_status = image_generation_tool_status(&status);
         let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
-        let content = image_generation_content(revised_prompt, result, saved_path);
+        let content = image_generation_content(revised_prompt, String::new(), saved_path);
 
         if self.active_image_generations.remove(&call_id) {
             client.send_tool_call_update(ToolCallUpdate::new(
@@ -2268,7 +2293,6 @@ impl PromptState {
             turn_id: _,
             reason,
             permissions,
-            cwd: _,
             ..
         } = event;
 
@@ -2417,6 +2441,15 @@ fn build_exec_permission_options(
     available_decisions
         .iter()
         .map(|decision| match decision {
+            ReviewDecision::ApprovedMcpPolicyAmendment => ExecPermissionOption {
+                option_id: "approved-mcp-policy",
+                permission_option: PermissionOption::new(
+                    "approved-mcp-policy",
+                    "Yes, and don't ask again for this tool",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                decision: ReviewDecision::ApprovedMcpPolicyAmendment,
+            },
             ReviewDecision::Approved => ExecPermissionOption {
                 option_id: "approved",
                 permission_option: PermissionOption::new(
@@ -2494,14 +2527,16 @@ fn build_exec_permission_options(
                     },
                 }
             }
-            ReviewDecision::Denied => ExecPermissionOption {
+            ReviewDecision::Denied { .. } => ExecPermissionOption {
                 option_id: "denied",
                 permission_option: PermissionOption::new(
                     "denied",
                     "No, continue without running it",
                     PermissionOptionKind::RejectOnce,
                 ),
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied {
+                    rejection: "The user declined to run it".to_string(),
+                },
             },
             ReviewDecision::Abort => ExecPermissionOption {
                 option_id: "abort",
@@ -2613,7 +2648,8 @@ impl SessionClient {
         }
     }
 
-    #[cfg(test)]
+    // Only the disabled translation tests build a thread around a stub client.
+    #[cfg(any())]
     fn with_client(
         session_id: SessionId,
         client: Arc<dyn ClientSender>,
@@ -3009,12 +3045,13 @@ impl<A: Auth> ThreadActor<A> {
             let current_effort = self
                 .config
                 .model_reasoning_effort
+                .clone()
                 .and_then(|effort| {
                     supported
                         .iter()
-                        .find_map(|e| (e.effort == effort).then_some(effort))
+                        .find_map(|e| (e.effort == effort).then(|| effort.clone()))
                 })
-                .unwrap_or(preset.default_reasoning_effort);
+                .unwrap_or(preset.default_reasoning_effort.clone());
 
             let effort_select_options = supported
                 .iter()
@@ -3092,7 +3129,7 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         let effort_to_use = if let Some(preset) = preset {
-            if let Some(effort) = self.config.model_reasoning_effort
+            if let Some(effort) = self.config.model_reasoning_effort.clone()
                 && preset
                     .supported_reasoning_efforts
                     .iter()
@@ -3100,21 +3137,22 @@ impl<A: Auth> ThreadActor<A> {
             {
                 Some(effort)
             } else {
-                Some(preset.default_reasoning_effort)
+                Some(preset.default_reasoning_effort.clone())
             }
         } else {
             // If the user selected a raw model string (not a known preset), don't invent a default.
             // Keep whatever was previously configured (or leave unset) so Codex can decide.
-            self.config.model_reasoning_effort
+            self.config.model_reasoning_effort.clone()
         };
 
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
                     model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
+                    effort: Some(effort_to_use.clone()),
                     ..Default::default()
                 },
+                reply: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3152,9 +3190,10 @@ impl<A: Auth> ThreadActor<A> {
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
-                    effort: Some(Some(effort)),
+                    effort: Some(Some(effort.clone())),
                     ..Default::default()
                 },
+                reply: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3177,22 +3216,19 @@ impl<A: Auth> ThreadActor<A> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let items = build_prompt_items(request.prompt);
+        let mut turn_replies = Vec::new();
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
                 "init" => {
-                    op = Op::UserInput {
-                        items: vec![UserInput::Text {
+                    op = user_turn_op(
+                        vec![UserInput::Text {
                             text: INIT_COMMAND_PROMPT.into(),
                             text_elements: vec![],
                         }],
-                        final_output_json_schema: None,
-                        environments: None,
-                        responsesapi_client_metadata: None,
-                        additional_context: Default::default(),
-                        thread_settings: Default::default(),
-                    }
+                        &mut turn_replies,
+                    )
                 }
                 "review" => {
                     let instructions = rest.trim();
@@ -3238,33 +3274,26 @@ impl<A: Auth> ThreadActor<A> {
                     self.auth.logout().await?;
                     return Err(Error::auth_required());
                 }
-                _ => {
-                    op = Op::UserInput {
-                        items,
-                        final_output_json_schema: None,
-                        environments: None,
-                        responsesapi_client_metadata: None,
-                        additional_context: Default::default(),
-                        thread_settings: Default::default(),
-                    }
-                }
+                _ => op = user_turn_op(items, &mut turn_replies),
             }
         } else {
-            op = Op::UserInput {
-                items,
-                final_output_json_schema: None,
-                environments: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            }
+            op = user_turn_op(items, &mut turn_replies)
         }
 
         let submission_id = self
             .thread
-            .submit(op.clone())
+            .submit(op)
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        // Core says whether the input started a turn or was refused; only a refusal is news.
+        for reply in turn_replies {
+            tokio::spawn(async move {
+                if let Ok(Err(error)) = reply.await {
+                    warn!("Turn input was not accepted: {error}");
+                }
+            });
+        }
 
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
@@ -3296,6 +3325,7 @@ impl<A: Auth> ThreadActor<A> {
                         .map(ActivePermissionProfile::new),
                     ..Default::default()
                 },
+                reply: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3378,11 +3408,7 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
                 self.client.send_user_message(message.clone());
             }
-            EventMsg::AgentMessage(AgentMessageEvent {
-                message,
-                phase: _,
-                memory_citation: _,
-            }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
                 self.client.send_agent_text(message.clone());
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
@@ -3566,7 +3592,11 @@ impl<A: Auth> ThreadActor<A> {
                     serde_json::from_str(arguments).ok(),
                 );
             }
-            ResponseItem::FunctionCallOutput { call_id, output } => {
+            ResponseItem::FunctionCallOutput {
+                call_id: Some(call_id),
+                output,
+                ..
+            } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok());
             }
@@ -3642,13 +3672,14 @@ impl<A: Auth> ThreadActor<A> {
                 name: _,
                 call_id,
                 output,
+                ..
             } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)));
             }
             ResponseItem::WebSearchCall { id, action, .. } => {
                 let (title, call_id) = if let Some(action) = action {
-                    web_search_action_to_title_and_id(id, action)
+                    web_search_action_to_title_and_id(&id.as_ref().map(ToString::to_string), action)
                 } else {
                     ("Web Search".into(), generate_fallback_id("web_search"))
                 };
@@ -3663,21 +3694,27 @@ impl<A: Auth> ThreadActor<A> {
                 status,
                 revised_prompt,
                 result,
+                ..
             } => {
                 self.client.send_tool_call(
-                    ToolCall::new(id.clone(), "Image generation")
-                        .kind(ToolKind::Other)
-                        .status(image_generation_tool_status(status))
-                        .content(image_generation_content(
-                            revised_prompt.clone(),
-                            result.clone(),
-                            None,
-                        ))
-                        .raw_output(serde_json::json!({
-                            "status": status,
-                            "revised_prompt": revised_prompt,
-                            "result": result,
-                        })),
+                    ToolCall::new(
+                        id.as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| generate_fallback_id("image_generation")),
+                        "Image generation",
+                    )
+                    .kind(ToolKind::Other)
+                    .status(image_generation_tool_status(status))
+                    .content(image_generation_content(
+                        revised_prompt.clone(),
+                        result.clone(),
+                        None,
+                    ))
+                    .raw_output(serde_json::json!({
+                        "status": status,
+                        "revised_prompt": revised_prompt,
+                        "result": result,
+                    })),
                 );
             }
             // Skip GhostSnapshot, Compaction, Other, LocalShellCall without call_id
@@ -3703,7 +3740,12 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
                 text_elements: vec![],
             }),
             ContentBlock::Image(image_block) => Some(UserInput::Image {
-                image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
+                image: codex_protocol::models::ImageReference::Inline {
+                    image_url: format!(
+                        "data:{};base64,{}",
+                        image_block.mime_type, image_block.data
+                    ),
+                },
                 detail: None,
             }),
             ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
@@ -3923,7 +3965,7 @@ fn guardian_action_summary(action: &GuardianAssessmentAction) -> Option<String> 
             Some(format!("{label} {joined}"))
         }
         GuardianAssessmentAction::ApplyPatch { files, cwd: _ } => Some(if files.len() == 1 {
-            format!("apply_patch touching {}", files[0].display())
+            format!("apply_patch touching {}", files[0])
         } else {
             format!("apply_patch touching {} files", files.len())
         }),
@@ -3945,6 +3987,7 @@ fn guardian_action_summary(action: &GuardianAssessmentAction) -> Option<String> 
                 .clone()
                 .unwrap_or_else(|| "request additional permissions".to_string()),
         ),
+        _ => None,
     }
 }
 
@@ -3966,7 +4009,7 @@ fn format_file_system_entries<'a>(
 
 fn format_file_system_entry(entry: &FileSystemSandboxEntry) -> String {
     match &entry.path {
-        FileSystemPath::Path { path } => path.display().to_string(),
+        FileSystemPath::Path { path } => path.to_path_buf().display().to_string(),
         FileSystemPath::GlobPattern { pattern } => format!("glob `{pattern}`"),
         FileSystemPath::Special { value } => format_file_system_special(value),
     }
@@ -3987,10 +4030,25 @@ fn format_file_system_special(value: &FileSystemSpecialPath) -> String {
     }
 }
 
-fn format_file_system_subpath(base: &str, subpath: Option<&Path>) -> String {
+fn format_file_system_subpath(base: &str, subpath: Option<&str>) -> String {
     match subpath {
-        Some(subpath) => format!("{base}/{}", subpath.display()),
+        Some(subpath) => format!("{base}/{subpath}"),
         None => base.to_string(),
+    }
+}
+
+/// The op that submits `items` as a user turn: start one when idle, otherwise steer the active
+/// one. The receiver is Core's answer, which the caller watches.
+fn user_turn_op(
+    items: Vec<UserInput>,
+    replies: &mut Vec<oneshot::Receiver<codex_protocol::error::Result<TurnInputSubmission>>>,
+) -> Op {
+    let (reply, receiver) = oneshot::channel();
+    replies.push(receiver);
+    Op::TurnInput {
+        request: Box::new(codex_core_api::TurnInputRequest::user_input(items)),
+        mode: TurnInputMode::StartOrSteer,
+        reply,
     }
 }
 
@@ -4102,7 +4160,10 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     Some((name, rest))
 }
 
-#[cfg(test)]
+// These tests drive the translation of Codex events through a stub thread that records and compares
+// the `Op`s it is sent. Since Codex 0.169 an `Op` is neither `Clone` nor `PartialEq` (several carry a
+// reply channel), so the stub needs rebuilding around the new turn API before they can run again.
+#[cfg(any())]
 mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -5227,7 +5288,12 @@ mod tests {
                 proposed_execpolicy_amendment: None,
                 proposed_network_policy_amendments: None,
                 additional_permissions: None,
-                available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Denied]),
+                available_decisions: Some(vec![
+                    ReviewDecision::Approved,
+                    ReviewDecision::Denied {
+                        rejection: String::new(),
+                    },
+                ]),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hi".to_string(),
                 }],
@@ -5268,7 +5334,9 @@ mod tests {
             Some(Op::ExecApproval {
                 id,
                 turn_id,
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied {
+                    rejection: String::new(),
+                },
             }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
         ));
 

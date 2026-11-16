@@ -5,6 +5,7 @@ members = [
     "apply-patch",
     "arg0",
     "cli",
+    "claude-acp",
     "codex-acp",
     "common",
     "core",
@@ -181,7 +182,7 @@ sha2 = "0.10"
 shlex = "1.3.0"
 similar = "2.7.0"
 socket2 = "0.6.0"
-starlark = "0.13.0"
+starlark = "0.14.2"
 strum = "0.27.2"
 strum_macros = "0.27.2"
 # The pure-Rust fancy-regex engine instead of the C oniguruma one.
@@ -294,9 +295,12 @@ opt-level = 0
 incremental = false
 
 [patch.crates-io]
-# The tungstenite forks the upstream Codex crates (used by codex-acp) are built against.
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
+# What the upstream Codex crates (codex-acp) are built against; revisions follow openai/codex's own
+# [patch] section at the pinned tag.
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "7447c427513cfe685f236e1ac0513c4ea3dd9c0b" }
+sqlx-core = { git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-sqlite = { git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "bc589d684755a8c02da0fc7e58d0861cbfc306f1" }
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
 crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "45fecb9508105988f42fe6ff0441783ed3717f92" }
@@ -304,8 +308,10 @@ crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "45fe
 # Uncomment to debug local changes.
 # rmcp = { path = "../../rust-sdk/crates/rmcp" }
 
-# The upstream Codex crates codex-acp links, with the pty crate it vendors a fix for.
+[patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "bc589d684755a8c02da0fc7e58d0861cbfc306f1" }
+
+# The upstream crates that use tree-sitter, built against the version Nori links.
 [patch."https://github.com/openai/codex"]
-codex-utils-pty = { path = "codex-acp/vendor/codex-utils-pty" }
 codex-apply-patch = { path = "codex-acp/vendor/codex-apply-patch" }
 codex-shell-command = { path = "codex-acp/vendor/codex-shell-command" }
