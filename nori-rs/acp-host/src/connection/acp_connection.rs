@@ -812,9 +812,22 @@ impl AcpConnection {
             )
         })?;
         let mut spec = spec.clone();
-        spec.config
-            .extend(crate::in_process::codex_overrides_from_env(&config.env));
-        debug!("Starting built-in agent {} in {}", spec.agent, cwd.display());
+        // The environment the adapter would have read becomes explicit options, since a process
+        // shared with other agents has no per-agent environment.
+        match spec.agent.as_str() {
+            "codex" => spec
+                .config
+                .extend(crate::in_process::codex_overrides_from_env(&config.env)),
+            "claude" => spec
+                .config
+                .extend(crate::in_process::claude_overrides_from_env(&config.env)),
+            _ => {}
+        }
+        debug!(
+            "Starting built-in agent {} in {}",
+            spec.agent,
+            cwd.display()
+        );
 
         let (client_end, agent_end) = tokio::io::duplex(IN_PROCESS_PIPE_BYTES);
         // The agent says why it stopped, whether it failed or just ended: a closed pipe is a

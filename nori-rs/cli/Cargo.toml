@@ -16,10 +16,13 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-default = ["native-codex"]
+default = ["native-codex", "native-claude"]
 # Run Codex inside Nori's own process instead of through an adapter. It links all of codex-core,
 # including V8, so a build without it is much smaller and faster to compile.
 native-codex = ["dep:codex-acp"]
+# Run Claude Code through the in-process Rust driver instead of the TypeScript adapter. It still
+# starts Claude Code's own CLI; there is no adapter process.
+native-claude = ["dep:claude-code-acp-rs"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -39,6 +42,7 @@ codex-stdio-to-uds = { workspace = true }
 nori-tui = { workspace = true }
 ctor = { workspace = true }
 codex-acp = { path = "../codex-acp", optional = true }
+claude-code-acp-rs = { path = "../claude-acp", optional = true }
 libc = { workspace = true }
 owo-colors = { workspace = true }
 regex-lite = { workspace = true}

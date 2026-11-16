@@ -4,6 +4,32 @@
 pub fn register() {
     #[cfg(feature = "native-codex")]
     register_codex();
+    #[cfg(feature = "native-claude")]
+    register_claude();
+}
+
+#[cfg(feature = "native-claude")]
+fn register_claude() {
+    use std::sync::Arc;
+
+    nori_acp_host::in_process::register_in_process_agent(
+        "claude",
+        Arc::new(|spec, pipe| {
+            Box::pin(async move {
+                let mut options = claude_code_acp::InProcessOptions::default();
+                for pair in &spec.config {
+                    match pair.split_once('=') {
+                        Some(("cli_path", path)) => options.cli_path = Some(path.into()),
+                        Some(("model", model)) => options.model = Some(model.to_owned()),
+                        _ => {}
+                    }
+                }
+                claude_code_acp::serve_in_process(pipe, options)
+                    .await
+                    .map_err(std::io::Error::other)
+            })
+        }),
+    );
 }
 
 #[cfg(feature = "native-codex")]

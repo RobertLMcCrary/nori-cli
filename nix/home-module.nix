@@ -144,7 +144,10 @@ let
             types.submodule {
               options = {
                 agent = mkOption {
-                  type = types.enum [ "codex" ];
+                  type = types.enum [
+                    "claude"
+                    "codex"
+                  ];
                   description = "The agent built into Nori to run in its own process, with no adapter.";
                 };
                 home = mkOption {

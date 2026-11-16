@@ -990,10 +990,12 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
             install_hint: format!("npm install -g {}", agent.npm_package()),
             model_injection: agent.model_injection(),
             advertise_subagents: true,
-            // Codex runs inside Nori when this build has it, so there is no adapter to start.
-            in_process: (agent == AgentKind::Codex && crate::in_process::in_process_available("codex"))
-                .then(|| crate::in_process::InProcessSpec {
-                    agent: "codex".to_string(),
+            // Claude and Codex run inside Nori when this build has them, so there is no adapter
+            // to start.
+            in_process: native_name(agent)
+                .filter(|name| crate::in_process::in_process_available(name))
+                .map(|name| crate::in_process::InProcessSpec {
+                    agent: name.to_string(),
                     home: None,
                     config: Vec::new(),
                 }),
@@ -1001,6 +1003,15 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
     }
 
     anyhow::bail!("Unknown ACP agent: {agent_name}")
+}
+
+/// The built-in in-process agent that can stand in for `agent`'s adapter, if there is one.
+fn native_name(agent: AgentKind) -> Option<&'static str> {
+    match agent {
+        AgentKind::ClaudeCode => Some("claude"),
+        AgentKind::Codex => Some("codex"),
+        AgentKind::Gemini => None,
+    }
 }
 
 /// Get the display name for an agent by agent name.

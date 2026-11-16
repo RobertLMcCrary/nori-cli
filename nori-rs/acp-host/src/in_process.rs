@@ -77,6 +77,19 @@ pub fn codex_overrides_from_env(env: &HashMap<String, String>) -> Vec<String> {
     overrides
 }
 
+/// The environment an adapter would read for Claude Code, as the `key=value` options the
+/// in-process driver takes: which `claude` to run (how an account is chosen) and the model.
+pub fn claude_overrides_from_env(env: &HashMap<String, String>) -> Vec<String> {
+    let mut overrides = Vec::new();
+    if let Some(path) = env.get("CLAUDE_CODE_EXECUTABLE").filter(|v| !v.is_empty()) {
+        overrides.push(format!("cli_path={path}"));
+    }
+    if let Some(model) = env.get("ANTHROPIC_MODEL").filter(|v| !v.is_empty()) {
+        overrides.push(format!("model={model}"));
+    }
+    overrides
+}
+
 fn flatten(out: &mut Vec<String>, prefix: String, value: &serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -103,7 +116,8 @@ mod tests {
     fn codex_config_json_becomes_dotted_overrides() {
         let env = HashMap::from([(
             "CODEX_CONFIG".to_owned(),
-            r#"{"model":"o3","features":{"goals":false},"model_reasoning_effort":"high"}"#.to_owned(),
+            r#"{"model":"o3","features":{"goals":false},"model_reasoning_effort":"high"}"#
+                .to_owned(),
         )]);
         let mut overrides = codex_overrides_from_env(&env);
         overrides.sort();
@@ -116,6 +130,22 @@ mod tests {
             ]
         );
         assert!(codex_overrides_from_env(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn claude_environment_becomes_driver_options() {
+        let env = HashMap::from([
+            (
+                "CLAUDE_CODE_EXECUTABLE".to_owned(),
+                "/bin/claude2".to_owned(),
+            ),
+            ("ANTHROPIC_MODEL".to_owned(), "opus".to_owned()),
+        ]);
+        assert_eq!(
+            claude_overrides_from_env(&env),
+            vec!["cli_path=/bin/claude2", "model=opus"]
+        );
+        assert!(claude_overrides_from_env(&HashMap::new()).is_empty());
     }
 
     #[test]

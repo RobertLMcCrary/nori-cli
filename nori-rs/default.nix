@@ -2,17 +2,13 @@
   lib,
   rustPlatform,
   stdenv,
-  callPackage,
   pkg-config,
   dbus,
-  # Run Codex inside Nori. It links all of codex-core, including V8, so turning it off gives a much
-  # smaller and faster build, at the cost of needing an external Codex adapter.
+  # Run Codex inside Nori. It links all of codex-core, so turning it off gives a much smaller and
+  # faster build, at the cost of needing an external Codex adapter.
   nativeCodex ? true,
   ...
 }:
-let
-  v8 = callPackage ../nix/v8.nix { };
-in
 rustPlatform.buildRustPackage {
   pname = "nori";
   version = "0.0.0";
@@ -33,11 +29,6 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
   buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ dbus ];
   doCheck = false;
-
-  env = lib.optionalAttrs nativeCodex {
-    RUSTY_V8_ARCHIVE = v8.archive;
-    RUSTY_V8_SRC_BINDING_PATH = v8.binding;
-  };
 
   meta = {
     description = "Nori command-line interface, an agent-agnostic terminal UI over ACP";
