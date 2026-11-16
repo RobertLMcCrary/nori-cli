@@ -49,15 +49,13 @@ pub fn agent_picker_params_with_subtitle(
         .map(|agent| {
             let is_current = agent.agent_name.to_lowercase() == current_normalized;
             let agent_name = agent.agent_name.clone();
-            let display_name = agent.display_name.clone();
             let highlight_agent = agent_name.clone();
-            let highlight_display = display_name.clone();
+            let highlight_display = agent.display_name.clone();
 
             // Start preparing the selected agent as soon as the picker closes.
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 tx.send(AppEvent::PrepareAgentCandidate {
                     agent_name: agent_name.clone(),
-                    display_name: display_name.clone(),
                 });
             })];
 

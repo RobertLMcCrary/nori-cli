@@ -230,7 +230,6 @@ impl App {
                     }
                     self.candidate_agent = Some(CandidateAgent::Activating {
                         agent_name,
-                        display_name,
                         widget: Box::new(widget),
                         activation_error: None,
                     });
@@ -791,10 +790,7 @@ impl App {
 
                     if let Some(started) = started {
                         let Some(CandidateAgent::Activating {
-                            agent_name,
-                            display_name,
-                            widget,
-                            ..
+                            agent_name, widget, ..
                         }) = self.candidate_agent.take()
                         else {
                             unreachable!("candidate generation checked above")
@@ -828,10 +824,7 @@ impl App {
                         {
                             tracing::error!(%error, "failed to persist activated agent selection");
                         }
-                        self.chat_widget.add_info_message(
-                            format!("Started new conversation with agent: {display_name}"),
-                            None,
-                        );
+                        self.chat_widget.show_agent_in_footer();
                     } else if let Some(message) = ended_message {
                         let candidate = self.candidate_agent.take();
                         if let Some(CandidateAgent::Activating {
@@ -1196,11 +1189,8 @@ impl App {
                         Some(Overlay::new_static_with_lines(lines, "T O O L".to_string()));
                 }
             }
-            AppEvent::PrepareAgentCandidate {
-                agent_name,
-                display_name,
-            } => {
-                self.switch_agent(tui, agent_name, display_name).await;
+            AppEvent::PrepareAgentCandidate { agent_name } => {
+                self.switch_agent(tui, agent_name).await;
             }
             AppEvent::HighlightAgentCandidate {
                 agent_name,
@@ -1836,7 +1826,6 @@ impl App {
                     );
                     self.candidate_agent = Some(CandidateAgent::Activating {
                         agent_name,
-                        display_name,
                         widget: Box::new(widget),
                         activation_error: None,
                     });

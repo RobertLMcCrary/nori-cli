@@ -251,8 +251,6 @@ pub(crate) enum AppEvent {
     PrepareAgentCandidate {
         /// The agent name of the selected agent (e.g., "mock-model", "gemini-2.5-flash")
         agent_name: String,
-        /// The display name for the status indicator
-        display_name: String,
     },
 
     /// Abandon the prepared candidate while keeping the active session.

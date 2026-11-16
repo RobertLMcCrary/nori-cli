@@ -626,6 +626,11 @@ impl BottomPane {
     }
 
     /// The model shown in the footer (None hides it).
+    #[cfg(test)]
+    pub(crate) fn model_label(&self) -> Option<&str> {
+        self.composer.model_label()
+    }
+
     pub(crate) fn set_model_label(&mut self, label: Option<String>) {
         self.composer.set_model_label(label);
         self.request_redraw();

@@ -491,6 +491,11 @@ impl ChatComposer {
         self.acp_mode_label = label;
     }
 
+    #[cfg(test)]
+    pub(crate) fn model_label(&self) -> Option<&str> {
+        self.model_label.as_deref()
+    }
+
     pub(crate) fn set_model_label(&mut self, label: Option<String>) {
         self.model_label = label;
     }

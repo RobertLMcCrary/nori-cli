@@ -140,12 +140,7 @@ impl App {
     /// new agent, whose connection is prepared behind it; what is typed meanwhile is queued
     /// until it is ready, exactly as at startup. An agent already warmed for the picker row is
     /// used as it is, and the switch takes no time at all.
-    pub(crate) async fn switch_agent(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-        agent_name: String,
-        display_name: String,
-    ) {
+    pub(crate) async fn switch_agent(&mut self, tui: &mut crate::tui::Tui, agent_name: String) {
         self.cancel_warm_pause();
         let warm = match &self.candidate_agent {
             Some(CandidateAgent::Prepared {
@@ -195,10 +190,7 @@ impl App {
         self.chat_widget = ChatWidget::new(init);
         self.configure_new_chat_widget();
         self.chat_widget.restore_composer_draft(composer_draft);
-        self.chat_widget.add_info_message(
-            format!("Started new conversation with agent: {display_name}"),
-            None,
-        );
+        self.chat_widget.show_agent_in_footer();
         if let Some(agent) = warm {
             self.prepared_agent = Some(agent);
             self.app_event_tx.send(AppEvent::NewSession);

@@ -9,35 +9,6 @@ use ratatui::text::Span;
 
 use crate::history_cell::PlainHistoryCell;
 use crate::nori::agent_config_state::AgentConfigOption;
-use crate::nori::agent_config_state::AgentConfigState;
-
-/// Initial-snapshot banner shown the first time the agent announces its
-/// session config options. Lists every option's current value and surfaces
-/// the `/config` affordance so the user knows how to change them.
-pub(crate) fn new_agent_options_initial_history_cell(
-    agent_display_name: &str,
-    config: &AgentConfigState,
-) -> PlainHistoryCell {
-    let agent_display_name = if agent_display_name.is_empty() {
-        "Agent"
-    } else {
-        agent_display_name
-    };
-
-    let mut line = vec!["• ".dim(), format!("{agent_display_name} options: ").into()];
-    for (index, option) in config.options().iter().enumerate() {
-        if index > 0 {
-            line.push(", ".into());
-        }
-        line.extend(option_assignment_spans(
-            &option.name,
-            &option.display_value(),
-        ));
-    }
-    line.push(" (/config to change)".dim());
-
-    PlainHistoryCell::new(vec![Line::from(line)])
-}
 
 pub(crate) fn new_agent_options_history_cell(
     agent_display_name: &str,
@@ -111,19 +82,18 @@ mod tests {
 
     use super::*;
     use crate::history_cell::HistoryCell;
+    use crate::nori::agent_config_state::AgentConfigState;
     use nori_protocol::acp::v1 as acp;
 
     #[test]
     fn history_cells_highlight_values_not_names() {
-        let cell = new_agent_options_initial_history_cell(
-            "Claude Code",
-            &AgentConfigState::from_options(&[acp::SessionConfigOption::select(
-                "mode",
-                "Mode",
-                "default",
-                vec![acp::SessionConfigSelectOption::new("default", "Default")],
-            )]),
-        );
+        let mode = AgentConfigState::from_options(&[acp::SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "default",
+            vec![acp::SessionConfigSelectOption::new("default", "Default")],
+        )]);
+        let cell = new_agent_options_history_cell("Claude Code", mode.options());
 
         let lines = cell.display_lines(80);
         assert_value_highlighted(&lines[0].spans, "Mode", "Default");

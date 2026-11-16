@@ -134,11 +134,15 @@ fn configuration_history_announces_the_initial_set_then_only_changes() {
 
     chat.handle_acp_session_config_update(&claude_options("opus-5"));
     let announced = history_text(&mut rx);
-    assert!(
-        announced.contains("Claude Code options: Mode=Plan, Model=Opus 5, Effort=xhigh"),
-        "the first announcement lists every advertised option, got:\n{announced}"
+    assert_eq!(
+        announced, "",
+        "the first announcement is not printed, the footer carries it"
     );
-    assert!(announced.contains("(/config to change)"));
+    assert_eq!(
+        chat.bottom_pane.model_label(),
+        Some("Claude Code · Opus 5 · xhigh"),
+        "the footer names the agent, model and effort"
+    );
 
     chat.handle_acp_session_config_update(&claude_options("sonnet-5"));
     let changed = history_text(&mut rx);
@@ -275,13 +279,13 @@ fn a_session_start_after_the_early_card_announces_the_configuration_instead() {
 
     let announced = history_text(&mut rx);
     assert!(
-        announced.contains("Claude Code options: Mode=Plan, Model=Opus 5, Effort=xhigh"),
-        "the card already went out without the model, so the resolved \
-         configuration is announced on its own line, got:\n{announced}"
+        !announced.contains("Nori CLI") && !announced.contains("options"),
+        "the card is not written a second time and nothing is announced, the footer shows \
+         the configuration, got:\n{announced}"
     );
-    assert!(
-        !announced.contains("Nori CLI"),
-        "and the card is not written a second time, got:\n{announced}"
+    assert_eq!(
+        chat.bottom_pane.model_label(),
+        Some("Claude Code · Opus 5 · xhigh")
     );
 }
 

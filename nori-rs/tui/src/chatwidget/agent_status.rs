@@ -14,7 +14,42 @@ use crate::nori::session_header::AgentStatusHandle;
 use crate::nori::session_header::SkillsetStatus;
 use crate::nori::session_header::StatusViewModel;
 
+/// What the footer's model segment says: the agent, the model with the effort it runs at (what
+/// Ctrl+N, Ctrl+P and Shift+Space change), and any other option the agent has moved off its
+/// default. The mode has its own footer label.
+fn footer_label(agent: &str, config: &AgentConfigState) -> Option<String> {
+    use nori_protocol::acp::v1::SessionConfigOptionCategory as Category;
+
+    let mut parts: Vec<String> = Vec::new();
+    if !agent.is_empty() {
+        parts.push(agent.to_owned());
+    }
+    if let Some(model) = config.option_for_category(&Category::Model) {
+        parts.push(model.display_value());
+    }
+    let effort = config.effort_option();
+    if let Some(effort) = effort {
+        parts.push(effort.display_value());
+    }
+    for option in config.options() {
+        let shown = option.is_category(&Category::Model)
+            || option.is_category(&Category::Mode)
+            || effort.is_some_and(|effort| effort.id == option.id);
+        let value = option.display_value();
+        if !shown && !value.eq_ignore_ascii_case("default") {
+            parts.push(value);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 impl ChatWidget {
+    /// Show the agent in the footer now, before it has told us anything else about itself.
+    pub(crate) fn show_agent_in_footer(&mut self) {
+        let label = footer_label(self.bottom_pane.agent_display_name(), &self.agent_config);
+        self.bottom_pane.set_model_label(label);
+    }
+
     /// The agent's advertised configuration, in advertised order.
     pub(crate) fn agent_config(&self) -> &AgentConfigState {
         &self.agent_config
@@ -26,17 +61,8 @@ impl ChatWidget {
         self.agent_status
             .set(AgentStatus::from_config(&self.config.active_agent, &config));
         let mode = config.mode_config();
-        // The model, with the effort it runs at: what Ctrl+N, Ctrl+P and Shift+Space change.
-        let model = config
-            .option_for_category(&nori_protocol::acp::v1::SessionConfigOptionCategory::Model)
-            .map(|option| {
-                let model = option.display_value();
-                match config.effort_option() {
-                    Some(effort) => format!("{model} · {}", effort.display_value()),
-                    None => model,
-                }
-            });
-        self.bottom_pane.set_model_label(model);
+        self.bottom_pane
+            .set_model_label(footer_label(self.bottom_pane.agent_display_name(), &config));
         self.agent_config = config;
         self.apply_acp_mode_config_snapshot(self.acp_mode_config_generation, mode);
     }
@@ -49,16 +75,9 @@ impl ChatWidget {
     ) {
         let next = AgentConfigState::from_options(config_options);
 
-        if self.agent_config.is_empty() {
-            if !next.is_empty() {
-                self.add_to_history(
-                    crate::nori::session_config_history::new_agent_options_initial_history_cell(
-                        self.bottom_pane.agent_display_name(),
-                        &next,
-                    ),
-                );
-            }
-        } else {
+        // The first announcement is not printed: the footer shows the agent, model, effort and
+        // mode, and only what changes after that is worth a line in the history.
+        if !self.agent_config.is_empty() {
             let changes = next.changes_since(&self.agent_config);
             if !changes.is_empty() {
                 self.add_to_history(
