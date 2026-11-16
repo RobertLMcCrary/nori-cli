@@ -9,7 +9,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
@@ -80,6 +79,8 @@
                     _module.args.lib = lib.mkForce (lib.extend (_: _: { hm.dag.entryAfter = _: data: data; }));
                     programs.nori = {
                       enable = true;
+                      # The module's wiring is what is checked here; building Nori itself is `.#nori`.
+                      package = pkgs.writeShellScriptBin "nori" "";
                       settings.agent = "claude";
                       agents.claude = {
                         name = "Claude";
