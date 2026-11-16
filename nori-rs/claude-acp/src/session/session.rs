@@ -47,7 +47,7 @@ use super::usage::UsageTracker;
 /// - File tools: Read, Write, Edit
 ///
 /// Other tools like Glob, Grep, Task, etc. should remain as CLI built-in tools.
-fn get_acp_replacement_tools() -> Vec<&'static str> {
+pub(crate) fn get_acp_replacement_tools() -> Vec<&'static str> {
     vec![
         // Terminal tools - must be replaced to use ACP Terminal API
         "Bash",
@@ -1168,7 +1168,9 @@ mod tests {
             "test-session-1".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None, &SessionTools::default())
+            None,
+            &SessionTools::default(),
+        )
         .unwrap();
 
         assert_eq!(session.session_id, "test-session-1");
@@ -1184,7 +1186,9 @@ mod tests {
             "test-cancel-session".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None, &SessionTools::default())
+            None,
+            &SessionTools::default(),
+        )
         .unwrap();
 
         // 1. Initially cancelled should be false
@@ -1221,7 +1225,9 @@ mod tests {
             "test-session-2".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None, &SessionTools::default())
+            None,
+            &SessionTools::default(),
+        )
         .unwrap();
 
         // Note: Cancellation is now handled per-prompt via CancellationToken
@@ -1235,7 +1241,9 @@ mod tests {
             "test-session-3".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None, &SessionTools::default())
+            None,
+            &SessionTools::default(),
+        )
         .unwrap();
 
         // Default is Default mode (standard behavior with permission prompts)
@@ -1332,7 +1340,9 @@ mod tests {
             "test-cleanup-session".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None, &SessionTools::default())
+            None,
+            &SessionTools::default(),
+        )
         .unwrap();
 
         // Cleanup should succeed even with no processes
@@ -1350,7 +1360,9 @@ mod tests {
             "test-cleanup-with-bg".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None, &SessionTools::default())
+            None,
+            &SessionTools::default(),
+        )
         .unwrap();
 
         // Create a mock background process using the process manager
@@ -1474,7 +1486,9 @@ mod tests {
             "test-bundled-cli".to_string(),
             PathBuf::from("/tmp"),
             &test_config(),
-            None, &SessionTools::default())
+            None,
+            &SessionTools::default(),
+        )
         .unwrap();
 
         // Session should exist without explicitly setting cli_path.

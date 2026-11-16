@@ -1232,13 +1232,15 @@ impl ChatWidget {
 
         // Buffer incomplete Execute ClientToolCells instead of flushing
         // them to history with wrong content (description text as output),
-        // and incomplete delegations, which run in parallel and would stay
-        // "Delegating…" in the scrollback.
+        // incomplete delegations, which run in parallel and would stay
+        // "Delegating…" in the scrollback, and Nori's own tools, which agents
+        // call in parallel and which read as their result.
         if let Some(active) = self.active_cell.take() {
             if let Some(client_cell) = active.as_any().downcast_ref::<ClientToolCell>()
                 && client_cell.is_active()
                 && (*client_cell.snapshot_kind() == crate::presentation::ToolKind::Execute
-                    || client_cell.is_delegation())
+                    || client_cell.is_delegation()
+                    || client_cell.is_native())
             {
                 let call_id = client_cell.call_id().to_owned();
                 if let Ok(boxed) = active.into_any().downcast::<ClientToolCell>() {

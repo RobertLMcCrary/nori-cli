@@ -194,7 +194,9 @@ impl NotificationConverter {
     }
 
     /// Convert a user message: Claude Code returns every tool's output in one, as `tool_result`
-    /// blocks, so this is where tool calls finish. Anything else in it is the CLI echoing input.
+    /// blocks, so this is where tool calls finish. The ACP server's own tools (`mcp__acp__*`)
+    /// report their completion as they run, so only the rest finish here. Anything else in the
+    /// message is the CLI echoing input.
     fn convert_user_message(
         &self,
         user: &UserMessage,
@@ -214,6 +216,10 @@ impl NotificationConverter {
             .filter_map(|block| match block {
                 SdkContentBlock::ToolResult(result) => Some(result),
                 _ => None,
+            })
+            .filter(|result| {
+                self.get_tool_use(&result.tool_use_id)
+                    .is_none_or(|entry| !entry.name.starts_with(crate::mcp::ACP_TOOL_PREFIX))
             })
             .flat_map(|result| self.make_tool_result(session_id, result))
             .collect()
@@ -718,9 +724,18 @@ impl NotificationConverter {
 
         let output = match &tool_result.content {
             Some(ToolResultContent::Text(text)) => text.clone(),
-            Some(ToolResultContent::Blocks(blocks)) => {
-                serde_json::to_string(blocks).unwrap_or_default()
-            }
+            // MCP results come as content blocks: their text is the output; anything else
+            // (an image, say) is kept as JSON.
+            Some(ToolResultContent::Blocks(blocks)) => blocks
+                .iter()
+                .map(
+                    |block| match block.get("text").and_then(serde_json::Value::as_str) {
+                        Some(text) if block["type"] == "text" => text.to_owned(),
+                        _ => block.to_string(),
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join("\n"),
             None => String::new(),
         };
 
@@ -1056,6 +1071,50 @@ mod tests {
         };
         assert_eq!(update.tool_call_id.0.as_ref(), "toolu_1");
         assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+
+        // An MCP result's text blocks are its output, not a JSON array of blocks.
+        converter.cache_tool_use(&ToolUseBlock {
+            id: "toolu_3".to_string(),
+            name: "mcp__nori__git_log".to_string(),
+            input: json!({}),
+        });
+        let blocks: Message = serde_json::from_value(json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_3",
+                "content": [{"type": "text", "text": "{\"commits\":[]}"}]
+            }]},
+            "session_id": "abc"
+        }))
+        .expect("a user message");
+        let [notification] = converter
+            .convert_message(&blocks, "s")
+            .try_into()
+            .expect("one");
+        let SessionUpdate::ToolCallUpdate(update) = notification.update else {
+            panic!("a tool call update");
+        };
+        assert_eq!(
+            update.fields.raw_output,
+            Some(json!({"content": "{\"commits\":[]}", "is_error": false}))
+        );
+
+        // The ACP server finishes its own tools; their results are not reported twice.
+        converter.cache_tool_use(&ToolUseBlock {
+            id: "toolu_2".to_string(),
+            name: "mcp__acp__Edit".to_string(),
+            input: json!({}),
+        });
+        let edit_result: Message = serde_json::from_value(json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_2", "content": "ok"
+            }]},
+            "session_id": "abc"
+        }))
+        .expect("a user message");
+        assert_eq!(converter.convert_message(&edit_result, "s").len(), 0);
 
         // A plain echo of the user's text finishes nothing.
         let echo: Message = serde_json::from_value(json!({

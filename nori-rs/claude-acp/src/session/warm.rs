@@ -67,10 +67,9 @@ fn pool() -> &'static Mutex<Pool> {
 pub fn claim(key: &WarmKey) -> Option<Arc<Session>> {
     let (claimed, expired) = {
         let mut pool = pool().lock().unwrap_or_else(PoisonError::into_inner);
-        let (fresh, expired): (Vec<Warm>, Vec<Warm>) =
-            std::mem::take(&mut pool.ready).into_iter().partition(|warm| {
-                warm.started.elapsed() < MAX_AGE && warm.session.is_connected()
-            });
+        let (fresh, expired): (Vec<Warm>, Vec<Warm>) = std::mem::take(&mut pool.ready)
+            .into_iter()
+            .partition(|warm| warm.started.elapsed() < MAX_AGE && warm.session.is_connected());
         pool.ready = fresh;
         let claimed = pool
             .ready

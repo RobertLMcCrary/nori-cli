@@ -1089,15 +1089,23 @@ impl SdkMcpServer for AcpMcpServer {
                 }))
             }
             "tools/list" => {
+                // The tools that stand in for the CLI's own file and terminal tools stay loaded:
+                // behind Claude Code's tool search, the model would first have to look for its
+                // Read and Edit.
+                let replacements = crate::session::acp_replacement_tools();
                 let tools: Vec<_> = self
                     .tools
                     .values()
                     .map(|t| {
-                        serde_json::json!({
+                        let mut tool = serde_json::json!({
                             "name": t.name,
                             "description": t.description,
                             "inputSchema": t.input_schema
-                        })
+                        });
+                        if replacements.contains(&t.name.as_str()) {
+                            tool["_meta"] = serde_json::json!({"anthropic/alwaysLoad": true});
+                        }
+                        tool
                     })
                     .collect();
 

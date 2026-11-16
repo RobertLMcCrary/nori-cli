@@ -204,6 +204,70 @@ fn noop_tool_updates_do_not_fragment_streaming_answer() {
     );
 }
 
+/// Agents call Nori's tools in parallel: a second call must not push the first,
+/// still running, into the scrollback as "Reading git status" for good.
+#[test]
+fn parallel_native_tool_calls_each_finish_with_their_result() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let native = |call_id: &str,
+                  call: crate::presentation::NativeCall,
+                  phase: crate::presentation::ToolPhase,
+                  result: Option<&str>| {
+        let mut snapshot = acp_tool_snapshot(
+            call_id,
+            call_id,
+            crate::presentation::ToolKind::Other("Other".into()),
+            phase,
+        );
+        snapshot.invocation = Some(crate::presentation::Invocation::Native(call));
+        snapshot.artifacts = result
+            .map(|text| {
+                vec![crate::presentation::Artifact::Text {
+                    text: text.into(),
+                    format: crate::presentation::TextFormat::Plain,
+                }]
+            })
+            .unwrap_or_default();
+        crate::presentation::ClientEvent::ToolSnapshot(snapshot)
+    };
+    use crate::presentation::NativeCall::GitLog;
+    use crate::presentation::NativeCall::GitStatus;
+    use crate::presentation::ToolPhase::Completed;
+    use crate::presentation::ToolPhase::InProgress;
+
+    chat.handle_client_event(native("status", GitStatus, InProgress, None));
+    chat.handle_client_event(native("log", GitLog, InProgress, None));
+    chat.handle_client_event(native(
+        "status",
+        GitStatus,
+        Completed,
+        Some(r#"{"branch":"main","changes":[]}"#),
+    ));
+    chat.handle_client_event(native(
+        "log",
+        GitLog,
+        Completed,
+        Some(r#"{"branch":"main","commits":[{"id":"5dee151aaaa","summary":"feat: add mul"}]}"#),
+    ));
+    chat.handle_client_event(crate::presentation::ClientEvent::PromptCompleted(
+        crate::presentation::PromptCompleted {
+            stop_reason: nori_protocol::acp::v1::StopReason::EndTurn,
+            last_agent_message: None,
+            failure: None,
+        },
+    ));
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(rendered.contains("Git status  main"), "{rendered}");
+    assert!(rendered.contains("✓ working tree clean"), "{rendered}");
+    assert!(rendered.contains("5dee151 feat: add mul"), "{rendered}");
+    assert!(!rendered.contains("Reading git status"), "{rendered}");
+}
+
 #[test]
 fn transcript_subagents_are_merged_into_exit_stats() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();

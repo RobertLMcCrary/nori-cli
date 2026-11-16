@@ -208,7 +208,9 @@ workflow:
 - **Hooks.** After a prompt turn that ended normally, Nori compares the working
   tree and `HEAD` with how they were when the user's turn started, and sends
   the first hook whose event happened, as a hidden turn wrapped in
-  `<workflow_hook event="on-change">`, with a notice naming it:
+  `<workflow_hook event="on-change">`, with an info line naming it. Without a
+  snapshot from the turn's start (the scripts loaded during the turn) nothing
+  counts as changed:
   - after a user turn: `on-change` (files changed), then `on-commit` (`HEAD`
     moved), then `on-turn`, then `on-stop`;
   - after a hook turn: only `on-commit` and `on-stop`, so a hook's own edits

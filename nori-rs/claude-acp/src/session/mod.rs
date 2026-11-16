@@ -30,6 +30,7 @@ pub use permission_manager::{
 };
 pub use permission_request::{PermissionOutcome, PermissionRequestBuilder};
 pub use prompt_manager::{PromptId, PromptManager, PromptTask};
+pub(crate) use session::get_acp_replacement_tools as acp_replacement_tools;
 pub use session::{Session, stable_cache_key};
 pub use usage::UsageTracker;
 pub use wrapped_child::WrappedChild;

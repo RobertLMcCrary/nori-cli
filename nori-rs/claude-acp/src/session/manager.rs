@@ -182,7 +182,9 @@ mod tests {
                 "session-1".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         assert_eq!(session.session_id, "session-1");
@@ -200,7 +202,9 @@ mod tests {
                 "session-1".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         let session = manager.get_session("session-1");
@@ -221,7 +225,9 @@ mod tests {
                 "session-1".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         let result = manager.get_session_or_error("session-1");
@@ -241,7 +247,9 @@ mod tests {
                 "session-1".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         assert!(manager.has_session("session-1"));
@@ -262,14 +270,18 @@ mod tests {
                 "session-1".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         let duplicate = manager.create_session(
             "session-1".to_string(),
             PathBuf::from("/tmp"),
             &config,
-            None, &SessionTools::default());
+            None,
+            &SessionTools::default(),
+        );
 
         assert!(matches!(
             duplicate,
@@ -287,14 +299,18 @@ mod tests {
                 "session-1".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
         manager
             .create_session(
                 "session-2".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         let ids = manager.session_ids();
@@ -313,14 +329,18 @@ mod tests {
                 "session-1".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
         manager
             .create_session(
                 "session-2".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         assert_eq!(manager.session_count(), 2);
@@ -339,7 +359,9 @@ mod tests {
                 "session-1".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         let result = manager.with_session("session-1", |session| session.session_id.clone());
@@ -365,7 +387,9 @@ mod tests {
                 "session-cleanup-test".to_string(),
                 PathBuf::from("/tmp"),
                 &config,
-                None, &SessionTools::default())
+                None,
+                &SessionTools::default(),
+            )
             .unwrap();
 
         // Verify session exists

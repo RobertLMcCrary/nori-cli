@@ -218,10 +218,13 @@ impl AcpBackend {
             }
             (workflow, state.before.clone(), state.stop_hooked)
         };
+        // Without a snapshot from the turn's start (the workflow loaded during the turn, or this
+        // is not a git repository) nothing is known to have changed.
         let after = tree_state_of(self.cwd.clone()).await;
-        let changed = before != after;
-        let committed =
-            before.as_ref().map(|state| &state.head) != after.as_ref().map(|state| &state.head);
+        let (changed, committed) = match (&before, &after) {
+            (Some(before), Some(after)) => (before != after, before.head != after.head),
+            _ => (false, false),
+        };
         let events: &[HookEvent] = match completed_turn.prompt.kind {
             // Hooks answer what the user's turn did; a hook turn's own commit may still be
             // followed up, but its edits never start another round.
@@ -285,11 +288,16 @@ impl AcpBackend {
             state.stop_hooked |= event == HookEvent::BeforeStop;
         }
         let form = event.form();
-        notice(
-            &self.backend_event_tx,
-            format!("Workflow \"{}\": {form}", workflow.name),
-        )
-        .await;
+        // Routine, so an info line rather than a warning.
+        let _ = self
+            .backend_event_tx
+            .send(BackendEvent::Public(SessionEvent::Nori(
+                nori_protocol::NoriEvent::HookOutput(nori_protocol::HookOutput {
+                    message: format!("Workflow \"{}\" · {form}", workflow.name),
+                    level: nori_protocol::HookOutputLevel::Info,
+                }),
+            )))
+            .await;
         let text = format!("<workflow_hook event=\"{form}\">\n{prompt}\n</workflow_hook>");
         let _ = self
             .session_event_tx

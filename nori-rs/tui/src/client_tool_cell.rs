@@ -83,6 +83,14 @@ impl ClientToolCell {
         )
     }
 
+    /// A call to one of Nori's own tools, which reads as its result once it has one.
+    pub(crate) fn is_native(&self) -> bool {
+        matches!(
+            self.snapshot.invocation,
+            Some(crate::presentation::Invocation::Native(_))
+        )
+    }
+
     pub(crate) fn is_exploring(&self) -> bool {
         is_exploring_snapshot(&self.snapshot) || !self.exploring_snapshots.is_empty()
     }
