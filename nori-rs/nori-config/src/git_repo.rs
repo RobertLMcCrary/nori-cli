@@ -148,6 +148,147 @@ impl GitRepo {
         Some((added, removed))
     }
 
+    /// The revision a pull-request-style diff starts from: the merge-base of HEAD with the
+    /// remote's default branch, else with `main`, else with `master`, else HEAD itself.
+    pub fn pr_diff_base(&self) -> String {
+        if let Some(default) = self.remote_default_branch("origin")
+            && let Some(base) = self.merge_base("HEAD", &format!("origin/{default}"))
+        {
+            return base;
+        }
+        for branch in ["main", "master"] {
+            if let Some(base) = self.merge_base("HEAD", branch) {
+                return base;
+            }
+        }
+        "HEAD".to_string()
+    }
+
+    /// A unified diff of the working tree against the revision `base`, in the layout of
+    /// `git diff <base>` followed by every untracked file as a new file. With `color`, it uses
+    /// git's default palette. `None` when `base` does not name a commit.
+    pub fn diff_text(&self, base: &str, color: bool) -> Option<String> {
+        let workdir = self.repo.workdir()?.to_path_buf();
+        let base_tree = match self
+            .repo
+            .rev_parse_single(base)
+            .ok()
+            .and_then(|id| id.object().ok()?.peel_to_commit().ok()?.tree().ok())
+        {
+            Some(tree) => tree,
+            // Before the first commit everything in the working tree is new.
+            None if self.head_commit().is_none() => self.repo.empty_tree(),
+            None => return None,
+        };
+        let head_tree = self.repo.head_tree().ok();
+
+        // Every path whose content may differ from `base`: what moved between `base` and HEAD,
+        // plus what changed since HEAD.
+        let mut paths: std::collections::BTreeSet<gix::bstr::BString> = Default::default();
+        if let Some(head_tree) = &head_tree {
+            for change in self
+                .repo
+                .diff_tree_to_tree(&base_tree, head_tree, None)
+                .ok()?
+            {
+                use gix::object::tree::diff::ChangeDetached as Change;
+                match change {
+                    Change::Addition { location, .. }
+                    | Change::Deletion { location, .. }
+                    | Change::Modification { location, .. } => {
+                        paths.insert(location);
+                    }
+                    Change::Rewrite {
+                        location,
+                        source_location,
+                        ..
+                    } => {
+                        paths.insert(location);
+                        paths.insert(source_location);
+                    }
+                }
+            }
+        }
+        let mut untracked = Vec::new();
+        let items = self
+            .repo
+            .status(gix::progress::Discard)
+            .ok()?
+            .untracked_files(gix::status::UntrackedFiles::Files)
+            .into_iter(Vec::<gix::bstr::BString>::new())
+            .ok()?;
+        for item in items.flatten() {
+            match item {
+                gix::status::Item::TreeIndex(change) => {
+                    paths.insert(change.location().to_owned());
+                }
+                gix::status::Item::IndexWorktree(
+                    gix::status::index_worktree::Item::Modification { rela_path, .. },
+                ) => {
+                    paths.insert(rela_path);
+                }
+                gix::status::Item::IndexWorktree(
+                    gix::status::index_worktree::Item::DirectoryContents { entry, .. },
+                ) if entry.status == gix::dir::entry::Status::Untracked
+                    && entry.disk_kind == Some(gix::dir::entry::Kind::File) =>
+                {
+                    untracked.push(entry.rela_path.clone());
+                }
+                _ => {}
+            }
+        }
+        untracked.sort();
+
+        let palette = Palette::new(color);
+        let mut out = String::new();
+        for path in paths {
+            let Ok(relative) = gix::path::from_bstr(path.as_ref() as &gix::bstr::BStr) else {
+                continue;
+            };
+            let entry = base_tree
+                .lookup_entry_by_path(&relative)
+                .ok()
+                .flatten()
+                .filter(|entry| entry.mode().is_blob());
+            let old = entry
+                .as_ref()
+                .and_then(|entry| entry.object().ok())
+                .map(|object| (object.id, object.data.clone()));
+            let old_mode = entry.as_ref().map(|entry| u32::from(entry.mode().value()));
+            let full = workdir.join(&relative);
+            let new = std::fs::read(&full).ok();
+            let new_mode = new.as_ref().map(|_| worktree_mode(&full));
+            write_file_diff(
+                &mut out,
+                &palette,
+                &path.to_string(),
+                old.as_ref().map(|(id, data)| (*id, data.as_slice())),
+                old_mode,
+                new.as_deref(),
+                new_mode,
+            );
+        }
+        for path in untracked {
+            let Ok(relative) = gix::path::from_bstr(path.as_ref() as &gix::bstr::BStr) else {
+                continue;
+            };
+            let full = workdir.join(&relative);
+            let Ok(content) = std::fs::read(&full) else {
+                continue;
+            };
+            write_file_diff(
+                &mut out,
+                &palette,
+                &path.to_string(),
+                None,
+                None,
+                Some(&content),
+                Some(worktree_mode(&full)),
+            );
+        }
+        Some(out)
+    }
+
     /// The tracked files that differ between HEAD and the working tree, with both versions.
     fn head_changes(&self) -> Option<Vec<FileChange>> {
         let head_tree = self.repo.head_tree().ok()?;
@@ -207,6 +348,252 @@ impl GitRepo {
     }
 }
 
+/// ANSI sequences for the parts of a diff, or nothing at all.
+struct Palette {
+    meta: &'static str,
+    frag: &'static str,
+    old: &'static str,
+    new: &'static str,
+    reset: &'static str,
+}
+
+impl Palette {
+    fn new(color: bool) -> Self {
+        if color {
+            Self {
+                meta: "\x1b[1m",
+                frag: "\x1b[36m",
+                old: "\x1b[31m",
+                new: "\x1b[32m",
+                reset: "\x1b[m",
+            }
+        } else {
+            Self {
+                meta: "",
+                frag: "",
+                old: "",
+                new: "",
+                reset: "",
+            }
+        }
+    }
+}
+
+/// The git file mode of a working tree file: executable or plain.
+fn worktree_mode(path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0) {
+            return 0o100755;
+        }
+    }
+    let _ = path;
+    0o100644
+}
+
+/// Append one file's diff, in the layout of `git diff`.
+fn write_file_diff(
+    out: &mut String,
+    palette: &Palette,
+    path: &str,
+    old: Option<(gix::ObjectId, &[u8])>,
+    old_mode: Option<u32>,
+    new: Option<&[u8]>,
+    new_mode: Option<u32>,
+) {
+    use std::fmt::Write as _;
+
+    let Palette { meta, reset, .. } = palette;
+    let old_bytes = old.map(|(_, data)| data);
+    if old_bytes == new {
+        return;
+    }
+    let new_id = new.map(|data| {
+        gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::object::Kind::Blob, data)
+            .expect("blob hash")
+    });
+    let abbrev = |id: Option<gix::ObjectId>| {
+        id.map_or_else(
+            || "0000000".to_string(),
+            |id| id.to_hex_with_len(7).to_string(),
+        )
+    };
+    let _ = writeln!(out, "{meta}diff --git a/{path} b/{path}{reset}");
+    match (old_mode, new_mode) {
+        (None, Some(mode)) => {
+            let _ = writeln!(out, "{meta}new file mode {mode:o}{reset}");
+        }
+        (Some(mode), None) => {
+            let _ = writeln!(out, "{meta}deleted file mode {mode:o}{reset}");
+        }
+        (Some(before), Some(after)) if before != after => {
+            let _ = writeln!(out, "{meta}old mode {before:o}{reset}");
+            let _ = writeln!(out, "{meta}new mode {after:o}{reset}");
+        }
+        _ => {}
+    }
+    let mode_suffix = match (old_mode, new_mode) {
+        (Some(before), Some(after)) if before == after => format!(" {after:o}"),
+        _ => String::new(),
+    };
+    let _ = writeln!(
+        out,
+        "{meta}index {}..{}{mode_suffix}{reset}",
+        abbrev(old.map(|(id, _)| id)),
+        abbrev(new_id)
+    );
+
+    let (old_data, new_data) = (old_bytes.unwrap_or_default(), new.unwrap_or_default());
+    if old_data.contains(&0) || new_data.contains(&0) {
+        let a = if old.is_some() {
+            format!("a/{path}")
+        } else {
+            "/dev/null".into()
+        };
+        let b = if new.is_some() {
+            format!("b/{path}")
+        } else {
+            "/dev/null".into()
+        };
+        let _ = writeln!(out, "Binary files {a} and {b} differ");
+        return;
+    }
+    let a = if old.is_some() {
+        format!("a/{path}")
+    } else {
+        "/dev/null".into()
+    };
+    let b = if new.is_some() {
+        format!("b/{path}")
+    } else {
+        "/dev/null".into()
+    };
+    let _ = writeln!(out, "{meta}--- {a}{reset}");
+    let _ = writeln!(out, "{meta}+++ {b}{reset}");
+
+    let input = imara_diff::InternedInput::new(
+        imara_diff::sources::byte_lines(old_data),
+        imara_diff::sources::byte_lines(new_data),
+    );
+    let diff = imara_diff::Diff::compute(imara_diff::Algorithm::Histogram, &input);
+    let printer = LinePrinter {
+        interner: &input.interner,
+        before: &input.before,
+        palette,
+    };
+    let _ = write!(
+        out,
+        "{}",
+        diff.unified_diff(&printer, imara_diff::UnifiedDiffConfig::default(), &input)
+    );
+}
+
+/// Prints diff lines the way `git diff` does, optionally in color.
+struct LinePrinter<'a> {
+    interner: &'a imara_diff::Interner<&'a [u8]>,
+    /// The old file's lines, to find the function a hunk sits in.
+    before: &'a [imara_diff::Token],
+    palette: &'a Palette,
+}
+
+impl LinePrinter<'_> {
+    /// One diff line. `color` is the line's palette entry, empty for context. git colors an
+    /// added line's `+` separately from its text, and ends every colored line with a reset.
+    fn line(
+        &self,
+        f: &mut impl std::fmt::Write,
+        prefix: char,
+        color: &str,
+        token: imara_diff::Token,
+    ) -> std::fmt::Result {
+        let bytes = self.interner[token];
+        let (text, newline) = match bytes.strip_suffix(b"\n") {
+            Some(text) => (text, true),
+            None => (bytes, false),
+        };
+        let text = String::from_utf8_lossy(text);
+        let reset = self.palette.reset;
+        if prefix == '+' && !reset.is_empty() {
+            write!(f, "{color}+{reset}")?;
+            if !text.is_empty() {
+                write!(f, "{color}{text}{reset}")?;
+            }
+            writeln!(f)?;
+        } else {
+            writeln!(f, "{color}{prefix}{text}{reset}")?;
+        }
+        if !newline {
+            writeln!(f, "\\ No newline at end of file{reset}")?;
+        }
+        Ok(())
+    }
+}
+
+impl imara_diff::UnifiedDiffPrinter for LinePrinter<'_> {
+    fn display_header(
+        &self,
+        mut f: impl std::fmt::Write,
+        start_before: u32,
+        start_after: u32,
+        len_before: u32,
+        len_after: u32,
+    ) -> std::fmt::Result {
+        // `git` writes a length of one as just the start.
+        let span = |start: u32, len: u32| match len {
+            1 => format!("{}", start + 1),
+            0 => format!("{start},0"),
+            len => format!("{},{len}", start + 1),
+        };
+        // git's default hint: the closest earlier line that starts like a declaration.
+        let hint = self.before[..start_before as usize]
+            .iter()
+            .rev()
+            .map(|&token| self.interner[token])
+            .find(|line| {
+                line.first()
+                    .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'$' || b == b'_')
+            })
+            .map(|line| {
+                let text = String::from_utf8_lossy(line);
+                let text = text.trim_end();
+                let text = text.chars().take(80).collect::<String>();
+                format!(" {}{text}{}", self.palette.reset, self.palette.reset)
+            })
+            .unwrap_or_default();
+        let Palette { frag, reset, .. } = self.palette;
+        writeln!(
+            f,
+            "{frag}@@ -{} +{} @@{reset}{hint}",
+            span(start_before, len_before),
+            span(start_after, len_after)
+        )
+    }
+
+    fn display_context_token(
+        &self,
+        mut f: impl std::fmt::Write,
+        token: imara_diff::Token,
+    ) -> std::fmt::Result {
+        self.line(&mut f, ' ', "", token)
+    }
+
+    fn display_hunk(
+        &self,
+        mut f: impl std::fmt::Write,
+        before: &[imara_diff::Token],
+        after: &[imara_diff::Token],
+    ) -> std::fmt::Result {
+        for &token in before {
+            self.line(&mut f, '-', self.palette.old, token)?;
+        }
+        for &token in after {
+            self.line(&mut f, '+', self.palette.new, token)?;
+        }
+        Ok(())
+    }
+}
+
 /// One tracked file's content at HEAD and in the working tree; `None` when it does not exist there.
 struct FileChange {
     old: Option<Vec<u8>>,
@@ -219,8 +606,8 @@ fn count_lines(old: &[u8], new: &[u8]) -> (u32, u32) {
     if old.contains(&0) || new.contains(&0) {
         return (0, 0);
     }
-    let input = gix::diff::blob::InternedInput::new(old, new);
-    let diff = gix::diff::blob::Diff::compute(gix::diff::blob::Algorithm::Histogram, &input);
+    let input = imara_diff::InternedInput::new(old, new);
+    let diff = imara_diff::Diff::compute(imara_diff::Algorithm::Histogram, &input);
     (diff.count_additions(), diff.count_removals())
 }
 
@@ -245,7 +632,6 @@ mod tests {
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").expect("head");
         repo
     }
-
 
     /// Commit `files` on `main` and check them out into the index, without the `git` binary.
     fn commit_files(repo: &gix::Repository, files: &[(&str, &str)]) {
@@ -419,6 +805,58 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let dir = temp.path().canonicalize().expect("canonical");
         gix::init(&dir).expect("init");
-        assert_eq!(GitRepo::discover(&dir).expect("repo").diff_head_stats(), None);
+        assert_eq!(
+            GitRepo::discover(&dir).expect("repo").diff_head_stats(),
+            None
+        );
+    }
+
+    /// Our diff must be byte-for-byte what `git diff --color` prints, so the `git` binary is used
+    /// here only as the reference to compare against.
+    #[test]
+    fn the_colored_diff_matches_git_byte_for_byte() {
+        use std::process::Command;
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).expect("utf8")
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().canonicalize().expect("canonical");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "T"]);
+        let numbered: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.join("long.txt"), &numbered).expect("long");
+        std::fs::write(dir.join("code.rs"), "fn alpha() {\n    one();\n    two();\n}\n\nfn beta() {\n    three();\n    four();\n}\n").expect("code");
+        std::fs::write(dir.join("gone.txt"), "bye\n").expect("gone");
+        std::fs::write(dir.join("tail.txt"), "no newline at end").expect("tail");
+        std::fs::write(dir.join("bin.dat"), [0u8, 1, 2, 3]).expect("bin");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+
+        let edited: String = numbered
+            .replace("line 3\n", "line three\n")
+            .replace("line 30\n", "line thirty\nextra\n");
+        std::fs::write(dir.join("long.txt"), edited).expect("edit long");
+        std::fs::write(dir.join("code.rs"), "fn alpha() {\n    one();\n    two();\n}\n\nfn beta() {\n    three();\n    FOUR();\n}\n").expect("edit code");
+        std::fs::remove_file(dir.join("gone.txt")).expect("rm");
+        std::fs::write(dir.join("tail.txt"), "no newline at the end").expect("edit tail");
+        std::fs::write(dir.join("bin.dat"), [0u8, 9, 9, 9]).expect("edit bin");
+
+        let git_repo = GitRepo::discover(&dir).expect("repo");
+        let ours = git_repo.diff_text("HEAD", true).expect("diff");
+        let theirs = git(&dir, &["diff", "--color", "HEAD"]);
+        assert_eq!(ours, theirs);
     }
 }
