@@ -1,7 +1,6 @@
 use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -26,37 +25,12 @@ impl fmt::Display for WorktreeBlockedReason {
 ///
 /// Returns `Ok(())` if eligible, or `Err(reason)` if not.
 pub fn can_create_worktree(cwd: &Path) -> Result<(), WorktreeBlockedReason> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(cwd)
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true" => {}
-        _ => return Err(WorktreeBlockedReason::NotGitRepo),
+    let repo = nori_config::GitRepo::discover(cwd)
+        .filter(|repo| repo.work_dir().is_some())
+        .ok_or(WorktreeBlockedReason::NotGitRepo)?;
+    if repo.is_linked_worktree() {
+        return Err(WorktreeBlockedReason::AlreadyInWorktree);
     }
-
-    let git_dir = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
-        .current_dir(cwd)
-        .output();
-
-    let common_dir = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .current_dir(cwd)
-        .output();
-
-    match (git_dir, common_dir) {
-        (Ok(gd), Ok(cd)) if gd.status.success() && cd.status.success() => {
-            let gd_str = String::from_utf8_lossy(&gd.stdout).trim().to_string();
-            let cd_str = String::from_utf8_lossy(&cd.stdout).trim().to_string();
-            if gd_str != cd_str {
-                return Err(WorktreeBlockedReason::AlreadyInWorktree);
-            }
-        }
-        _ => return Err(WorktreeBlockedReason::NotGitRepo),
-    }
-
     Ok(())
 }
 
@@ -93,17 +67,9 @@ pub fn rename_auto_worktree_branch(
 /// Returns the path to the new worktree directory.
 pub fn setup_auto_worktree(cwd: &Path) -> Result<PathBuf> {
     // 1. Find the git repo root
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()
-        .context("Failed to run git rev-parse")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Not inside a git repository");
-    }
-
-    let repo_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let repo_root = nori_config::GitRepo::discover(cwd)
+        .and_then(|repo| repo.work_dir())
+        .context("Not inside a git repository")?;
 
     // 2. Ensure .worktrees/ is in .gitignore
     codex_git::ensure_gitignore_entry(&repo_root, ".worktrees/")

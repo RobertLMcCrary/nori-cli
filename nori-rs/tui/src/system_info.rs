@@ -55,7 +55,7 @@ impl SystemInfo {
     }
 
     /// The subset of system info worth blocking startup for: the git identity
-    /// of `dir`, which is three short `git` invocations.
+    /// of `dir`, read in-process.
     ///
     /// Everything else a full collection does is too slow to run before the
     /// first frame — the skillset version spawns Node, transcript discovery and
@@ -326,94 +326,16 @@ pub(crate) fn read_active_skillset(cwd: &std::path::Path) -> Option<String> {
 
 /// Detect untracked files (files not yet added to git and not ignored).
 fn has_untracked_files(dir: Option<&std::path::Path>) -> bool {
-    let mut cmd = Command::new("git");
-    cmd.args(["ls-files", "--others", "--exclude-standard"]);
-    if let Some(d) = dir {
-        cmd.current_dir(d);
-    }
-
-    let output = match cmd.output() {
-        Ok(output) if output.status.success() => output,
-        _ => return false,
-    };
-
-    output.stdout.iter().any(|&byte| byte != b'\n')
+    git_repo(dir).is_some_and(|repo| repo.has_untracked_files())
 }
 
+/// Lines added and removed since HEAD, as `(added, removed)`; `None` for a side with no change.
 fn get_git_stats(dir: Option<&std::path::Path>) -> (Option<i32>, Option<i32>) {
-    let mut cmd = Command::new("git");
-    cmd.args(["diff", "HEAD", "--shortstat"]);
-    if let Some(d) = dir {
-        cmd.current_dir(d);
-    }
-
-    let output = match cmd.output() {
-        Ok(output) => output,
-        Err(_) => return (None, None),
-    };
-
-    if !output.status.success() {
+    let Some((added, removed)) = git_repo(dir).and_then(|repo| repo.diff_head_stats()) else {
         return (None, None);
-    }
-
-    let stats = match String::from_utf8(output.stdout) {
-        Ok(s) => s,
-        Err(_) => return (None, None),
     };
-
-    parse_git_shortstat(&stats)
-}
-
-fn parse_git_shortstat(output: &str) -> (Option<i32>, Option<i32>) {
-    if output.trim().is_empty() {
-        return (None, None);
-    }
-
-    let mut added = None;
-    let mut removed = None;
-
-    // Parse insertions: "10 insertions(+)" or "10 insertion(+)"
-    if let Some(insertions_idx) = output.find("insertion") {
-        // Extract the substring before "insertion"
-        let before = &output[..insertions_idx];
-        // Split by commas and spaces to get individual tokens
-        let tokens: Vec<&str> = before
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|s| !s.is_empty())
-            .collect();
-        // The number should be the last token before "insertion"
-        if let Some(last_token) = tokens.last()
-            && let Ok(num) = last_token.parse::<i32>()
-        {
-            added = Some(num);
-        }
-    }
-
-    // Parse deletions: "3 deletions(-)" or "3 deletion(-)"
-    if let Some(deletions_idx) = output.find("deletion") {
-        let before = &output[..deletions_idx];
-        let tokens: Vec<&str> = before
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if let Some(last_token) = tokens.last()
-            && let Ok(num) = last_token.parse::<i32>()
-        {
-            removed = Some(num);
-        }
-    }
-
-    // If we found insertions but not deletions, deletions is 0
-    if added.is_some() && removed.is_none() {
-        removed = Some(0);
-    }
-
-    // If we found deletions but not insertions, insertions is 0
-    if removed.is_some() && added.is_none() {
-        added = Some(0);
-    }
-
-    (added, removed)
+    let count = |lines: u32| (lines > 0).then(|| i32::try_from(lines).unwrap_or(i32::MAX));
+    (count(added), count(removed))
 }
 
 /// The checked-out branch, as `git branch --show-current` reports it: `None` when HEAD is
@@ -514,19 +436,7 @@ fn evaluate_worktree_cleanup_warning(
 /// if worktrees are present and disk space is below the threshold.
 #[cfg(unix)]
 pub(crate) fn check_worktree_cleanup(cwd: &std::path::Path) -> Option<WorktreeCleanupWarning> {
-    // Check if we're in a git repo
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let repo_root =
-        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let repo_root = nori_config::GitRepo::discover(cwd)?.work_dir()?;
 
     // List worktrees (excluding main)
     let worktrees = codex_git::list_worktrees(&repo_root).ok()?;
@@ -555,6 +465,14 @@ pub(crate) fn extract_worktree_name(dir: &std::path::Path) -> Option<String> {
 /// Returns true if this is a linked worktree, false if it's the main repo or not a git repo.
 fn is_git_worktree(dir: Option<&std::path::Path>) -> bool {
     git_facts(dir).is_some_and(|facts| facts.is_linked_worktree())
+}
+
+/// The repository of `dir`, or of the current directory, opened in-process with `gix`.
+fn git_repo(dir: Option<&std::path::Path>) -> Option<nori_config::GitRepo> {
+    match dir {
+        Some(dir) => nori_config::GitRepo::discover(dir),
+        None => nori_config::GitRepo::discover(&env::current_dir().ok()?),
+    }
 }
 
 /// The repository of `dir`, or of the current directory, read in-process with `gix`.
@@ -754,38 +672,6 @@ mod tests {
             !is_git_worktree(Some(&temp_dir)),
             "Non-git dir should not be worktree"
         );
-    }
-
-    #[test]
-    fn test_parse_git_shortstat_with_changes() {
-        let output = " 2 files changed, 10 insertions(+), 3 deletions(-)";
-        let (added, removed) = parse_git_shortstat(output);
-        assert_eq!(added, Some(10));
-        assert_eq!(removed, Some(3));
-    }
-
-    #[test]
-    fn test_parse_git_shortstat_only_additions() {
-        let output = " 1 file changed, 5 insertions(+)";
-        let (added, removed) = parse_git_shortstat(output);
-        assert_eq!(added, Some(5));
-        assert_eq!(removed, Some(0));
-    }
-
-    #[test]
-    fn test_parse_git_shortstat_only_deletions() {
-        let output = " 1 file changed, 7 deletions(-)";
-        let (added, removed) = parse_git_shortstat(output);
-        assert_eq!(added, Some(0));
-        assert_eq!(removed, Some(7));
-    }
-
-    #[test]
-    fn test_parse_git_shortstat_empty() {
-        let output = "";
-        let (added, removed) = parse_git_shortstat(output);
-        assert_eq!(added, None);
-        assert_eq!(removed, None);
     }
 
     #[test]

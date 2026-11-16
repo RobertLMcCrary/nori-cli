@@ -397,65 +397,17 @@ async fn write_project_metadata(path: &Path, project_id: &ProjectId) -> io::Resu
 
 /// Collect git info for session metadata.
 async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
-    use tokio::process::Command;
-    use tokio::time::Duration;
-    use tokio::time::timeout;
-
-    const GIT_TIMEOUT: Duration = Duration::from_secs(5);
-
-    // Check if we're in a git repo
-    let is_git = timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
-            .args(["rev-parse", "--git-dir"])
-            .current_dir(cwd)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-
-    if !is_git.status.success() {
-        return None;
-    }
-
-    // Get branch and commit hash in parallel
-    let (branch_result, commit_result) = tokio::join!(
-        timeout(
-            GIT_TIMEOUT,
-            Command::new("git")
-                .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .current_dir(cwd)
-                .output()
-        ),
-        timeout(
-            GIT_TIMEOUT,
-            Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(cwd)
-                .output()
-        )
-    );
-
-    let branch = branch_result
-        .ok()
-        .and_then(std::result::Result::ok)
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| s != "HEAD");
-
-    let commit_hash = commit_result
-        .ok()
-        .and_then(std::result::Result::ok)
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
-
-    Some(GitInfo {
-        branch,
-        commit_hash,
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let repo = nori_config::GitRepo::discover(&cwd)?;
+        Some(GitInfo {
+            branch: repo.branch(),
+            commit_hash: repo.head_commit(),
+        })
     })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]

@@ -9,12 +9,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
-use tokio::process::Command;
-use tokio::time::Duration;
-use tokio::time::timeout;
-
-/// Timeout for git commands
-const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+use nori_config::GitRepo;
 
 /// Project identification result.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,40 +82,20 @@ pub async fn compute_project_id(cwd: &Path) -> io::Result<ProjectId> {
 
 /// Get the git repository root directory.
 async fn get_git_root(cwd: &Path) -> Option<PathBuf> {
-    let output = run_git_command(&["rev-parse", "--show-toplevel"], cwd).await?;
-
-    if output.status.success() {
-        let root = String::from_utf8(output.stdout).ok()?.trim().to_string();
-        Some(PathBuf::from(root))
-    } else {
-        None
-    }
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || GitRepo::discover(&cwd)?.work_dir())
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Get the git remote URL (origin preferred).
 async fn get_git_remote_url(cwd: &Path) -> Option<String> {
-    let output = run_git_command(&["remote", "get-url", "origin"], cwd).await?;
-
-    if output.status.success() {
-        let url = String::from_utf8(output.stdout).ok()?.trim().to_string();
-        if url.is_empty() { None } else { Some(url) }
-    } else {
-        None
-    }
-}
-
-/// Run a git command with timeout.
-async fn run_git_command(args: &[&str], cwd: &Path) -> Option<std::process::Output> {
-    let result = timeout(
-        GIT_COMMAND_TIMEOUT,
-        Command::new("git").args(args).current_dir(cwd).output(),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(output)) => Some(output),
-        _ => None,
-    }
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || GitRepo::discover(&cwd)?.remote_url("origin"))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Normalize a git URL for consistent hashing.
