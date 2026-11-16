@@ -253,6 +253,14 @@ impl ChatWidget {
                     "Successfully authenticated with OpenAI!\n\nYou can now use Nori.".to_string(),
                     None,
                 );
+                // The startup preparation ran before these credentials existed. Start a session
+                // now so the next command, `/model` included, has an agent to ask.
+                if !self.has_harness_session()
+                    && nori_harness::AgentKind::from_slug(&self.config.active_agent)
+                        == Some(nori_harness::AgentKind::Codex)
+                {
+                    self.app_event_tx.send(AppEvent::NewSession);
+                }
             } else {
                 handler.cancel();
                 self.add_info_message("Login cancelled or failed.".to_string(), None);

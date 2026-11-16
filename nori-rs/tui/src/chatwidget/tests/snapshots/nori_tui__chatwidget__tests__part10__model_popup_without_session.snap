@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests/part10.rs
+expression: "render_bottom_pane(&mut chat, 80)"
+---
+
+  Select model
+  Start a session to choose a model
+
+     No active session yet
+     Send a message, run /new, or /login first.
+
+  ↑↓/j/k move  enter select  esc close

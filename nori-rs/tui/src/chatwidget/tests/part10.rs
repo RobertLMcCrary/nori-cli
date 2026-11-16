@@ -44,6 +44,58 @@ fn candidate_login_target_survives_failure_and_clears_after_success() {
 }
 
 #[test]
+fn successful_login_starts_a_session_for_the_active_codex_agent() {
+    let (mut chat, mut rx, _unused_rx) = make_chatwidget_manual();
+    chat.config.active_agent = "codex".to_string();
+    chat.login_handler = Some(crate::login_handler::LoginHandler::new());
+
+    chat.handle_login_complete(true);
+
+    let mut started = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AppEvent::NewSession) {
+            started = true;
+        }
+    }
+    assert!(
+        started,
+        "login success should start the session the startup preparation could not"
+    );
+}
+
+#[test]
+fn successful_login_does_not_start_a_session_for_another_agent() {
+    let (mut chat, mut rx, _unused_rx) = make_chatwidget_manual();
+    chat.config.active_agent = "claude-code".to_string();
+    chat.login_handler = Some(crate::login_handler::LoginHandler::new());
+
+    chat.handle_login_complete(true);
+
+    let mut started = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AppEvent::NewSession) {
+            started = true;
+        }
+    }
+    assert!(
+        !started,
+        "a login for Codex must not replace an active session on another agent"
+    );
+}
+
+#[test]
+fn model_popup_without_a_session_asks_for_one() {
+    let (mut chat, _rx, _unused_rx) = make_chatwidget_manual();
+
+    chat.open_model_popup();
+
+    insta::assert_snapshot!(
+        "model_popup_without_session",
+        render_bottom_pane(&mut chat, 80)
+    );
+}
+
+#[test]
 fn deferred_startup_input_preserves_prompt_and_image_only_semantics_for_resume() {
     let (mut chat, _rx, _unused_rx) = make_cloud_chatwidget_manual();
     chat.first_prompt_text = Some("Continue onboarding".to_string());

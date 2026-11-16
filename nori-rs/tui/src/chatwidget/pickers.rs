@@ -702,7 +702,13 @@ impl ChatWidget {
             });
             return;
         }
-        self.open_model_unsupported_popup();
+        self.open_model_without_session_popup();
+    }
+
+    /// Show that choosing a model needs a session, with no agent to read options from yet.
+    pub(crate) fn open_model_without_session_popup(&mut self) {
+        let params = crate::nori::agent_picker::acp_model_picker_no_session_params();
+        self.bottom_pane.show_selection_view(params);
     }
 
     /// Show the static "model switching not supported" picker.

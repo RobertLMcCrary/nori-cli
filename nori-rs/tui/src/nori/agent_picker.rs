@@ -127,16 +127,12 @@ fn recording_footer_hint(enabled: bool) -> Line<'static> {
     ])
 }
 
-/// Create selection view parameters for the model picker in ACP mode.
-/// Shows models as disabled with a message to use /agent instead.
-///
-/// This is the fallback when model state is not available.
+/// Create selection view parameters for the model picker when the agent has not advertised a
+/// model setting.
 pub fn acp_model_picker_params() -> SelectionViewParams {
-    // In ACP mode, we show a message that models are not directly selectable
-    // and users should use /agent instead
     let items: Vec<SelectionItem> = vec![SelectionItem {
-        name: "Model switching disabled in ACP mode".to_string(),
-        description: Some("Use /agent to switch between ACP agents".to_string()),
+        name: "No model options".to_string(),
+        description: Some("The agent did not advertise a model setting.".to_string()),
         is_current: false,
         actions: vec![],
         dismiss_on_select: true,
@@ -145,10 +141,30 @@ pub fn acp_model_picker_params() -> SelectionViewParams {
 
     SelectionViewParams {
         title: Some("Select model".to_string()),
-        subtitle: Some("Not available in ACP mode - use /agent instead".to_string()),
-        footer_hint: Some(Line::from(
-            "Press esc to dismiss, or use /agent to switch agents.",
-        )),
+        subtitle: Some("This agent doesn't offer model switching".to_string()),
+        footer_hint: Some(Line::from("Press esc to dismiss.")),
+        items,
+        ..Default::default()
+    }
+    .picker()
+}
+
+/// Create selection view parameters for `/model` before a session exists, when there is no
+/// agent configuration to read yet.
+pub fn acp_model_picker_no_session_params() -> SelectionViewParams {
+    let items: Vec<SelectionItem> = vec![SelectionItem {
+        name: "No active session yet".to_string(),
+        description: Some("Send a message, run /new, or /login first.".to_string()),
+        is_current: false,
+        actions: vec![],
+        dismiss_on_select: true,
+        ..Default::default()
+    }];
+
+    SelectionViewParams {
+        title: Some("Select model".to_string()),
+        subtitle: Some("Start a session to choose a model".to_string()),
+        footer_hint: Some(Line::from("Press esc to dismiss.")),
         items,
         ..Default::default()
     }
@@ -238,12 +254,27 @@ mod tests {
     }
 
     #[test]
-    fn test_acp_model_picker_shows_disabled() {
+    fn test_acp_model_picker_explains_missing_model_option() {
         let params = acp_model_picker_params();
 
         assert!(params.title.is_some());
-        assert!(params.subtitle.is_some());
-        assert!(params.subtitle.unwrap().contains("Not available"));
+        assert_eq!(
+            params.subtitle.as_deref(),
+            Some("This agent doesn't offer model switching")
+        );
+        assert_eq!(params.items[0].name, "No model options");
+    }
+
+    #[test]
+    fn test_acp_model_picker_without_session_points_at_starting_one() {
+        let params = acp_model_picker_no_session_params();
+
+        assert_eq!(params.title.as_deref(), Some("Select model"));
+        assert_eq!(
+            params.subtitle.as_deref(),
+            Some("Start a session to choose a model")
+        );
+        assert_eq!(params.items[0].name, "No active session yet");
     }
 
     #[test]
