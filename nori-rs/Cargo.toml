@@ -5,6 +5,7 @@ members = [
     "apply-patch",
     "arg0",
     "cli",
+    "codex-acp",
     "common",
     "core",
     "execpolicy",
@@ -293,9 +294,18 @@ opt-level = 0
 incremental = false
 
 [patch.crates-io]
+# The tungstenite forks the upstream Codex crates (used by codex-acp) are built against.
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
 crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "45fecb9508105988f42fe6ff0441783ed3717f92" }
 
 # Uncomment to debug local changes.
 # rmcp = { path = "../../rust-sdk/crates/rmcp" }
+
+# The upstream Codex crates codex-acp links, with the pty crate it vendors a fix for.
+[patch."https://github.com/openai/codex"]
+codex-utils-pty = { path = "codex-acp/vendor/codex-utils-pty" }
+codex-apply-patch = { path = "codex-acp/vendor/codex-apply-patch" }
+codex-shell-command = { path = "codex-acp/vendor/codex-shell-command" }

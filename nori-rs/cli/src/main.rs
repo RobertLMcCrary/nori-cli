@@ -348,6 +348,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
     nori_tui::startup_trace::mark("cli_main");
+    nori_cli::native_agents::register();
     let MultitoolCli {
         config_overrides: root_config_overrides,
         print,

@@ -61,6 +61,7 @@ pub use types::HotkeyBinding;
 pub use types::HotkeyConfig;
 pub use types::HotkeyConfigToml;
 pub use types::LocalDistribution;
+pub use types::NativeDistribution;
 pub use types::ModelOverrideToml;
 pub use types::NoriConfig;
 pub use types::NoriConfigOverrides;

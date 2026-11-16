@@ -1,3 +1,4 @@
+pub mod native_agents;
 pub mod cloud;
 pub mod debug_sandbox;
 mod exit_status;

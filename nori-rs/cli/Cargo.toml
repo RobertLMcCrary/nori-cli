@@ -15,10 +15,17 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+default = ["native-codex"]
+# Run Codex inside Nori's own process instead of through an adapter. It links all of codex-core,
+# including V8, so a build without it is much smaller and faster to compile.
+native-codex = ["dep:codex-acp"]
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
+nori-acp-host = { workspace = true }
 nori-harness = { workspace = true }
 nori-installed = { workspace = true }
 nori-exec = { workspace = true }
@@ -31,6 +38,7 @@ codex-process-hardening = { workspace = true }
 codex-stdio-to-uds = { workspace = true }
 nori-tui = { workspace = true }
 ctor = { workspace = true }
+codex-acp = { path = "../codex-acp", optional = true }
 libc = { workspace = true }
 owo-colors = { workspace = true }
 regex-lite = { workspace = true}

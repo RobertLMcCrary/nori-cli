@@ -83,6 +83,9 @@ pub fn arg0_dispatch() -> Option<TempDir> {
 ///
 /// This function should be used to wrap any `main()` function in binary crates
 /// in this workspace that depends on these helper CLIs.
+/// Worker thread stack size: what upstream Codex uses for the same reason.
+const TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn arg0_dispatch_or_else<F, Fut>(main_fn: F) -> anyhow::Result<()>
 where
     F: FnOnce(Option<PathBuf>) -> Fut,
@@ -95,7 +98,12 @@ where
 
     // Regular invocation – create a Tokio runtime and execute the provided
     // async entry-point.
-    let runtime = tokio::runtime::Runtime::new()?;
+    // Codex runs inside this process, and its configuration and session futures are large enough
+    // to overflow the default 2 MiB worker stack, so workers get the stack Codex itself asks for.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(TOKIO_WORKER_STACK_SIZE_BYTES)
+        .build()?;
     runtime.block_on(async move {
         let codex_linux_sandbox_exe: Option<PathBuf> = if cfg!(target_os = "linux") {
             std::env::current_exe().ok()

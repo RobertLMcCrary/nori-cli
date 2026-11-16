@@ -66,15 +66,32 @@ let
     slug: agent:
     let
       package = adapterPackages.${slug} or null;
-      command = if agent.command != null then agent.command else lib.getExe package;
+      command =
+        if agent.command != null then
+          agent.command
+        else if package != null then
+          lib.getExe package
+        else
+          "";
     in
     {
       inherit (agent) name;
       inherit slug;
       transcript_base_dir = agent.transcriptBaseDir;
-      distribution.local = {
-        inherit command;
-      } // lib.optionalAttrs (agent.args != [ ]) { inherit (agent) args; };
+      distribution =
+        if agent.native != null then
+          {
+            native = {
+              inherit (agent.native) agent;
+              config = agent.native.config;
+            } // lib.optionalAttrs (agent.native.home != null) { inherit (agent.native) home; };
+          }
+        else
+          {
+            local = {
+              inherit command;
+            } // lib.optionalAttrs (agent.args != [ ]) { inherit (agent) args; };
+          };
     }
     // lib.optionalAttrs (agent.authHint != null) { auth_hint = agent.authHint; }
     // lib.optionalAttrs (agent.modelOverride != null) { model_override = agent.modelOverride; };
@@ -121,6 +138,33 @@ let
           type = types.listOf types.str;
           default = [ ];
           description = "Arguments for `command`.";
+        };
+        native = mkOption {
+          type = types.nullOr (
+            types.submodule {
+              options = {
+                agent = mkOption {
+                  type = types.enum [ "codex" ];
+                  description = "The agent built into Nori to run in its own process, with no adapter.";
+                };
+                home = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "Where this account's state and login live (Codex's CODEX_HOME).";
+                };
+                config = mkOption {
+                  type = types.listOf types.str;
+                  default = [ ];
+                  description = "key=value overrides, as `codex -c` takes them.";
+                };
+              };
+            }
+          );
+          default = null;
+          description = ''
+            Run an agent built into Nori inside its own process instead of through an adapter. Needs
+            a Nori built with native Codex (the default).
+          '';
         };
         adapter = {
           kind = mkOption {
@@ -219,8 +263,8 @@ in
 
   config = mkIf cfg.enable {
     assertions = lib.mapAttrsToList (slug: agent: {
-      assertion = agent.command != null || agent.adapter.kind != null;
-      message = "programs.nori.agents.${slug} needs a `command` or an `adapter.kind`.";
+      assertion = agent.command != null || agent.adapter.kind != null || agent.native != null;
+      message = "programs.nori.agents.${slug} needs a `command`, an `adapter.kind` or `native`.";
     }) cfg.agents
     ++ lib.mapAttrsToList (slug: agent: {
       assertion = agent.adapter.kind != "claude-native" || agent.adapter.package != null;

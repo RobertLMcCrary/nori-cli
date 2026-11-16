@@ -140,6 +140,8 @@ pub struct AgentDistributionToml {
     pub pipx: Option<PackageDistribution>,
     /// Python (uv): `uvx <package> [args...]`
     pub uvx: Option<PackageDistribution>,
+    /// An agent built into Nori and run inside its own process, with no subprocess at all.
+    pub native: Option<NativeDistribution>,
     // Future: cargo (cargo-binstall / cargo install)
     // Future: binary (platform-specific archive downloads)
 }
@@ -153,6 +155,7 @@ impl AgentDistributionToml {
             self.bunx.is_some(),
             self.pipx.is_some(),
             self.uvx.is_some(),
+            self.native.is_some(),
         ]
         .iter()
         .filter(|&&b| b)
@@ -160,13 +163,13 @@ impl AgentDistributionToml {
 
         if count == 0 {
             return Err(
-                "Agent distribution must specify exactly one of: local, npx, bunx, pipx, uvx"
+                "Agent distribution must specify exactly one of: local, npx, bunx, pipx, uvx, native"
                     .to_string(),
             );
         }
         if count > 1 {
             return Err(
-                "Agent distribution must specify exactly one of: local, npx, bunx, pipx, uvx (found multiple)"
+                "Agent distribution must specify exactly one of: local, npx, bunx, pipx, uvx, native (found multiple)"
                     .to_string(),
             );
         }
@@ -208,6 +211,13 @@ impl AgentDistributionToml {
                 args: uvx.args.clone(),
             });
         }
+        if let Some(native) = &self.native {
+            return Ok(ResolvedDistribution::Native {
+                agent: native.agent.clone(),
+                home: native.home.as_ref().map(std::path::PathBuf::from),
+                config: native.config.clone(),
+            });
+        }
         unreachable!("validate() ensures exactly one variant is set")
     }
 }
@@ -224,6 +234,21 @@ pub struct LocalDistribution {
     /// Environment variables to set
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// An agent compiled into Nori, served in-process over an in-memory pipe.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NativeDistribution {
+    /// Which built-in agent: `codex`.
+    pub agent: String,
+    /// Where this account's state and login live (Codex's `CODEX_HOME`). Set per agent, so two
+    /// accounts can run side by side in one process.
+    #[serde(default)]
+    pub home: Option<String>,
+    /// `key=value` overrides as `codex -c` takes them, e.g. `model="o3"`.
+    #[serde(default)]
+    pub config: Vec<String>,
 }
 
 /// Package manager distribution: `<manager> <package> [args...]`
@@ -254,6 +279,12 @@ pub enum ResolvedDistribution {
     Pipx { package: String, args: Vec<String> },
     /// Python (uv): `uvx <package> [args...]`
     Uvx { package: String, args: Vec<String> },
+    /// A built-in agent run inside Nori's own process.
+    Native {
+        agent: String,
+        home: Option<std::path::PathBuf>,
+        config: Vec<String>,
+    },
     // Future: Cargo { crate_name: String, version: Option<String>, binary: Option<String> }
     // Future: Binary { url: String, platforms: HashMap<String, BinaryPlatformConfig> }
 }

@@ -4,6 +4,7 @@
 //! This crate must stay independent of the session harness and any terminal UI.
 
 pub mod connection;
+pub mod in_process;
 mod error_category;
 pub mod patch;
 pub mod registry;

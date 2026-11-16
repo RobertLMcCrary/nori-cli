@@ -679,6 +679,8 @@ pub struct AcpAgentConfig {
     /// Advertise `clientCapabilities.subagents` in `initialize`, so adapters that implement the
     /// subagents proposal report their child sessions instead of flattening or hiding them.
     pub advertise_subagents: bool,
+    /// Run the agent inside Nori's own process instead of starting `command`.
+    pub in_process: Option<crate::in_process::InProcessSpec>,
 }
 
 impl AcpAgentConfig {
@@ -857,6 +859,8 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
                 full_args.extend(args.iter().cloned());
                 ("uvx".to_string(), full_args, HashMap::new())
             }
+            // Nothing is started: the agent runs in this process.
+            ResolvedDistribution::Native { .. } => (String::new(), Vec::new(), HashMap::new()),
         };
 
         let install_hint = match dist {
@@ -875,6 +879,21 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
             ResolvedDistribution::Uvx { package, .. } => {
                 format!("uv tool install {package}")
             }
+            ResolvedDistribution::Native { agent, .. } => {
+                format!("this build of Nori has no built-in {agent} agent; rebuild with it enabled")
+            }
+        };
+        let in_process = match dist {
+            ResolvedDistribution::Native {
+                agent,
+                home,
+                config,
+            } => Some(crate::in_process::InProcessSpec {
+                agent: agent.clone(),
+                home: home.clone(),
+                config: config.clone(),
+            }),
+            _ => None,
         };
 
         return Ok(AcpAgentConfig {
@@ -892,6 +911,7 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
             install_hint,
             model_injection: registered.model_injection.clone(),
             advertise_subagents: true,
+            in_process,
         });
     }
 
@@ -970,6 +990,13 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
             install_hint: format!("npm install -g {}", agent.npm_package()),
             model_injection: agent.model_injection(),
             advertise_subagents: true,
+            // Codex runs inside Nori when this build has it, so there is no adapter to start.
+            in_process: (agent == AgentKind::Codex && crate::in_process::in_process_available("codex"))
+                .then(|| crate::in_process::InProcessSpec {
+                    agent: "codex".to_string(),
+                    home: None,
+                    config: Vec::new(),
+                }),
         });
     }
 
@@ -1070,6 +1097,7 @@ fn get_mock_agent_config(normalized: &str) -> Option<AcpAgentConfig> {
                     var: "MOCK_AGENT_INJECTED_MODEL".to_string(),
                 },
                 advertise_subagents: true,
+                in_process: None,
             })
         }
         "mock-model-alt" => {
@@ -1122,6 +1150,7 @@ fn get_mock_agent_config(normalized: &str) -> Option<AcpAgentConfig> {
                     var: "MOCK_AGENT_INJECTED_MODEL".to_string(),
                 },
                 advertise_subagents: true,
+                in_process: None,
             })
         }
         _ => None,

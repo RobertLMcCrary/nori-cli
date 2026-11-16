@@ -840,6 +840,7 @@ fn script_agent_config(dir: &std::path::Path, body: &str) -> crate::registry::Ac
         install_hint: "none".to_string(),
         model_injection: crate::registry::ModelInjection::None,
         advertise_subagents: true,
+        in_process: None,
     }
 }
 

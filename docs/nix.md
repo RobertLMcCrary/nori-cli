@@ -51,6 +51,12 @@ writes `config.toml` from a Home Manager module. Nothing is fetched at run time.
 - `adapter.kind = "opencode"` runs `opencode acp`. `adapter.kind = "claude-native"` runs the Rust
   Claude adapter (`claude-code-acp-rs`, no Node, `initialize` in about 20 ms); it needs
   `adapter.package` to be a package providing `bin/claude-code-acp-rs`.
+- `native = { agent = "codex"; home = "..."; }` runs Codex inside Nori's own process: no adapter,
+  no subprocess, no Node. `home` is that account's `CODEX_HOME`, set per agent so several accounts
+  can run in one process. It needs a Nori built with native Codex, which is the default
+  (`nori.override { nativeCodex = false; }` builds without it; that build links no V8 and is much
+  smaller, but then needs a Codex adapter). The package fetches the prebuilt V8 the Codex crates
+  need (`nix/v8.nix`), because a Nix build has no network.
 - An agent can use its own `command` instead of an adapter.
 - `configMethod = "copy"` (the default) writes `config.toml` as a plain file on each activation so
   Nori can still save settings between them; `"symlink"` makes it read-only.

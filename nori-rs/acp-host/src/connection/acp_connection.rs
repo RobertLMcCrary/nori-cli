@@ -242,6 +242,9 @@ fn write_text_file(cwd: &Path, requested: &Path, content: &str) -> Result<(), ac
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }
 
+/// Size of the in-memory pipe between Nori and a built-in agent. Writes wait when it is full.
+const IN_PROCESS_PIPE_BYTES: usize = 1 << 20;
+
 /// Shared ACP connection setup: registers notification/request handlers,
 /// performs the initialization handshake, and returns a `AcpConnection` with
 /// no process handles (`child`/`stderr_task` are `None`). `spawn()` fills in the
@@ -571,6 +574,9 @@ impl AcpConnection {
         proxy_config: AcpProxyConfig,
         initialize_event_tx: Option<mpsc::Sender<AcpEvent>>,
     ) -> Result<Self> {
+        if let Some(spec) = &config.in_process {
+            return Self::spawn_in_process(config, spec, cwd, initialize_event_tx).await;
+        }
         debug!(
             "Spawning ACP agent: {} {:?} in {}",
             config.command,
@@ -788,6 +794,82 @@ impl AcpConnection {
         connection.child = Some(child_handle);
         connection.stderr_task = Some(stderr_task);
         Ok(connection)
+    }
+
+    /// Run a built-in agent inside this process, with its ACP client on the other end of an
+    /// in-memory pipe. No process is started, so there is nothing to spawn, wait for, or reap:
+    /// the handshake is the only start-up cost.
+    async fn spawn_in_process(
+        config: &AcpAgentConfig,
+        spec: &crate::in_process::InProcessSpec,
+        cwd: &Path,
+        initialize_event_tx: Option<mpsc::Sender<AcpEvent>>,
+    ) -> Result<Self> {
+        let launcher = crate::in_process::in_process_launcher(&spec.agent).with_context(|| {
+            format!(
+                "this build of Nori has no built-in {} agent; rebuild with it enabled",
+                spec.agent
+            )
+        })?;
+        let mut spec = spec.clone();
+        spec.config
+            .extend(crate::in_process::codex_overrides_from_env(&config.env));
+        debug!("Starting built-in agent {} in {}", spec.agent, cwd.display());
+
+        let (client_end, agent_end) = tokio::io::duplex(IN_PROCESS_PIPE_BYTES);
+        // The agent says why it stopped, whether it failed or just ended: a closed pipe is a
+        // silent EOF to the protocol layer, which would leave the handshake waiting forever.
+        let (stopped_tx, mut stopped_rx) = oneshot::channel::<String>();
+        let agent_name = spec.agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let reason = match launcher(spec, agent_end).await {
+                Ok(()) => format!("built-in agent {agent_name} ended before it answered"),
+                Err(error) => {
+                    warn!("built-in agent {agent_name} stopped: {error}");
+                    error.to_string()
+                }
+            };
+            let _ = stopped_tx.send(reason);
+        });
+
+        let (read, write) = tokio::io::split(client_end);
+        let outgoing_sink = futures::sink::unfold(
+            Box::pin(write.compat_write()),
+            move |mut writer, line: String| async move {
+                let mut bytes = line.into_bytes();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await?;
+                Ok::<_, std::io::Error>(writer)
+            },
+        );
+        let incoming_lines = Box::pin(BufReader::new(read.compat()).lines());
+        let transport = Lines::new(outgoing_sink, incoming_lines);
+
+        let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(1024);
+        let init = tokio::select! {
+            result = establish_connection(
+                transport,
+                cwd,
+                event_tx,
+                event_rx,
+                initialize_event_tx,
+                config.advertise_subagents,
+                SharedChildren::default(),
+            ) => result,
+            Ok(reason) = &mut stopped_rx => Err(anyhow::anyhow!(reason)),
+        };
+        match init {
+            Ok(mut connection) => {
+                // The agent task takes the place of the subprocess handles: it is stopped when
+                // the connection is.
+                connection.stderr_task = Some(agent_task);
+                Ok(connection)
+            }
+            Err(error) => {
+                agent_task.abort();
+                Err(error)
+            }
+        }
     }
 
     fn set_root_session(&self, session_id: acp::SessionId) {
