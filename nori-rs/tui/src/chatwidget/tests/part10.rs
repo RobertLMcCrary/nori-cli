@@ -2101,3 +2101,60 @@ fn a_held_back_keystroke_is_drawn_in_the_frame_that_releases_it() {
     assert!(!skip_frame, "the frame that releases the key must draw it");
     assert_eq!(chat.composer_text(), "h");
 }
+
+#[test]
+fn a_live_session_title_becomes_a_toast_and_replays_stay_quiet() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    chat.handle_session_event(
+        generation,
+        initialize_agent_event("claude-agent-acp", "Claude Agent ACP", "0.93.0"),
+    );
+    chat.handle_session_event(
+        generation,
+        session_info_update(nori_protocol::acp::v1::SessionInfoUpdate::new().title("Greeting")),
+    );
+
+    let toasts = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>| {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ShowToast(text) = event {
+                out.push(text);
+            }
+        }
+        out
+    };
+    assert_eq!(toasts(&mut rx), vec!["Greeting".to_string()]);
+
+    chat.handle_session_event(
+        generation,
+        nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::ReplayStarted(
+            nori_protocol::ReplayStarted {
+                source: nori_protocol::ReplaySource::Agent,
+            },
+        )),
+    );
+    chat.handle_session_event(
+        generation,
+        session_info_update(nori_protocol::acp::v1::SessionInfoUpdate::new().title("Older")),
+    );
+    assert!(toasts(&mut rx).is_empty(), "a replayed title is not news");
+}
+
+#[test]
+fn toasts_can_be_turned_off() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.config.toasts = false;
+    let generation = chat.session_generation;
+    chat.handle_session_event(
+        generation,
+        initialize_agent_event("claude-agent-acp", "Claude Agent ACP", "0.93.0"),
+    );
+    chat.handle_session_event(
+        generation,
+        session_info_update(nori_protocol::acp::v1::SessionInfoUpdate::new().title("Greeting")),
+    );
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(event, AppEvent::ShowToast(_)), "toasts are off");
+    }
+}

@@ -109,6 +109,24 @@ impl SessionInfoDisplay {
         )
     }
 
+    /// Whether this reports a failure. Those stay in the history: a toast is gone in seconds, and
+    /// an agent-side error must not be missed.
+    pub(crate) fn reports_error(&self) -> bool {
+        self.assignments
+            .iter()
+            .any(|assignment| assignment.name.starts_with(ERROR_FIELD_PREFIX))
+    }
+
+    /// The one thing worth a toast: the session's title, when this update set it. Timestamps and
+    /// other metadata are not news.
+    pub(crate) fn toast_text(&self) -> Option<String> {
+        self.assignments
+            .iter()
+            .find(|assignment| assignment.name == "title")
+            .map(|assignment| assignment.value.clone())
+            .filter(|title| !title.is_empty() && title != "<null>")
+    }
+
     pub(crate) fn history_cell(&self) -> PlainHistoryCell {
         let mut lines = vec![Line::from(vec!["• ".dim(), self.header.clone().into()])];
         if !self.assignments.is_empty() {

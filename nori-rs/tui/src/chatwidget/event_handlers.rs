@@ -894,7 +894,24 @@ impl ChatWidget {
                         origin,
                         self.session_info_detail,
                     ) {
-                        self.add_to_history(display.history_cell());
+                        // Errors, and the development-build metadata dump, stay in the history.
+                        if display.reports_error()
+                            || matches!(
+                                self.session_info_detail,
+                                crate::nori::session_info::SessionInfoDetail::Metadata
+                            )
+                        {
+                            self.add_to_history(display.history_cell());
+                        }
+                        // An ordinary update is a toast in the top right, or nothing when
+                        // toasts are off.
+                        if !display.reports_error()
+                            && self.config.toasts
+                            && origin == crate::nori::session_info::SessionInfoOrigin::Live
+                            && let Some(text) = display.toast_text()
+                        {
+                            self.app_event_tx.send(AppEvent::ShowToast(text));
+                        }
                     }
                 } else if update.kind == crate::presentation::SessionUpdateKind::Usage
                     && let Some(usage) = update.usage

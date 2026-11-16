@@ -79,6 +79,9 @@ pub(crate) enum AppEvent {
     /// session picker instead of auto-claiming a fresh session.
     SessionClosed,
 
+    /// Show a brief message in the top right of the screen.
+    ShowToast(String),
+
     /// Have an agent commit the working tree's changes. `automatic` is a turn that just ended
     /// with `[git] auto_commit` on, as opposed to the hotkey.
     CommitChanges {

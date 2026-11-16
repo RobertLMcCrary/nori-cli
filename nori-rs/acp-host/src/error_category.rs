@@ -76,10 +76,14 @@ pub fn categorize_acp_error_chain(error: &anyhow::Error) -> AcpErrorDetails {
         let Some(acp_error) = cause.downcast_ref::<acp::Error>() else {
             continue;
         };
+        // Agents say why in `data.detail`; Codex's in-process agent puts it in `data.message`
+        // under a generic "Internal error", which is where the usage-limit reset date lives.
         let detail = acp_error.data.as_ref().and_then(|data| {
-            data.get("detail")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
+            ["detail", "message"].into_iter().find_map(|key| {
+                data.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
         });
         let message = Some(acp_error.message.clone());
         let category = match i32::from(acp_error.code) {

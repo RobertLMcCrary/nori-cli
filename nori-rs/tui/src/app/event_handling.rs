@@ -349,6 +349,9 @@ impl App {
                 });
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::ShowToast(text) => {
+                tui.show_toast(text);
+            }
             AppEvent::CommitChanges { automatic } => {
                 self.request_commit(automatic);
             }

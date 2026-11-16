@@ -48,6 +48,7 @@ mod history_queue;
 #[cfg(unix)]
 mod job_control;
 mod repaint;
+mod toast;
 
 /// A type alias for the terminal type used in this application
 pub type Terminal = CustomTerminal<CrosstermBackend<FrameWriter>>;
@@ -198,6 +199,9 @@ pub struct Tui {
     draw_tx: tokio::sync::broadcast::Sender<()>,
     pub(crate) terminal: Terminal,
     history: history_queue::HistoryQueue,
+    /// Toasts on screen, and whether the last frame drew them (so the next must erase them).
+    toasts: toast::Toasts,
+    toasts_drawn: bool,
     /// The next draw repaints the whole (alternate) screen.
     full_repaint: bool,
     /// Whether a frame was drawn yet, for the startup trace.
@@ -263,6 +267,8 @@ impl Tui {
             draw_tx,
             terminal,
             history: history_queue::HistoryQueue::default(),
+            toasts: toast::Toasts::default(),
+            toasts_drawn: false,
             full_repaint: false,
             first_frame_drawn: false,
             alt_saved_viewport: None,
@@ -440,6 +446,15 @@ impl Tui {
         self.alt_screen_active.load(Ordering::Relaxed)
     }
 
+    /// Show `text` as a toast in the top right for a few seconds.
+    pub(crate) fn show_toast(&mut self, text: String) {
+        self.toasts.push(text, Instant::now());
+        let frames = self.frame_requester();
+        frames.schedule_frame();
+        // One more frame when it is time for it to go, to erase it.
+        frames.schedule_frame_in(toast::TOAST_LIFETIME + Duration::from_millis(50));
+    }
+
     pub fn draw(
         &mut self,
         height: u16,
@@ -521,7 +536,17 @@ impl Tui {
             terminal.clear()?;
         }
 
-        if self.history.write_frame_with_popup(terminal, height, popup_rows)? {
+        // Toasts are drawn over rows Nori wrote, so whatever frame comes next first writes those
+        // rows back: it erases the toasts, and keeps new history from scrolling their marks up.
+        let toasts_expired = self.toasts.expire(Instant::now());
+        if self.toasts_drawn || toasts_expired {
+            self.history.request_repaint();
+        }
+        let terminal = &mut self.terminal;
+        if self
+            .history
+            .write_frame_with_popup(terminal, height, popup_rows)?
+        {
             self.frame_requester().schedule_frame();
         }
         let terminal = &mut self.terminal;
@@ -542,7 +567,22 @@ impl Tui {
 
         terminal.draw(|frame| {
             draw_fn(frame);
-        })
+        })?;
+
+        let rows = u16::try_from(terminal.owned_history_rows()).unwrap_or(u16::MAX);
+        let first_row = terminal.viewport_area.top().saturating_sub(rows);
+        let width = terminal.viewport_area.width;
+        self.toasts_drawn = !self.toasts.is_empty() && rows > 0;
+        if self.toasts_drawn {
+            toast::draw(
+                self.terminal.backend_mut(),
+                &self.toasts,
+                first_row,
+                rows,
+                width,
+            )?;
+        }
+        Ok(())
     }
 }
 

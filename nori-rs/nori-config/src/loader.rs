@@ -217,6 +217,7 @@ impl NoriConfig {
                 .os_notifications
                 .unwrap_or(super::types::OsNotifications::Enabled),
             vertical_footer: toml.tui.vertical_footer.unwrap_or(false),
+            toasts: toml.tui.toasts.unwrap_or(true),
             notify_after_idle: toml
                 .tui
                 .notify_after_idle

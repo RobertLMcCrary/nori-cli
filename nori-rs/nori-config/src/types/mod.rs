@@ -240,7 +240,7 @@ pub struct LocalDistribution {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct NativeDistribution {
-    /// Which built-in agent: `codex`.
+    /// Which built-in agent: `claude` or `codex`.
     pub agent: String,
     /// Where this account's state and login live (Codex's `CODEX_HOME`). Set per agent, so two
     /// accounts can run side by side in one process.
@@ -2045,6 +2045,10 @@ pub struct TuiConfigToml {
     /// Stack footer segments vertically in the status footer.
     pub vertical_footer: Option<bool>,
 
+    /// Show agent session updates as brief toasts in the top right instead of in the history.
+    /// On by default; set to false to show nothing at all.
+    pub toasts: Option<bool>,
+
     /// How long after idle before sending a notification.
     pub notify_after_idle: Option<NotifyAfterIdle>,
 
@@ -2109,6 +2113,9 @@ pub struct TuiConfig {
 
     /// Stack footer segments vertically in the status footer.
     pub vertical_footer: bool,
+
+    /// Show agent session updates as brief toasts in the top right.
+    pub toasts: bool,
 }
 
 impl Default for TuiConfig {
@@ -2119,6 +2126,7 @@ impl Default for TuiConfig {
             terminal_notifications: TerminalNotifications::Enabled,
             os_notifications: OsNotifications::Enabled,
             vertical_footer: false,
+            toasts: true,
         }
     }
 }
@@ -2278,6 +2286,9 @@ pub struct NoriConfig {
     /// Stack footer segments vertically in the status footer.
     pub vertical_footer: bool,
 
+    /// Show agent session updates as brief toasts in the top right.
+    pub toasts: bool,
+
     /// How long after idle before sending a notification.
     pub notify_after_idle: NotifyAfterIdle,
 
@@ -2420,6 +2431,7 @@ impl Default for NoriConfig {
             terminal_notifications: TerminalNotifications::Enabled,
             os_notifications: OsNotifications::Enabled,
             vertical_footer: false,
+            toasts: true,
             notify_after_idle: NotifyAfterIdle::default(),
             vim_mode: VimEnterBehavior::Off,
             hotkeys: HotkeyConfig::default(),

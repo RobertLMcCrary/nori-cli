@@ -22,6 +22,12 @@ pub(crate) struct HistoryQueue {
     repaint: bool,
     /// The next frame scrolls everything above the prompt into the scrollback.
     clear_above: bool,
+    /// Whether anything is above the prompt for a clear to hide: what the shell left when Nori
+    /// started, then whatever Nori has written. Clearing nothing would only push blank rows into
+    /// the scrollback.
+    content_above: bool,
+    /// The first frame has been placed, and `content_above` set from where the prompt began.
+    started: bool,
     /// The prompt has been placed at the bottom of the screen. Only the first frame and a clear
     /// do it: moving the screen down later would put blank rows into the middle of the
     /// scrollback each time the prompt shrinks.
@@ -41,6 +47,9 @@ struct Stretch {
 
 impl HistoryQueue {
     pub(crate) fn push(&mut self, lines: Vec<Line<'static>>) {
+        if !lines.is_empty() {
+            self.content_above = true;
+        }
         self.lines.extend(lines);
     }
 
@@ -48,13 +57,6 @@ impl HistoryQueue {
         self.lines.clear();
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Ctrl+L clears the screen above the prompt instead"
-        )
-    )]
     pub(crate) fn request_repaint(&mut self) {
         self.repaint = true;
     }
@@ -95,6 +97,10 @@ impl HistoryQueue {
     {
         // Place the prompt on its own, as if no popup had ever been open.
         let stretched = terminal.viewport_area;
+        if !std::mem::replace(&mut self.started, true) {
+            // A prompt that begins on the first row means a terminal with nothing on it.
+            self.content_above |= stretched.y > 0;
+        }
         let before = std::mem::take(&mut self.stretch);
         if before != Stretch::default() {
             let mut base = stretched;
@@ -115,7 +121,10 @@ impl HistoryQueue {
             terminal.clear()?;
         }
 
-        if std::mem::take(&mut self.clear_above) {
+        if std::mem::take(&mut self.clear_above)
+            && (self.content_above || terminal.owned_history_rows() > 0)
+        {
+            self.content_above = false;
             let top = terminal.viewport_area.top();
             if top > 0 {
                 terminal.backend_mut().scroll_region_up(0..top, top)?;
@@ -521,5 +530,30 @@ mod tests {
             .map(|index| format!("{index:05} let value = compute(x, y); // comment"))
             .collect();
         assert_eq!(written, expected);
+    }
+
+    #[test]
+    fn clearing_an_empty_screen_does_nothing() {
+        let mut terminal =
+            Terminal::with_options(VT100Backend::with_scrollback(WIDTH, HEIGHT)).expect("terminal");
+        // A fresh terminal: the prompt begins on the first row and nothing is above it.
+        terminal.set_viewport_area(Rect::new(0, 0, WIDTH, 2));
+        let mut queue = HistoryQueue::default();
+        queue.write_frame(&mut terminal, 2).expect("first frame");
+        draw_prompt(&mut terminal);
+
+        terminal.backend_mut().start_recording();
+        queue.request_clear_above();
+        queue.write_frame(&mut terminal, 2).expect("clear frame");
+        draw_prompt(&mut terminal);
+        let written = terminal.backend_mut().take_recording();
+
+        let text = String::from_utf8_lossy(&written);
+        assert!(
+            !text.contains('r') || !text.contains(';'),
+            "a clear with nothing above must not scroll anything: {text:?}"
+        );
+        let rows = screen(&terminal);
+        assert_eq!(rows[HEIGHT as usize - 2], "> prompt");
     }
 }
