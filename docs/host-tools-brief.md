@@ -53,8 +53,8 @@ built; how it works now lives in the docs below. What follows is only what a nex
   - No Codex turn has been seen: the machine has no Codex login.
   - Toasts have never been seen on screen.
   - The user's Ctrl+Shift and "doesn't render to the bottom" reports were never reproduced.
-  - `nix build .#nori` was still building at the last check. New crates must be tracked by
-    git for the flake to see them.
+  - `nix build .#nori` builds on aarch64-darwin (about 53 min with `--max-jobs 1 --cores 4`).
+    Linux builds are not tried. New crates must be tracked by git for the flake to see them.
 - **Claude**
   - The CLI re-initializes MCP about 0.85 s after the first query, and the user's
     SessionStart hooks run on every spawn. Both sit before the first token, even on a warm
