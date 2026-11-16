@@ -565,7 +565,7 @@ fn test_editing_hotkey_action_default_bindings() {
     assert_eq!(HotkeyAction::DeleteBackwardChar.default_binding(), "ctrl+h");
     assert_eq!(HotkeyAction::DeleteForwardChar.default_binding(), "ctrl+d");
     assert_eq!(HotkeyAction::DeleteBackwardWord.default_binding(), "ctrl+w");
-    assert_eq!(HotkeyAction::KillToEndOfLine.default_binding(), "ctrl+k");
+    assert_eq!(HotkeyAction::KillToEndOfLine.default_binding(), "alt+k");
     assert_eq!(
         HotkeyAction::KillToBeginningOfLine.default_binding(),
         "ctrl+u"
@@ -598,10 +598,7 @@ fn test_hotkey_config_default_includes_editing_bindings() {
         config.delete_backward_word,
         HotkeyBinding::from_str("ctrl+w")
     );
-    assert_eq!(
-        config.kill_to_end_of_line,
-        HotkeyBinding::from_str("ctrl+k")
-    );
+    assert_eq!(config.kill_to_end_of_line, HotkeyBinding::from_str("alt+k"));
     assert_eq!(
         config.kill_to_beginning_of_line,
         HotkeyBinding::from_str("ctrl+u")
@@ -651,10 +648,7 @@ fn test_hotkey_config_from_toml_editing_overrides() {
         config.move_beginning_of_line,
         HotkeyBinding::from_str("ctrl+a")
     );
-    assert_eq!(
-        config.kill_to_end_of_line,
-        HotkeyBinding::from_str("ctrl+k")
-    );
+    assert_eq!(config.kill_to_end_of_line, HotkeyBinding::from_str("alt+k"));
 }
 
 #[test]
@@ -736,7 +730,7 @@ fn test_hotkey_config_binding_for_editing_action() {
     );
     assert_eq!(
         config.binding_for(HotkeyAction::KillToEndOfLine),
-        &HotkeyBinding::from_str("ctrl+k")
+        &HotkeyBinding::from_str("alt+k")
     );
     assert_eq!(
         config.binding_for(HotkeyAction::Yank),

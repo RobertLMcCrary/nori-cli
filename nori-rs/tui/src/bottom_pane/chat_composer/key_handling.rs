@@ -1,6 +1,15 @@
+use std::sync::LazyLock;
+
 use super::*;
 use crate::bottom_pane::textarea::VimModeState;
+use nori_config::HotkeyBinding;
 use nori_config::VimEnterBehavior;
+
+/// Older effort bindings, kept working where a terminal reports Shift on a letter.
+static NEXT_EFFORT_ALIAS: LazyLock<HotkeyBinding> =
+    LazyLock::new(|| HotkeyBinding::from_str("ctrl+shift+n"));
+static PREVIOUS_EFFORT_ALIAS: LazyLock<HotkeyBinding> =
+    LazyLock::new(|| HotkeyBinding::from_str("ctrl+shift+p"));
 
 impl ChatComposer {
     /// Handle a key event coming from the main UI.
@@ -14,10 +23,6 @@ impl ChatComposer {
                 KeyEvent {
                     code: KeyCode::Enter,
                     modifiers: KeyModifiers::SHIFT | KeyModifiers::ALT,
-                    ..
-                } | KeyEvent {
-                    code: KeyCode::Char('j'),
-                    modifiers: KeyModifiers::CONTROL,
                     ..
                 }
             );
@@ -783,6 +788,24 @@ impl ChatComposer {
                             .binding_for(nori_config::HotkeyAction::PreviousEffort),
                         &key_event,
                     ) =>
+            {
+                self.app_event_tx.send(AppEvent::CycleEffort(
+                    crate::chatwidget::ModelStep::Previous,
+                ));
+                (InputResult::None, true)
+            }
+            // Older effort bindings, kept for terminals and habits that still send Shift.
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && matches_binding(&NEXT_EFFORT_ALIAS, &key_event) =>
+            {
+                self.app_event_tx
+                    .send(AppEvent::CycleEffort(crate::chatwidget::ModelStep::Next));
+                (InputResult::None, true)
+            }
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && matches_binding(&PREVIOUS_EFFORT_ALIAS, &key_event) =>
             {
                 self.app_event_tx.send(AppEvent::CycleEffort(
                     crate::chatwidget::ModelStep::Previous,

@@ -231,6 +231,20 @@ fn ctrl_shift_n_and_p_step_the_effort_and_leave_the_model_keys_alone() {
 }
 
 #[test]
+fn ctrl_j_and_k_step_the_effort() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+
+    for code in [KeyCode::Char('j'), KeyCode::Char('k')] {
+        chat.handle_key_event(KeyEvent::new(code, KeyModifiers::CONTROL));
+    }
+
+    assert_eq!(
+        effort_steps(&mut rx),
+        vec![ModelStep::Next, ModelStep::Previous]
+    );
+}
+
+#[test]
 fn the_models_step_with_fable_last() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
     chat.sync_acp_session_config_snapshot(&[acp::SessionConfigOption::select(

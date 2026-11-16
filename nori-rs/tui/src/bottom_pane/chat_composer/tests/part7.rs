@@ -109,7 +109,6 @@ fn vim_newline_shortcuts_insert_in_both_modes_and_preserve_mode() {
     let shortcuts = [
         (KeyCode::Enter, KeyModifiers::SHIFT),
         (KeyCode::Enter, KeyModifiers::ALT),
-        (KeyCode::Char('j'), KeyModifiers::CONTROL),
     ];
 
     for start_normal in [false, true] {

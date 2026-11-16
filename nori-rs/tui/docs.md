@@ -426,11 +426,12 @@ opened through the custom-model input to the set request, and only `Panel`
 reopens `/config`. Switching agents with `/agent` skips the resume picker when
 the new agent lists no sessions and starts a session at once.
 
-The Next and Previous Effort Level hotkeys (default `ctrl+shift+n` and `ctrl+shift+p`) step
-the agent's effort option (the one it declares as its thought level, or named for effort or
-reasoning) through the same path, and the footer's model segment shows both (`Sonnet 5.5 ·
-High`). A letter binding matches the shifted key too, since a terminal may report `N` for
-ctrl+shift+n. Models are stepped through, and listed by `/model`, in the agent's order except
+The Next and Previous Effort Level hotkeys (default `ctrl+j` and `ctrl+k`) step the agent's
+effort option (the one it declares as its thought level, or named for effort or reasoning)
+through the same path, and the footer's model segment shows both (`Sonnet 5.5 · High`).
+`ctrl+shift+n` and `ctrl+shift+p` remain aliases where the terminal reports Shift; some
+terminals fold it into the letter and report plain ctrl+n, which is indistinguishable from
+Next Model. Models are stepped through, and listed by `/model`, in the agent's order except
 that the Fable family comes last (`agent_config_state::sort_models`).
 
 The Next Model and Previous Model hotkeys (default `ctrl+n` and `ctrl+p`) step
