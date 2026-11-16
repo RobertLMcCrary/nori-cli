@@ -388,6 +388,7 @@ fn session_context_for_connection(
 pub mod browser_profile;
 #[cfg(unix)]
 pub mod browser_session;
+mod git_tools;
 mod goal_ext;
 mod nori_client_context;
 mod nori_client_mcp;

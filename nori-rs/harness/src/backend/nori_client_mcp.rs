@@ -119,6 +119,8 @@ pub(crate) struct NoriClientShared {
     nori_client_advertised: bool,
     goal_ext_advertised: bool,
     orchestrator: super::orchestrator::Orchestrator,
+    /// The session's working directory, which the git tools operate in.
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl NoriClientShared {
@@ -139,7 +141,14 @@ impl NoriClientShared {
             nori_client_advertised,
             goal_ext_advertised,
             orchestrator,
+            cwd: None,
         }
+    }
+
+    /// Serve the git tools for `cwd`.
+    pub(crate) fn with_cwd(mut self, cwd: std::path::PathBuf) -> Self {
+        self.cwd = Some(cwd);
+        self
     }
 }
 
@@ -154,10 +163,15 @@ pub(crate) struct NoriClientService {
 
 #[tool_router]
 impl NoriClientService {
+    /// The working directory the git tools run in.
+    pub(super) fn shared_cwd(&self) -> Option<std::path::PathBuf> {
+        self.shared.cwd.clone()
+    }
+
     fn new(shared: NoriClientShared) -> Self {
         Self {
             shared,
-            tool_router: Self::tool_router() + Self::task_tool_router(),
+            tool_router: Self::tool_router() + Self::task_tool_router() + Self::git_tool_router(),
         }
     }
 
@@ -251,9 +265,10 @@ impl ServerHandler for NoriClientService {
                 ..Default::default()
             },
             instructions: Some(format!(
-                "Use nori-client resources and prompts for Nori CLI harness context; use tools only for Nori-owned live state.\n\n{}\n\n{}",
+                "Use nori-client resources and prompts for Nori CLI harness context; use tools only for Nori-owned live state.\n\n{}\n\n{}\n\n{}",
                 thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS,
                 super::orchestrator::TASK_INSTRUCTIONS,
+                super::git_tools::INSTRUCTIONS,
             )),
         }
     }
@@ -322,11 +337,11 @@ impl ServerHandler for NoriClientService {
     }
 }
 
-fn tool_success(body: serde_json::Value) -> CallToolResult {
+pub(super) fn tool_success(body: serde_json::Value) -> CallToolResult {
     CallToolResult::success(vec![Content::text(body.to_string())])
 }
 
-fn tool_error(message: impl Into<String>) -> CallToolResult {
+pub(super) fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }
 
@@ -628,6 +643,7 @@ pub(super) async fn register_for_session(
     backend_event_tx: mpsc::Sender<BackendEvent>,
     connected: Arc<AtomicBool>,
     orchestrator: super::orchestrator::Orchestrator,
+    cwd: &std::path::Path,
 ) -> Result<Option<PendingNoriClientServer>> {
     if !reachable(connection) {
         return Ok(None);
@@ -643,7 +659,8 @@ pub(super) async fn register_for_session(
             goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta())
                 .is_some(),
             orchestrator,
-        ),
+        )
+        .with_cwd(cwd.to_path_buf()),
         connection.capabilities().mcp_capabilities.http,
     )
     .await?;
@@ -790,6 +807,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_tools_commit_a_batch_and_report_what_remains() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).expect("utf8")
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().canonicalize().expect("canonical");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("a.txt"), "a\n").expect("a");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.join("a.txt"), "a2\n").expect("edit");
+        std::fs::write(dir.join("b.txt"), "b\n").expect("new");
+
+        let (backend_event_tx, _rx) = mpsc::channel(8);
+        let service = NoriClientService::new(
+            NoriClientShared::new(
+                Arc::new(Mutex::new(thread_goal::ThreadGoalState::default())),
+                backend_event_tx,
+                Arc::new(AtomicBool::new(false)),
+                test_agent_capabilities(),
+                true,
+                false,
+                test_orchestrator(),
+            )
+            .with_cwd(dir.clone()),
+        );
+
+        let status: serde_json::Value =
+            serde_json::from_str(tool_text(&service.git_status().await.expect("status")))
+                .expect("json");
+        assert_eq!(status["branch"], "main");
+        assert_eq!(status["changes"].as_array().expect("changes").len(), 2);
+
+        let committed = service
+            .git_commit(Parameters(super::super::git_tools::GitCommitRequest {
+                paths: vec!["a.txt".into()],
+                message: "fix: update a".into(),
+            }))
+            .await
+            .expect("commit");
+        assert!(!is_error(&committed), "{}", tool_text(&committed));
+        let body: serde_json::Value = serde_json::from_str(tool_text(&committed)).expect("json");
+        assert_eq!(body["remaining_changes"], 1);
+        assert_eq!(
+            git(&dir, &["log", "-1", "--format=%s"]).trim(),
+            "fix: update a"
+        );
+        assert_eq!(git(&dir, &["status", "--porcelain"]).trim(), "?? b.txt");
+
+        let empty = service
+            .git_commit(Parameters(super::super::git_tools::GitCommitRequest {
+                paths: vec![],
+                message: "nothing".into(),
+            }))
+            .await
+            .expect("empty");
+        assert!(is_error(&empty));
+    }
+
+    #[tokio::test]
     async fn create_goal_creates_active_goal_and_emits_event() {
         let (backend_event_tx, mut backend_event_rx) = mpsc::channel(8);
         let service = NoriClientService::new(NoriClientShared::new(
@@ -914,6 +1001,8 @@ mod tests {
             "task_send",
             "task_cancel",
             "get_goal",
+            "git_status",
+            "git_commit",
         ] {
             assert!(names.contains(&tool), "{tool} missing from {names:?}");
         }

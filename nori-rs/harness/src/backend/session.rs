@@ -23,6 +23,7 @@ async fn session_mcp_servers(
         backend_event_tx.clone(),
         Arc::clone(goal_mcp_connected),
         orchestrator.clone(),
+        &config.cwd,
     )
     .await?;
     if let Some(server) = nori_client_server {

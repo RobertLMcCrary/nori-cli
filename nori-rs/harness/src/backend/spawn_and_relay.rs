@@ -179,6 +179,7 @@ impl AcpBackend {
             backend_event_tx.clone(),
             Arc::clone(&goal_mcp_connected),
             orchestrator.clone(),
+            &cwd,
         )
         .await?;
         if let Some(server) = nori_client_server {
