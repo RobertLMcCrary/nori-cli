@@ -43,9 +43,13 @@ built; how it works now lives in the docs below. What follows is only what a nex
 ## Still open
 
 - **Verification**
-  - The workflow hooks and the commit agent are not yet exercised live.
-  - Switching from Codex to a warm Claude is not timed in the TUI; `nori exec` holds one
-    session, so the probe cannot.
+  - Verified live in Rex against in-process Claude:
+    - an `on-change` hook fired after an edit, and the agent committed by the
+      workflow's rules;
+    - parallel `git_status` and `git_log` finished with their data;
+    - `/new` took a warm session ("Session ready" at once, against about 1 s cold).
+  - Not yet run live: the commit agent (a delegated task), and the switch from Codex to a
+    warm Claude, since there is no Codex login.
   - No Codex turn has been seen: the machine has no Codex login.
   - Toasts have never been seen on screen.
   - The user's Ctrl+Shift and "doesn't render to the bottom" reports were never reproduced.
