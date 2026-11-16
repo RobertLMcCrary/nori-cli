@@ -19,8 +19,8 @@ use super::node::Node;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::truncate_text;
 
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SPINNER_PERIOD: Duration = Duration::from_millis(80);
+pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNER_PERIOD: Duration = Duration::from_millis(80);
 /// The block never takes more than this fraction of the screen, and never fewer rows than this.
 const SCREEN_FRACTION: u16 = 3;
 const MIN_ROWS: u16 = 4;

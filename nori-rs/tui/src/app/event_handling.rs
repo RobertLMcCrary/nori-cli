@@ -110,7 +110,9 @@ impl App {
             self.repaint_screen(tui);
             return Ok(true);
         }
-        if self.overlay.is_some() {
+        if matches!(self.overlay, Some(Overlay::Subagents(_))) {
+            self.handle_subagent_overlay_event(tui, event)?;
+        } else if self.overlay.is_some() {
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
         } else {
             match event {
@@ -2115,6 +2117,12 @@ impl App {
             if matches_binding(commit_binding, &key_event) {
                 self.app_event_tx
                     .send(AppEvent::CommitChanges { automatic: false });
+                return;
+            }
+
+            let switch_binding = self.hotkey_config.binding_for(HotkeyAction::SwitchSubagent);
+            if matches_binding(switch_binding, &key_event) {
+                self.open_subagent_switcher(tui);
                 return;
             }
 

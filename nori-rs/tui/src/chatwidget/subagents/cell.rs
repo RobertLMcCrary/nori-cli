@@ -114,7 +114,7 @@ impl HistoryCell for SubagentSummaryCell {
     }
 }
 
-pub(super) fn tool_count_text(count: usize) -> String {
+pub(crate) fn tool_count_text(count: usize) -> String {
     match count {
         1 => "1 tool".to_owned(),
         count => format!("{count} tools"),
@@ -122,7 +122,7 @@ pub(super) fn tool_count_text(count: usize) -> String {
 }
 
 /// `7s`, `1m 05s`.
-pub(super) fn format_elapsed(elapsed: Duration) -> String {
+pub(crate) fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     if seconds < 60 {
         format!("{seconds}s")

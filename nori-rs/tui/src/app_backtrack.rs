@@ -63,7 +63,7 @@ impl App {
         }
         let chosen = match &mut self.overlay {
             Some(Overlay::Transcript(transcript)) => transcript.take_chosen(),
-            Some(Overlay::Static(_)) | None => None,
+            Some(Overlay::Static(_) | Overlay::Subagents(_)) | None => None,
         };
         if let Some(action) = chosen {
             self.reset_backtrack_state();

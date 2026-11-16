@@ -11,12 +11,16 @@ use std::time::Instant;
 use nori_protocol::acp::v1 as acp;
 use nori_protocol::acp::v1::SessionId;
 
+use ratatui::text::Line;
+
 use super::block::RowCache;
 use crate::client_tool_cell::ClientToolCell;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::HistoryCell;
 use crate::presentation::ClientEvent;
 use crate::presentation::ClientEventNormalizer;
+use crate::subagent_switcher::Tail;
+use crate::subagent_switcher::cell_lines;
 
 /// How much of a child's final message is kept for its summary.
 const MAX_FINAL_MESSAGE_BYTES: usize = 8 * 1024;
@@ -71,6 +75,8 @@ pub(super) struct Node {
     pub(super) activity: String,
     /// Bumped on every change that affects what the live block shows.
     pub(super) revision: i64,
+    /// When the child last changed, for ordering the subagent switcher.
+    pub(super) active_at: Instant,
     /// Rows built for the live block, reused until the node changes or the width does.
     pub(super) row_cache: RefCell<Option<RowCache>>,
     /// Summaries of this child's own finished children, for the detail view.
@@ -92,6 +98,7 @@ impl Node {
             tool_count: 0,
             activity: String::new(),
             revision: 0,
+            active_at: now,
             row_cache: RefCell::new(None),
             nested: Vec::new(),
             transcript: ChildTranscript::default(),
@@ -116,6 +123,7 @@ impl Node {
 
     pub(super) fn touch(&mut self) {
         self.revision += 1;
+        self.active_at = Instant::now();
     }
 
     /// Absorb an update delivered on the child's session or tagged with its launcher.
@@ -191,6 +199,28 @@ impl Node {
         self.activity
             .extend(line.trim().chars().take(MAX_ACTIVITY_CHARS));
         self.touch();
+    }
+
+    /// The last `rows` rows of what the child did so far, laid out at `width`, as the transcript
+    /// overlay would show them. Costs the rows asked for, not the length of the transcript.
+    pub(super) fn detail_lines(&self, cwd: &Path, width: u16, rows: usize) -> Vec<Line<'static>> {
+        let mut tail = Tail::new(rows);
+        for cell in self.nested.iter().rev() {
+            if tail.is_full() {
+                break;
+            }
+            tail.push_front(cell_lines(cell.as_ref(), width));
+        }
+        for part in self.transcript.parts.iter().rev() {
+            if tail.is_full() {
+                break;
+            }
+            tail.push_front(match part {
+                Detail::Tool(cell) => cell_lines(cell.as_ref(), width),
+                Detail::Text(text) => cell_lines(&AgentMarkdownCell::new(text.clone(), cwd), width),
+            });
+        }
+        tail.finish()
     }
 
     /// Take the child's detail as cells for the transcript overlay, and the final message: the

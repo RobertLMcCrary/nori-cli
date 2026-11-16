@@ -692,6 +692,28 @@ the agent is idle and children still run, the block ends with "esc to stop
 subagents", and Esc (with an empty composer) cancels them, taking precedence
 over Esc-Esc to edit the previous message.
 
+The Switch Subagent hotkey (default `ctrl+space`, config key `switch_subagent`
+under `[tui.hotkeys]`; terminals that send NUL for it are accepted) opens the
+subagent switcher (`subagent_switcher/`) from the composer, while the agent
+runs or not. It is an alternate-screen overlay listing the main session, then
+every running subagent (as first seen, most recently active first; later
+activity never reorders rows), then finished ones (most recently ended first).
+A finished child stays listed: the tree keeps it as an `EndedRecord` (the
+newest 256). The query line fuzzy-matches each whitespace-separated word
+against title, parent, agent, model and status, ranks title matches first, and
+bolds the matched characters. The selection is a `Target`, not an index, so
+rows that appear, end or are replaced (a launcher call becoming its session)
+leave it on the same subagent. At 100 columns or more the right 55% previews
+the selected row: a header, then the tail of its conversation laid out like
+the transcript overlay and cut from the end, so it costs the rows shown, not
+the transcript. The overlay holds snapshots only (`Roster`, `Body`); before a
+frame the app (`app/subagent_overlay.rs`) refreshes the roster and fetches the
+body the overlay reports missing, so an unchanged frame fetches nothing. Enter
+on a subagent opens a pager view of its whole conversation that follows new
+output while scrolled to the end, and keeps showing a child that finishes
+(Esc returns to the chat, the hotkey returns to the list); Enter on `main`
+closes the overlay.
+
 Tasks an agent delegates through Nori's own task tools are shown the same
 way: each task is a subagent labelled with its title and its agent and model
 (`Codex · GPT-5.1`). The parent's calls to those tools are recognised whatever

@@ -1,0 +1,22 @@
+---
+source: tui/src/subagent_switcher/snapshot_tests.rs
+expression: terminal.backend()
+---
+"/ S U B A G E N T S / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / "
+"› rea│                                                                                                                  "
+"› ✓ Read a.txt contents  1 tool · 27s · 2m ago        │ ✓ Read a.txt contents                                           "
+"                                                      │ general-purpose · done · 1 tool · 27s · 2m ago                  "
+"                                                      │ ────────────────────────────────────────────────────────────────"
+"                                                      │ • Explored                                                      "
+"                                                      │   └ Read a.txt                                                  "
+"                                                      │                                                                 "
+"                                                      │ • The file holds alpha.                                         "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+" ↑↓ move · enter switch · esc close · ctrl+space close                                                              1/1 "

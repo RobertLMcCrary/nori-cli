@@ -43,6 +43,18 @@ pub(crate) struct FinishedSubagent {
     pub(crate) depth: usize,
 }
 
+/// A child that finished, kept so the subagent switcher can still show what it did.
+#[derive(Debug)]
+pub(super) struct EndedRecord {
+    pub(super) finished: FinishedSubagent,
+    /// The label of the running subagent that started it, when it had one.
+    pub(super) parent: Option<String>,
+    pub(super) ended_at: Instant,
+}
+
+/// Finished children kept for the switcher; the oldest are dropped past this.
+const MAX_ENDED_KEPT: usize = 256;
+
 /// What a session id or launcher call id refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Link {
@@ -68,10 +80,14 @@ pub(crate) struct SubagentTree {
     by_session: HashMap<SessionId, Link>,
     by_launcher: HashMap<String, Link>,
     root_session_id: Option<SessionId>,
-    context: CellContext,
+    pub(super) context: CellContext,
     /// Merges launcher tool-call updates, which carry only the changed fields.
     launcher_normalizer: ClientEventNormalizer,
     finished: Vec<FinishedSubagent>,
+    /// Every finished child, by node id, for the switcher.
+    pub(super) ended: BTreeMap<NodeId, EndedRecord>,
+    /// Nodes that a later node took the place of: `(old, new)`.
+    pub(super) replaced: Vec<(NodeId, NodeId)>,
     next_id: i64,
     /// Live-block rows built so far, for tests that count work.
     pub(super) rows_built: std::cell::Cell<usize>,
@@ -87,6 +103,8 @@ impl SubagentTree {
             context: CellContext { cwd, animations },
             launcher_normalizer: ClientEventNormalizer::default(),
             finished: Vec::new(),
+            ended: BTreeMap::new(),
+            replaced: Vec::new(),
             next_id: 0,
             rows_built: std::cell::Cell::new(0),
         }
@@ -238,6 +256,7 @@ impl SubagentTree {
         let Some(stand_in) = self.live.remove(&launcher) else {
             return;
         };
+        self.replaced.push((launcher, child));
         self.by_launcher
             .insert(call_id.to_owned(), Link::Live(child));
         if let Some(parent) = stand_in
@@ -382,6 +401,21 @@ impl SubagentTree {
             detail,
             depth,
         };
+        let parent_label = node
+            .parent
+            .and_then(|parent| self.live.get(&parent))
+            .map(|parent| parent.label().to_owned());
+        self.ended.insert(
+            id,
+            EndedRecord {
+                finished: finished.clone(),
+                parent: parent_label,
+                ended_at: now,
+            },
+        );
+        if self.ended.len() > MAX_ENDED_KEPT {
+            self.ended.pop_first();
+        }
         if let Some(parent) = node.parent.and_then(|parent| self.live.get_mut(&parent)) {
             parent.children.remove(&id);
             parent
@@ -392,7 +426,7 @@ impl SubagentTree {
         self.finished.push(finished);
     }
 
-    fn depth_of(&self, id: NodeId) -> usize {
+    pub(super) fn depth_of(&self, id: NodeId) -> usize {
         let mut depth = 0;
         let mut current = self.live.get(&id).and_then(|node| node.parent);
         while let Some(parent) = current {

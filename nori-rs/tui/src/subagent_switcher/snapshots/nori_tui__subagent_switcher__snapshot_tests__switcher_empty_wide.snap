@@ -1,0 +1,16 @@
+---
+source: tui/src/subagent_switcher/snapshot_tests.rs
+expression: terminal.backend()
+---
+"/ S U B A G E N T S / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / "
+"› │ type to filter subagents                                                                                  "
+"› • main  Claude Code · opus                     │ • main                                                     "
+"  no subagents yet; agents delegate with         │ Claude Code · opus · idle                                  "
+"  delegate_task                                  │ ───────────────────────────────────────────────────────────"
+"                                                 │ › what changed in the auth code?                           "
+"                                                 │                                                            "
+"                                                 │ I will have a subagent audit it.                           "
+"                                                 │                                                            "
+"                                                 │                                                            "
+"                                                 │                                                            "
+" ↑↓ move · enter switch · esc close · ctrl+space close                                                    1/1 "

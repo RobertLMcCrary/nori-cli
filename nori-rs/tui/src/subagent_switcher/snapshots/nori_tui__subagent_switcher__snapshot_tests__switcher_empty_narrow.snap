@@ -1,0 +1,12 @@
+---
+source: tui/src/subagent_switcher/snapshot_tests.rs
+expression: terminal.backend()
+---
+"/ S U B A G E N T S / / / / / / / / / / / / / / / / / / / / "
+"› │ type to filter subagents                                "
+"› • main  Claude Code · opus                                "
+"  no subagents yet; agents delegate with delegate_task      "
+"                                                            "
+"                                                            "
+"                                                            "
+" ↑↓ move · enter switch · esc close · ctrl+space close  1/1 "

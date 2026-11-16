@@ -24,17 +24,21 @@ use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
 
 mod message_menu;
+mod subagent;
 mod transcript;
 #[cfg(test)]
 mod transcript_tests;
 
 pub(crate) use message_menu::MessageAction;
 pub(crate) use message_menu::MessageChoice;
+pub(crate) use subagent::SubagentFocus;
 pub(crate) use transcript::TranscriptOverlay;
 
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
+    /// The subagent switcher, or the focused view of one subagent.
+    Subagents(Box<crate::subagent_switcher::SubagentOverlay>),
 }
 
 impl Overlay {
@@ -57,6 +61,7 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
+            Overlay::Subagents(o) => o.handle_event(tui, event),
         }
     }
 
@@ -64,6 +69,7 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
+            Overlay::Subagents(o) => o.is_done(),
         }
     }
 }
@@ -487,7 +493,7 @@ struct CellRenderable {
     style: Style,
 }
 
-fn transcript_overlay_lines(cell: &dyn HistoryCell, width: u16) -> Vec<Line<'static>> {
+pub(crate) fn transcript_overlay_lines(cell: &dyn HistoryCell, width: u16) -> Vec<Line<'static>> {
     let mut lines = cell.transcript_lines(width);
     if cell.full_transcript() || lines.len() <= TRANSCRIPT_HISTORY_MAX_LINES {
         return lines;

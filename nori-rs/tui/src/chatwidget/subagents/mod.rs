@@ -13,15 +13,22 @@ mod block;
 mod cell;
 mod events;
 mod node;
+mod roster;
 mod tree;
 
+pub(crate) use block::SPINNER_FRAMES;
+pub(crate) use block::SPINNER_PERIOD;
 pub(crate) use block::SubagentBlock;
 pub(crate) use cell::SubagentSummaryCell;
+pub(crate) use cell::format_elapsed;
+pub(crate) use cell::tool_count_text;
 pub(crate) use tree::ChildTarget;
 pub(crate) use tree::FinishedSubagent;
 pub(crate) use tree::SubagentTree;
 
 #[cfg(test)]
 mod block_tests;
+#[cfg(test)]
+mod roster_tests;
 #[cfg(test)]
 mod tree_tests;

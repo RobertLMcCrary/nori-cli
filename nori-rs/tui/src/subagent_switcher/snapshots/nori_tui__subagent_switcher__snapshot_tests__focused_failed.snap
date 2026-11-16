@@ -1,0 +1,18 @@
+---
+source: tui/src/subagent_switcher/snapshot_tests.rs
+expression: terminal.backend()
+---
+"/ Run the test suite · failed / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / "
+"✗ Run the test suite                                                                      "
+"general-purpose · failed: usage limit · 1 tool · 1m 25s · 1m ago                          "
+"──────────────────────────────────────────────────────────────────────────────────────────"
+"• Explored                                                                                "
+"  └ Read Cargo.toml                                                                       "
+"~                                                                                         "
+"~                                                                                         "
+"~                                                                                         "
+"~                                                                                         "
+"~                                                                                         "
+"─────────────────────────────────────────────────────────────────────────────────── 100% ─"
+" esc back · ctrl+space switch                                                             "
+" ↑/↓ to scroll   pgup/pgdn to page   home/end to jump                                     "

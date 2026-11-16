@@ -79,6 +79,7 @@ mod status_indicator_widget;
 pub mod storybook;
 mod streaming;
 mod style;
+mod subagent_switcher;
 mod system_info;
 mod terminal_palette;
 mod terminal_title;

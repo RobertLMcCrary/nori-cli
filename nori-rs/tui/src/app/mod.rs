@@ -231,6 +231,7 @@ mod history_replay;
 mod message_actions;
 mod resize_reflow;
 mod session_setup;
+mod subagent_overlay;
 
 impl App {
     #[allow(clippy::too_many_arguments)]

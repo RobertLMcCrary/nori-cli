@@ -1,0 +1,26 @@
+---
+source: tui/src/subagent_switcher/snapshot_tests.rs
+expression: terminal.backend()
+---
+"/ S U B A G E N T S / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / "
+"› │ type to filter subagents                                                                                            "
+"  • main  Claude Code · opus                          │ ✗ Run the test suite                                            "
+"  • Explore the rep… › Audit the auth middleware      │ general-purpose · failed: usage limit · 1 tool · 1m 25s · 1m ago"
+"  • Explore the repo structure  1 tool · 2m 40s       │ ────────────────────────────────────────────────────────────────"
+"  ⊘ Summarize the docs  Explore · 1m 28s · 1m ago     │ • Explored                                                      "
+"› ✗ Run the test suite  1 tool · 1m 25s · 1m ago      │   └ Read Cargo.toml                                             "
+"  ✓ Read a.txt contents  1 tool · 27s · 2m ago        │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+"                                                      │                                                                 "
+" ↑↓ move · enter switch · esc close · ctrl+space close                                                              5/6 "
