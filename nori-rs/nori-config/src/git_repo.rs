@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 /// An open repository.
 pub struct GitRepo {
-    repo: gix::Repository,
+    pub(crate) repo: gix::Repository,
 }
 
 impl GitRepo {

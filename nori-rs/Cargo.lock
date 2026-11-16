@@ -4806,6 +4806,7 @@ dependencies = [
  "serde",
  "serial_test",
  "tempfile",
+ "thiserror 2.0.17",
  "toml",
  "toml_edit",
  "wildmatch",
