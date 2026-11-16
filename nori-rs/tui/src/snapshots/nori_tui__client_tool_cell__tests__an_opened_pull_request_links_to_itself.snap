@@ -1,0 +1,7 @@
+---
+source: tui/src/client_tool_cell.rs
+expression: "render_lines(&cell.display_lines(80)).join(\"\\n\")"
+---
+⇡ Opened #413 feat(forge): CI status and pull requests  draft
+  ├ feat/forge → main
+  └ https://github.com/o/r/pull/413

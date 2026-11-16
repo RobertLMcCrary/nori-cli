@@ -6,18 +6,26 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout};
-use tracing::{Span, instrument};
+use serde::Deserialize;
+use serde::Serialize;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::process::ChildStdin;
+use tokio::process::ChildStdout;
+use tracing::Span;
+use tracing::instrument;
 
 use process_wrap::tokio::*;
 
-use super::registry::{ToolResult, ToolSchema};
+use super::registry::ToolResult;
+use super::registry::ToolSchema;
 use crate::session::WrappedChild;
 
 /// Default timeout for MCP requests (3 minutes)

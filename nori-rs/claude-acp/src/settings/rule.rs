@@ -4,9 +4,11 @@
 
 use std::path::Path;
 
-use globset::{Glob, GlobMatcher};
+use globset::Glob;
+use globset::GlobMatcher;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::mcp::ExternalMcpManager;
 use crate::mcp::tools::bash::contains_shell_operator;
@@ -366,7 +368,8 @@ fn extract_tool_argument(tool_name: &str, input: &serde_json::Value) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{manager::Settings, permission_checker::PermissionChecker};
+    use crate::settings::manager::Settings;
+    use crate::settings::permission_checker::PermissionChecker;
     use serde_json::json;
     use std::path::PathBuf;
 

@@ -6,14 +6,33 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::mcp::external::{ExternalMcpError, ExternalMcpManager};
-use crate::mcp::registry::{ToolContext, ToolRegistry, ToolResult, ToolSchema};
-use crate::mcp::tools::{
-    AskUserQuestionTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
-    KillShellTool, LsTool, NotebookEditTool, NotebookReadTool, ReadTool, SkillTool,
-    SlashCommandTool, TaskOutputTool, TaskTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
-    WriteTool,
-};
+use crate::mcp::external::ExternalMcpError;
+use crate::mcp::external::ExternalMcpManager;
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolRegistry;
+use crate::mcp::registry::ToolResult;
+use crate::mcp::registry::ToolSchema;
+use crate::mcp::tools::AskUserQuestionTool;
+use crate::mcp::tools::BashOutputTool;
+use crate::mcp::tools::BashTool;
+use crate::mcp::tools::EditTool;
+use crate::mcp::tools::ExitPlanModeTool;
+use crate::mcp::tools::GlobTool;
+use crate::mcp::tools::GrepTool;
+use crate::mcp::tools::KillShellTool;
+use crate::mcp::tools::LsTool;
+use crate::mcp::tools::NotebookEditTool;
+use crate::mcp::tools::NotebookReadTool;
+use crate::mcp::tools::ReadTool;
+use crate::mcp::tools::SkillTool;
+use crate::mcp::tools::SlashCommandTool;
+use crate::mcp::tools::TaskOutputTool;
+use crate::mcp::tools::TaskTool;
+use crate::mcp::tools::TodoWriteTool;
+use crate::mcp::tools::Tool;
+use crate::mcp::tools::WebFetchTool;
+use crate::mcp::tools::WebSearchTool;
+use crate::mcp::tools::WriteTool;
 use crate::settings::McpServerConfig;
 
 /// MCP Server for managing and executing tools

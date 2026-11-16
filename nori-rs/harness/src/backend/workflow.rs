@@ -30,15 +30,31 @@ pub(crate) struct WorkflowState {
     /// The thread that runs the scripts, once started.
     host: Option<ScriptHost>,
     /// The workflow in force: the scripts' default, or one an inline clause set up.
-    active: Option<Workflow>,
+    pub(super) active: Option<Workflow>,
     /// The agent has been told the active workflow's rules.
     told: bool,
     /// Hook turns sent since the user's last turn.
-    hook_turns: i64,
+    pub(super) hook_turns: i64,
     /// The `on-stop` hook already ran since the user's last turn.
     stop_hooked: bool,
     /// The working tree when the user's current turn started.
     before: Option<TreeState>,
+    /// The commit the agent was last given the `on-pr` hook for, by `pull_request`.
+    pr_held_at: Option<String>,
+    /// Where the branch's remote copy was when the user's current turn started.
+    pub(super) pushed_before: Option<String>,
+    /// The pushed commit whose checks are being watched, or were last reported.
+    pub(super) ci_watching: Option<String>,
+    /// What CI said, waiting for the session to be idle.
+    pub(super) ci_owed: Option<super::ci_watch::CiReport>,
+}
+
+/// What the forge tools apply of the workflow in force.
+pub(crate) struct PrPolicy {
+    pub(crate) workflow: String,
+    pub(crate) rules: nori_script::PrRules,
+    /// The `on-pr` prompts, joined; empty when the workflow has none.
+    pub(crate) before_pr: String,
 }
 
 /// What a turn could have changed: HEAD, and every changed file with its size and mtime.
@@ -80,7 +96,30 @@ async fn tree_state_of(cwd: PathBuf) -> Option<TreeState> {
 }
 
 impl WorkflowState {
-    fn hook_budget(&self) -> i64 {
+    /// The pull request rules and `on-pr` hook of the workflow in force.
+    pub(crate) fn pr_policy(&self) -> Option<PrPolicy> {
+        let workflow = self.active.as_ref()?;
+        Some(PrPolicy {
+            workflow: workflow.name.clone(),
+            rules: workflow.pr.clone().unwrap_or_default(),
+            before_pr: workflow
+                .hook_prompts(HookEvent::BeforePr)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        })
+    }
+
+    /// Whether `pull_request` holds back at `head` to give the agent the `on-pr` hook: once per
+    /// commit, so the call after the agent has acted on it goes through.
+    pub(crate) fn hold_pr(&mut self, head: &str) -> bool {
+        if self.pr_held_at.as_deref() == Some(head) {
+            return false;
+        }
+        self.pr_held_at = Some(head.to_owned());
+        true
+    }
+
+    pub(super) fn hook_budget(&self) -> i64 {
         self.active
             .as_ref()
             .and_then(|workflow| workflow.max_turns)
@@ -193,13 +232,21 @@ impl AcpBackend {
         (text, rules)
     }
 
-    /// A user turn is starting: note the working tree, to tell afterwards what it changed.
+    /// A user turn is starting: note the working tree and what is pushed, to tell afterwards
+    /// what the turn changed.
     pub(super) async fn workflow_turn_started(&self) {
-        if self.workflow.lock().await.active.is_none() {
+        let Some(workflow) = self.workflow.lock().await.active.clone() else {
             return;
-        }
+        };
         let before = tree_state_of(self.cwd.clone()).await;
-        self.workflow.lock().await.before = before;
+        let pushed = if super::ci_watch::hooks_ci(&workflow) {
+            self.pushed_commit().await
+        } else {
+            None
+        };
+        let mut state = self.workflow.lock().await;
+        state.before = before;
+        state.pushed_before = pushed;
     }
 
     /// After a turn, send the prompts the workflow hooks to what happened, if the session is idle
@@ -246,8 +293,8 @@ impl AcpBackend {
                 HookEvent::AfterTurn => true,
                 // The last word before control returns to the user, once per user turn.
                 HookEvent::BeforeStop => !stop_hooked,
-                // Nori cannot see a pull request coming; the agent is told the rule instead.
-                HookEvent::BeforePr => false,
+                // `pull_request` gives the agent this one; CI's come from its watcher.
+                HookEvent::BeforePr | HookEvent::CiFailed | HookEvent::CiPassed => false,
             };
             happened && workflow.hook_prompts(*event).next().is_some()
         }) else {
@@ -287,18 +334,30 @@ impl AcpBackend {
             state.hook_turns += 1;
             state.stop_hooked |= event == HookEvent::BeforeStop;
         }
-        let form = event.form();
+        self.send_hook_turn(
+            format!("Workflow \"{}\" · {}", workflow.name, event.form()),
+            event,
+            prompt,
+        )
+        .await;
+    }
+
+    /// Send `body` as the hidden turn of the workflow hook `event`, announced by an info line.
+    pub(super) async fn send_hook_turn(&self, label: String, event: HookEvent, body: String) {
         // Routine, so an info line rather than a warning.
         let _ = self
             .backend_event_tx
             .send(BackendEvent::Public(SessionEvent::Nori(
                 nori_protocol::NoriEvent::HookOutput(nori_protocol::HookOutput {
-                    message: format!("Workflow \"{}\" · {form}", workflow.name),
+                    message: label,
                     level: nori_protocol::HookOutputLevel::Info,
                 }),
             )))
             .await;
-        let text = format!("<workflow_hook event=\"{form}\">\n{prompt}\n</workflow_hook>");
+        let text = format!(
+            "<workflow_hook event=\"{}\">\n{body}\n</workflow_hook>",
+            event.form()
+        );
         let _ = self
             .session_event_tx
             .send(session_runtime_driver::SessionRuntimeInput::Reducer(
@@ -316,7 +375,7 @@ impl AcpBackend {
     }
 }
 
-async fn notice(events: &mpsc::Sender<BackendEvent>, message: String) {
+pub(super) async fn notice(events: &mpsc::Sender<BackendEvent>, message: String) {
     let _ = events
         .send(BackendEvent::Public(SessionEvent::Nori(
             nori_protocol::NoriEvent::Notice(nori_protocol::Notice { message }),

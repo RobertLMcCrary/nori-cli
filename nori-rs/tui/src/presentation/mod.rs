@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 mod delegation;
+mod native_forge;
 mod native_history;
 mod native_tool;
 

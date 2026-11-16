@@ -39,12 +39,14 @@ pub(crate) const PRELUDE: &str = r#"
 "#;
 
 /// Long hook names matching the `.hook_after_change(prompt)` phrasing.
-const HOOK_ALIASES: [(HookEvent, &str); 5] = [
+const HOOK_ALIASES: [(HookEvent, &str); 7] = [
     (HookEvent::AfterChange, "hook-after-change"),
     (HookEvent::AfterTurn, "hook-after-turn"),
     (HookEvent::AfterCommit, "hook-after-commit"),
     (HookEvent::BeforePr, "hook-before-pr"),
     (HookEvent::BeforeStop, "hook-before-stop"),
+    (HookEvent::CiFailed, "hook-after-ci-fail"),
+    (HookEvent::CiPassed, "hook-after-ci-pass"),
 ];
 
 /// A workflow as a Steel value. Values are immutable: clauses return copies.

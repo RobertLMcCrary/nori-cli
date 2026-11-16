@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 
-use crate::mcp::registry::{ToolContext, ToolResult};
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
 
 /// Tool trait for MCP-compatible tools
 ///

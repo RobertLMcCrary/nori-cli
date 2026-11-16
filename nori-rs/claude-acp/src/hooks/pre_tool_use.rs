@@ -3,27 +3,36 @@
 //! Checks permissions using SettingsManager before tool execution.
 //! For "Ask" decisions, sends permission request directly (has correct tool_use_id).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
-use claude_code_agent_sdk::{
-    HookCallback, HookContext, HookInput, HookJsonOutput, HookSpecificOutput,
-    PreToolUseHookSpecificOutput, SyncHookJsonOutput,
-};
+use claude_code_agent_sdk::HookCallback;
+use claude_code_agent_sdk::HookContext;
+use claude_code_agent_sdk::HookInput;
+use claude_code_agent_sdk::HookJsonOutput;
+use claude_code_agent_sdk::HookSpecificOutput;
+use claude_code_agent_sdk::PreToolUseHookSpecificOutput;
+use claude_code_agent_sdk::SyncHookJsonOutput;
 use dashmap::DashMap;
 use futures::future::BoxFuture;
-use sacp::{
-    Client, ConnectionTo,
-    schema::{
-        SessionId, SessionNotification, SessionUpdate, ToolCallContent, ToolCallId, ToolCallStatus,
-        ToolCallUpdate, ToolCallUpdateFields,
-    },
-};
+use sacp::Client;
+use sacp::ConnectionTo;
+use sacp::schema::SessionId;
+use sacp::schema::SessionNotification;
+use sacp::schema::SessionUpdate;
+use sacp::schema::ToolCallContent;
+use sacp::schema::ToolCallId;
+use sacp::schema::ToolCallStatus;
+use sacp::schema::ToolCallUpdate;
+use sacp::schema::ToolCallUpdateFields;
 use tokio::sync::RwLock;
 use tracing::Instrument;
 
-use crate::command_safety::{command_might_be_dangerous, is_known_safe_command};
-use crate::session::{PermissionHandler, PermissionMode};
+use crate::command_safety::command_might_be_dangerous;
+use crate::command_safety::is_known_safe_command;
+use crate::session::PermissionHandler;
+use crate::session::PermissionMode;
 use crate::settings::PermissionChecker;
 use crate::utils::is_plans_directory_path;
 
@@ -617,7 +626,8 @@ fn create_deny_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{PermissionSettings, Settings};
+    use crate::settings::PermissionSettings;
+    use crate::settings::Settings;
     use serde_json::json;
 
     fn make_permission_checker(permissions: PermissionSettings) -> Arc<RwLock<PermissionChecker>> {

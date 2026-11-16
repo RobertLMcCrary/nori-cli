@@ -3,6 +3,10 @@ use super::*;
 /// Build the session's MCP server list (CLI-configured servers plus the
 /// nori-client goal server when the agent advertises HTTP MCP) and commit
 /// the registered server. Shared by every branch of `resume_session`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a piece of the backend that the session's tools share"
+)]
 async fn session_mcp_servers(
     config: &AcpBackendConfig,
     connection: &AcpConnection,
@@ -11,6 +15,7 @@ async fn session_mcp_servers(
     goal_mcp_connected: &Arc<std::sync::atomic::AtomicBool>,
     goal_mcp_http_server: &Arc<Mutex<Option<nori_client_mcp::NoriClient>>>,
     orchestrator: &orchestrator::Orchestrator,
+    workflow: &Arc<Mutex<workflow::WorkflowState>>,
 ) -> Result<Vec<acp::McpServer>> {
     let mut mcp_servers = crate::connection::mcp::to_acp_mcp_servers(
         &config.mcp_servers,
@@ -23,7 +28,10 @@ async fn session_mcp_servers(
         backend_event_tx.clone(),
         Arc::clone(goal_mcp_connected),
         orchestrator.clone(),
-        &config.cwd,
+        nori_client_mcp::Workspace {
+            cwd: config.cwd.clone(),
+            workflow: Arc::clone(workflow),
+        },
     )
     .await?;
     if let Some(server) = nori_client_server {
@@ -175,6 +183,7 @@ impl AcpBackend {
         ));
         let goal_mcp_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let goal_mcp_http_server = Arc::new(Mutex::new(None));
+        let workflow: Arc<Mutex<workflow::WorkflowState>> = Arc::default();
 
         // Either load the session server-side or create a fresh session for
         // client-side replay.
@@ -323,6 +332,7 @@ impl AcpBackend {
                 &goal_mcp_connected,
                 &goal_mcp_http_server,
                 &orchestrator,
+                &workflow,
             )
             .await?;
 
@@ -436,6 +446,7 @@ impl AcpBackend {
                         &goal_mcp_connected,
                         &goal_mcp_http_server,
                         &orchestrator,
+                        &workflow,
                     )
                     .await?;
                     let session_id = match connection.create_session(&cwd, mcp_servers).await {
@@ -508,6 +519,7 @@ impl AcpBackend {
                 &goal_mcp_connected,
                 &goal_mcp_http_server,
                 &orchestrator,
+                &workflow,
             )
             .await?;
 
@@ -555,6 +567,7 @@ impl AcpBackend {
                 &goal_mcp_connected,
                 &goal_mcp_http_server,
                 &orchestrator,
+                &workflow,
             )
             .await?;
             let session_id = match connection.create_session(&cwd, mcp_servers).await {
@@ -724,7 +737,7 @@ impl AcpBackend {
             notify_after_idle: config.notify_after_idle,
             edit_journal: Arc::new(EditJournal::new()),
             is_first_prompt: Arc::new(Mutex::new(is_first_prompt_val)),
-            workflow: Arc::default(),
+            workflow,
             prompt_summary_enabled: config.prompt_summary_enabled,
             agent_name: config.agent.clone(),
             cli_version: config.cli_version.clone(),

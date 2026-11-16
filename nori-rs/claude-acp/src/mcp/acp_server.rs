@@ -9,22 +9,34 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use claude_code_agent_sdk::{
-    SdkMcpServer, SdkMcpTool, ToolDefinition, ToolHandler, ToolResult as SdkToolResult,
-};
+use claude_code_agent_sdk::SdkMcpServer;
+use claude_code_agent_sdk::SdkMcpTool;
+use claude_code_agent_sdk::ToolDefinition;
+use claude_code_agent_sdk::ToolHandler;
+use claude_code_agent_sdk::ToolResult as SdkToolResult;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use sacp::Client;
 use sacp::ConnectionTo;
-use sacp::schema::{
-    Meta, SessionId, SessionNotification, SessionUpdate, Terminal, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-};
+use sacp::schema::Meta;
+use sacp::schema::SessionId;
+use sacp::schema::SessionNotification;
+use sacp::schema::SessionUpdate;
+use sacp::schema::Terminal;
+use sacp::schema::ToolCall;
+use sacp::schema::ToolCallContent;
+use sacp::schema::ToolCallId;
+use sacp::schema::ToolCallStatus;
+use sacp::schema::ToolCallUpdate;
+use sacp::schema::ToolCallUpdateFields;
+use sacp::schema::ToolKind;
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::instrument;
 
-use super::registry::{ToolContext, ToolResult};
+use super::registry::ToolContext;
+use super::registry::ToolResult;
 use super::server::McpServer;
 use crate::session::BackgroundProcessManager;
 use crate::settings::PermissionChecker;
@@ -848,7 +860,8 @@ impl AcpMcpServer {
         session_id: Option<&str>,
         tool_use_id: Option<&str>,
     ) -> Result<ToolResult, String> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::AsyncBufReadExt;
+        use tokio::io::BufReader;
         use tokio::process::Command;
 
         // Spawn the command

@@ -602,7 +602,7 @@ struct FileChange {
 
 /// Lines added and removed going from `old` to `new`. Binary content counts as no lines, as in
 /// `git diff --shortstat`.
-fn count_lines(old: &[u8], new: &[u8]) -> (u32, u32) {
+pub(crate) fn count_lines(old: &[u8], new: &[u8]) -> (u32, u32) {
     if old.contains(&0) || new.contains(&0) {
         return (0, 0);
     }

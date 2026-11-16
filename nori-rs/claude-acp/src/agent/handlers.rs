@@ -10,32 +10,53 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::{Stream, StreamExt};
+use futures::Stream;
+use futures::StreamExt;
 use sacp::Client;
 use sacp::ConnectionTo;
-use sacp::schema::{
-    AgentCapabilities, ContentBlock, CurrentModeUpdate, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionMode,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason,
-};
+use sacp::schema::AgentCapabilities;
+use sacp::schema::ContentBlock;
+use sacp::schema::CurrentModeUpdate;
+use sacp::schema::Implementation;
+use sacp::schema::InitializeRequest;
+use sacp::schema::InitializeResponse;
+use sacp::schema::LoadSessionRequest;
+use sacp::schema::LoadSessionResponse;
+use sacp::schema::NewSessionRequest;
+use sacp::schema::NewSessionResponse;
+use sacp::schema::PromptCapabilities;
+use sacp::schema::PromptRequest;
+use sacp::schema::PromptResponse;
+use sacp::schema::SessionId;
+use sacp::schema::SessionMode;
+use sacp::schema::SessionModeId;
+use sacp::schema::SessionModeState;
+use sacp::schema::SessionNotification;
+use sacp::schema::SessionUpdate;
+use sacp::schema::SetSessionModeRequest;
+use sacp::schema::SetSessionModeResponse;
+use sacp::schema::StopReason;
 use tokio_util::sync::CancellationToken;
 
 // Unstable types from agent-client-protocol-schema
-use agent_client_protocol_schema::{ModelInfo, SessionModelState};
+use agent_client_protocol_schema::ModelInfo;
+use agent_client_protocol_schema::SessionModelState;
 use tokio::sync::broadcast;
 use tracing::instrument;
 
 use crate::agent::flush;
-use crate::agent::slash_commands::{
-    filter_commands, get_predefined_commands, transform_mcp_command_input,
-};
+use crate::agent::slash_commands::filter_commands;
+use crate::agent::slash_commands::get_predefined_commands;
+use crate::agent::slash_commands::transform_mcp_command_input;
 use crate::mcp::SessionTools;
+use crate::session::PermissionMode;
+use crate::session::Session;
+use crate::session::SessionManager;
 use crate::session::warm;
-use crate::session::{PermissionMode, Session, SessionManager};
 use crate::terminal::TerminalClient;
-use crate::types::{AgentConfig, AgentError, NewSessionMeta};
+use crate::types::AgentConfig;
+use crate::types::AgentError;
+use crate::types::NewSessionMeta;
 
 /// The model id that means "whatever the Claude CLI picks for this account".
 /// Nothing is pinned to a dated model id, which would go stale.
@@ -385,9 +406,9 @@ fn build_config_options(
     current_mode: &str,
     models: &SessionModelState,
 ) -> Vec<agent_client_protocol_schema::SessionConfigOption> {
-    use agent_client_protocol_schema::{
-        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    };
+    use agent_client_protocol_schema::SessionConfigOption;
+    use agent_client_protocol_schema::SessionConfigOptionCategory;
+    use agent_client_protocol_schema::SessionConfigSelectOption;
 
     let modes: Vec<SessionConfigSelectOption> = build_available_modes()
         .into_iter()
@@ -1207,7 +1228,8 @@ async fn drain_leftover_messages(
         >,
     >,
 ) {
-    use tokio::time::{Duration, timeout};
+    use tokio::time::Duration;
+    use tokio::time::timeout;
 
     let mut drained_count = 0;
     let max_drain_time = Duration::from_millis(100);
@@ -1280,7 +1302,8 @@ async fn drain_messages_synchronously(
         >,
     >,
 ) {
-    use tokio::time::{Duration, timeout};
+    use tokio::time::Duration;
+    use tokio::time::timeout;
 
     let drain_start = Instant::now();
     let mut drained_count = 0;
@@ -1849,7 +1872,8 @@ fn base64_decode(s: &str) -> Option<String> {
 mod tests {
     use super::*;
     use futures::stream;
-    use sacp::schema::{ProtocolVersion, TextContent};
+    use sacp::schema::ProtocolVersion;
+    use sacp::schema::TextContent;
     use serial_test::serial;
     use std::time::Duration;
 
@@ -1890,7 +1914,8 @@ mod tests {
     /// 3. The drain function respects the maximum timeout
     #[tokio::test]
     async fn test_drain_messages_synchronously() {
-        use claude_code_agent_sdk::{Message, StreamEvent};
+        use claude_code_agent_sdk::Message;
+        use claude_code_agent_sdk::StreamEvent;
         use serde_json::json;
         use uuid::Uuid;
 
@@ -1954,7 +1979,8 @@ mod tests {
     /// Test that drain_messages_synchronously respects the maximum timeout
     #[tokio::test]
     async fn test_drain_messages_synchronously_max_timeout() {
-        use claude_code_agent_sdk::{Message, StreamEvent};
+        use claude_code_agent_sdk::Message;
+        use claude_code_agent_sdk::StreamEvent;
         use serde_json::json;
         use uuid::Uuid;
 
@@ -1991,7 +2017,8 @@ mod tests {
     /// Test that drain_messages_synchronously correctly detects silence period
     #[tokio::test]
     async fn test_drain_messages_synchronously_silence_detection() {
-        use claude_code_agent_sdk::{Message, StreamEvent};
+        use claude_code_agent_sdk::Message;
+        use claude_code_agent_sdk::StreamEvent;
         use serde_json::json;
         use uuid::Uuid;
 

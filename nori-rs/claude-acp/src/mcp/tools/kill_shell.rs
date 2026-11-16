@@ -9,11 +9,14 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 
 use super::base::Tool;
-use crate::mcp::registry::{ToolContext, ToolResult};
-use crate::session::{BackgroundTerminal, TerminalExitStatus};
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
+use crate::session::BackgroundTerminal;
+use crate::session::TerminalExitStatus;
 use crate::terminal::TerminalId;
 
 /// Prefix for Terminal API shell IDs

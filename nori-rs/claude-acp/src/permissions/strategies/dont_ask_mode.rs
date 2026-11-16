@@ -4,7 +4,8 @@
 //! No user prompts are shown.
 
 use crate::permissions::strategies::PermissionModeStrategy;
-use crate::session::{PermissionMode, ToolPermissionResult};
+use crate::session::PermissionMode;
+use crate::session::ToolPermissionResult;
 use serde_json::Value;
 
 /// Strategy for DontAsk mode - deny unless pre-approved by settings

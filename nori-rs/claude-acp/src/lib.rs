@@ -81,14 +81,27 @@ pub mod tracing;
 pub mod types;
 pub mod utils;
 
-pub use agent::{
-    InProcessOptions, prewarm, run_acp, run_acp_with_cli, serve_in_process, shutdown_otel,
-};
+pub use agent::InProcessOptions;
+pub use agent::prewarm;
+pub use agent::run_acp;
+pub use agent::run_acp_with_cli;
+pub use agent::serve_in_process;
+pub use agent::shutdown_otel;
 pub use cli::Cli;
-pub use hooks::{HookCallbackRegistry, create_post_tool_use_hook, create_pre_tool_use_hook};
-pub use mcp::{
-    AcpMcpServer, McpServer, ToolContext, ToolRegistry, ToolResult, get_disallowed_tools,
-};
-pub use settings::{Settings, SettingsManager};
-pub use terminal::{TerminalClient, TerminalHandle};
-pub use types::{AgentConfig, AgentError, NewSessionMeta, Result};
+pub use hooks::HookCallbackRegistry;
+pub use hooks::create_post_tool_use_hook;
+pub use hooks::create_pre_tool_use_hook;
+pub use mcp::AcpMcpServer;
+pub use mcp::McpServer;
+pub use mcp::ToolContext;
+pub use mcp::ToolRegistry;
+pub use mcp::ToolResult;
+pub use mcp::get_disallowed_tools;
+pub use settings::Settings;
+pub use settings::SettingsManager;
+pub use terminal::TerminalClient;
+pub use terminal::TerminalHandle;
+pub use types::AgentConfig;
+pub use types::AgentError;
+pub use types::NewSessionMeta;
+pub use types::Result;

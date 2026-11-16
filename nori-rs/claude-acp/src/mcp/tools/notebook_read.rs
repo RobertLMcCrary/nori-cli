@@ -3,12 +3,15 @@
 //! Reads Jupyter notebook (.ipynb) files and returns all cells with their outputs.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
 use std::fs;
 
 use super::base::Tool;
-use crate::mcp::registry::{ToolContext, ToolResult};
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
 
 /// Input parameters for NotebookRead
 #[derive(Debug, Deserialize)]

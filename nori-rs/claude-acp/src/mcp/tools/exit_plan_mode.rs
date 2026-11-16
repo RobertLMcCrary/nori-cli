@@ -5,10 +5,12 @@
 //! written to a plan file.
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 
 use super::base::Tool;
-use crate::mcp::registry::{ToolContext, ToolResult};
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
 
 /// ExitPlanMode tool for signaling completion of plan mode
 #[derive(Debug, Default)]

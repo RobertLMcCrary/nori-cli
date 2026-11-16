@@ -97,7 +97,8 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn test_register_and_execute() {

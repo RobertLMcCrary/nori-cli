@@ -1,6 +1,7 @@
 //! Core strategy trait for permission modes
 
-use crate::session::{PermissionMode, ToolPermissionResult};
+use crate::session::PermissionMode;
+use crate::session::ToolPermissionResult;
 use serde_json::Value;
 
 /// Strategy trait for permission mode checking

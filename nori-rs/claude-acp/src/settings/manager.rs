@@ -3,9 +3,11 @@
 //! Handles loading, merging, and accessing settings from multiple sources.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use super::rule::PermissionSettings;
 use crate::types::Result;

@@ -54,11 +54,15 @@ fn every_global_is_reviewed() {
         "on-commit",
         "on-pr",
         "on-stop",
+        "on-ci-fail",
+        "on-ci-pass",
         "hook-after-change",
         "hook-after-turn",
         "hook-after-commit",
         "hook-before-pr",
         "hook-before-stop",
+        "hook-after-ci-fail",
+        "hook-after-ci-pass",
     ];
     let mut unreviewed: Vec<String> = engine
         .engine

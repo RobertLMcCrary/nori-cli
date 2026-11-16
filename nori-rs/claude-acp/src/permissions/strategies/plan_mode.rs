@@ -6,7 +6,8 @@
 //! to the codebase.
 
 use crate::permissions::strategies::PermissionModeStrategy;
-use crate::session::{PermissionMode, ToolPermissionResult};
+use crate::session::PermissionMode;
+use crate::session::ToolPermissionResult;
 use crate::utils::is_plans_directory_path;
 use serde_json::Value;
 

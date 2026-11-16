@@ -68,8 +68,10 @@ inside `define-workflow`, with Steel's thread-first macro `~>` (or its alias
 | `(on-change "prompt")` | Sent after a prompt turn that changed files. Alias: `hook-after-change`. |
 | `(on-turn "prompt")` | Sent after every prompt turn. Alias: `hook-after-turn`. |
 | `(on-commit "prompt")` | Sent after the agent creates a commit. Alias: `hook-after-commit`. |
-| `(on-pr "prompt")` | Sent before the agent opens or updates a pull request. Alias: `hook-before-pr`. |
+| `(on-pr "prompt")` | Given to the agent by the `pull_request` tool before it opens or updates a pull request. Alias: `hook-before-pr`. |
 | `(on-stop "prompt")` | Sent before the agent hands control back to the user. Alias: `hook-before-stop`. |
+| `(on-ci-fail "prompt")` | Sent when a check fails on a commit the agent pushed, after a report of what failed. Alias: `hook-after-ci-fail`. |
+| `(on-ci-pass "prompt")` | Sent when every check passes on a commit the agent pushed. Alias: `hook-after-ci-pass`. |
 | `(instruct "text")` | A standing instruction, given to the agent verbatim. |
 | `(commit-style style option ...)` | What commits look like and when they are made. |
 | `(commit-agent 'agent #:model "model")` | The agent, and optionally the model, that writes and batches the commits instead of the session's agent. |
@@ -101,7 +103,7 @@ and `pr` merge: an option left out keeps its current value, so
 | `#:max-files` | integer, at least 1 | Most files one pull request may touch. |
 | `#:base` | string | The branch pull requests target. |
 | `#:draft` | `#t` or `#f` | Open pull requests as drafts. |
-| `#:upstream-when` | `'never`, `'ask`, `'tests-pass`, or `'done` | Never push; ask first; push and open the pull request once tests pass; or do so when the task is complete. |
+| `#:upstream-when` | `'never`, `'ask`, `'tests-pass`, or `'done` | Never push; ask first; push and open the pull request once tests pass; or do so when the task is complete. `pull_request` refuses under `'never`, asks the user under `'ask`, and does not ask under the other two. |
 
 An unknown option, a repeated option, or a value of the wrong type is an error
 that names the form and shows the value it got.
@@ -115,6 +117,7 @@ that names the form and shows the value it got.
   (on-change "Commit what you just changed as focused commits; explain the why.")
   (on-stop "Run the tests that cover what you changed, and fix what fails.")
   (on-pr "Check that the description lists every user-visible change.")
+  (on-ci-fail "Fix what CI reports, push, and say what broke.")
   (commit-style 'conventional #:max-files 8 #:max-subject 72 #:atomic #t
                 #:batch 'per-change #:require-body #t)
   (commit-agent 'claude #:model "haiku")
@@ -185,6 +188,7 @@ Follow the "land" workflow:
 - After a turn that changes files, Nori will tell you: Commit what you just changed as focused commits; explain the why.
 - Before you open a pull request, Nori will tell you: Check that the description lists every user-visible change.
 - Before you stop, Nori will tell you: Run the tests that cover what you changed, and fix what fails.
+- When CI fails on a commit you pushed, Nori will tell you: Fix what CI reports, push, and say what broke.
 ```
 
 Hooks are listed so the agent expects them. Nori still sends each hook's prompt
@@ -215,9 +219,10 @@ workflow:
     moved), then `on-turn`, then `on-stop`;
   - after a hook turn: only `on-commit` and `on-stop`, so a hook's own edits
     never start another round;
-  - `on-stop` fires at most once per user turn; `on-pr` is never sent, because
-    Nori cannot see a pull request coming, so the agent follows it from its
-    rules.
+  - `on-stop` fires at most once per user turn.
+  - `on-pr` comes from the `pull_request` tool, which holds once per commit to
+    give it, and `on-ci-fail` and `on-ci-pass` from Nori's watch of the
+    pushed commit's checks. See [forge.md](forge.md).
 - **Budget.** At most `turns` hook turns follow one user turn (3 when the
   workflow does not say). A hook is only sent when the session is idle; the
   goal loop continues after it.

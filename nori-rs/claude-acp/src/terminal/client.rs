@@ -8,12 +8,19 @@ use std::time::Instant;
 
 use sacp::Client;
 use sacp::ConnectionTo;
-use sacp::schema::{
-    CreateTerminalRequest, CreateTerminalResponse, EnvVariable, KillTerminalRequest,
-    KillTerminalResponse, ReleaseTerminalRequest, ReleaseTerminalResponse, SessionId, TerminalId,
-    TerminalOutputRequest, TerminalOutputResponse, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse,
-};
+use sacp::schema::CreateTerminalRequest;
+use sacp::schema::CreateTerminalResponse;
+use sacp::schema::EnvVariable;
+use sacp::schema::KillTerminalRequest;
+use sacp::schema::KillTerminalResponse;
+use sacp::schema::ReleaseTerminalRequest;
+use sacp::schema::ReleaseTerminalResponse;
+use sacp::schema::SessionId;
+use sacp::schema::TerminalId;
+use sacp::schema::TerminalOutputRequest;
+use sacp::schema::TerminalOutputResponse;
+use sacp::schema::WaitForTerminalExitRequest;
+use sacp::schema::WaitForTerminalExitResponse;
 use tracing::instrument;
 
 use crate::types::AgentError;

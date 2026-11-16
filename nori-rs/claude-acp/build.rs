@@ -8,7 +8,8 @@ fn main() {
 #[cfg(feature = "bundled-cli")]
 mod bundled_cli {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    use std::path::PathBuf;
 
     pub fn copy_to_dist() {
         let manifest_dir = PathBuf::from(

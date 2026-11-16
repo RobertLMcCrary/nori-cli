@@ -2,12 +2,17 @@
 //!
 //! Monitors settings files for changes and triggers reloads.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{DebounceEventResult, DebouncedEventKind, Debouncer, new_debouncer};
+use notify::RecommendedWatcher;
+use notify::RecursiveMode;
+use notify_debouncer_mini::DebounceEventResult;
+use notify_debouncer_mini::DebouncedEventKind;
+use notify_debouncer_mini::Debouncer;
+use notify_debouncer_mini::new_debouncer;
 use tokio::sync::mpsc;
 
 /// Settings file watcher
@@ -190,7 +195,8 @@ pub enum WatcherError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
+    use std::fs::File;
+    use std::fs::{self};
     use std::io::Write;
     use tempfile::TempDir;
     use tokio::time::timeout;

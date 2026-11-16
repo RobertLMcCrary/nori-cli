@@ -5,13 +5,19 @@
 use std::io::IsTerminal;
 use std::sync::Arc;
 
+use sacp::ByteStreams;
+use sacp::Client;
+use sacp::ConnectionTo;
+use sacp::Dispatch;
 use sacp::role::acp::Agent;
-use sacp::schema::{
-    CancelNotification, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    SetSessionModeRequest,
-};
-use sacp::{ByteStreams, Client, ConnectionTo, Dispatch};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use sacp::schema::CancelNotification;
+use sacp::schema::InitializeRequest;
+use sacp::schema::LoadSessionRequest;
+use sacp::schema::NewSessionRequest;
+use sacp::schema::PromptRequest;
+use sacp::schema::SetSessionModeRequest;
+use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing_subscriber::layer::SubscriberExt;
@@ -20,7 +26,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 use super::core::ClaudeAcpAgent;
 use super::handlers;
 use crate::cli::Cli;
-use crate::types::{AgentConfig, AgentError};
+use crate::types::AgentConfig;
+use crate::types::AgentError;
 
 // OpenTelemetry imports (only when feature is enabled)
 #[cfg(feature = "otel")]

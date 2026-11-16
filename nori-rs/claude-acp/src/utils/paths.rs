@@ -1,6 +1,7 @@
 //! Path utility functions
 
-use std::path::{Component, Path};
+use std::path::Component;
+use std::path::Path;
 
 /// Check if a file path is within the Claude plans directory (~/.claude/plans/)
 ///

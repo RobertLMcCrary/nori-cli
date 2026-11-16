@@ -7,6 +7,7 @@ mod callback_registry;
 mod post_tool_use;
 mod pre_tool_use;
 
-pub use callback_registry::{HookCallbackRegistry, PostToolUseCallback};
+pub use callback_registry::HookCallbackRegistry;
+pub use callback_registry::PostToolUseCallback;
 pub use post_tool_use::create_post_tool_use_hook;
 pub use pre_tool_use::create_pre_tool_use_hook;

@@ -9,7 +9,10 @@ use dashmap::DashMap;
 use tracing::instrument;
 
 use crate::mcp::SessionTools;
-use crate::types::{AgentConfig, AgentError, NewSessionMeta, Result};
+use crate::types::AgentConfig;
+use crate::types::AgentError;
+use crate::types::NewSessionMeta;
+use crate::types::Result;
 
 use super::session::Session;
 

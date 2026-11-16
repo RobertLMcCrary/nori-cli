@@ -10,6 +10,7 @@ each crate's `docs.md`.
 | [remote-control.md](remote-control.md) | Remote ACP transport behind `--remote` and `/remote-control` |
 | [nori-client-mcp.md](nori-client-mcp.md) | The backend-owned `nori-client` MCP server and goals |
 | [host-tools.md](host-tools.md) | Nori's tools handed straight to built-in agents, with no MCP server |
+| [forge.md](forge.md) | GitHub pull requests and CI: `ci_status`, `pull_request`, and CI hooks |
 | [warm-sessions.md](warm-sessions.md) | Agent sessions started ahead of time so switching is instant |
 | [headless.md](headless.md) | `nori exec` plaintext mode and the ACP stdio facade |
 | [transcripts.md](transcripts.md) | Transcript file locations and schema |

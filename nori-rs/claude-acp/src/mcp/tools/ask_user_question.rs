@@ -6,9 +6,12 @@
 //! asking is handled by the Claude agent SDK through its own mechanisms.
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 
-use crate::mcp::{Tool, ToolContext, ToolResult};
+use crate::mcp::Tool;
+use crate::mcp::ToolContext;
+use crate::mcp::ToolResult;
 
 /// Ask User Question tool
 #[derive(Debug, Clone, Default)]

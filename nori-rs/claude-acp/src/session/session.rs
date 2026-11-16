@@ -4,41 +4,62 @@
 //! ClaudeClient instance, usage tracking, and permission state.
 
 use dashmap::DashMap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::broadcast;
 
+use claude_code_agent_sdk::ClaudeAgentOptions;
+use claude_code_agent_sdk::ClaudeClient;
+use claude_code_agent_sdk::HookEvent;
+use claude_code_agent_sdk::HookMatcher;
+use claude_code_agent_sdk::McpServerConfig;
+use claude_code_agent_sdk::McpServers;
+use claude_code_agent_sdk::SettingSource;
+use claude_code_agent_sdk::SystemPrompt;
+use claude_code_agent_sdk::SystemPromptPreset;
 use claude_code_agent_sdk::types::config::PermissionMode as SdkPermissionMode;
 use claude_code_agent_sdk::types::mcp::McpSdkServerConfig;
-use claude_code_agent_sdk::{
-    ClaudeAgentOptions, ClaudeClient, HookEvent, HookMatcher, McpServerConfig, McpServers,
-    SettingSource, SystemPrompt, SystemPromptPreset,
-};
 use sacp::Client;
 use sacp::ConnectionTo;
-use sacp::schema::{
-    CurrentModeUpdate, SessionId, SessionModeId, SessionNotification, SessionUpdate,
-};
+use sacp::schema::CurrentModeUpdate;
+use sacp::schema::SessionId;
+use sacp::schema::SessionModeId;
+use sacp::schema::SessionNotification;
+use sacp::schema::SessionUpdate;
 use tokio::sync::RwLock;
 use tracing::instrument;
 
 use crate::converter::NotificationConverter;
-use crate::hooks::{HookCallbackRegistry, create_post_tool_use_hook, create_pre_tool_use_hook};
-use crate::mcp::{AcpMcpServer, HostToolsBinding, SessionTools};
+use crate::hooks::HookCallbackRegistry;
+use crate::hooks::create_post_tool_use_hook;
+use crate::hooks::create_pre_tool_use_hook;
+use crate::mcp::AcpMcpServer;
+use crate::mcp::HostToolsBinding;
+use crate::mcp::SessionTools;
 use crate::permissions::create_can_use_tool_callback;
-use crate::settings::{PermissionChecker, SettingsManager};
+use crate::settings::PermissionChecker;
+use crate::settings::SettingsManager;
 use crate::terminal::TerminalClient;
-use crate::types::{AgentConfig, AgentError, NewSessionMeta, Result};
+use crate::types::AgentConfig;
+use crate::types::AgentError;
+use crate::types::NewSessionMeta;
+use crate::types::Result;
 
 use super::BackgroundProcessManager;
 use super::background_processes::BackgroundTerminal;
-use super::permission::{PermissionHandler, PermissionMode};
+use super::permission::PermissionHandler;
+use super::permission::PermissionMode;
 use super::usage::UsageTracker;
+
+/// How long a closing session's CLI has to exit by itself before what is left is stopped.
+const CLI_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Get the list of tools that should be replaced by ACP MCP server tools.
 ///
@@ -454,8 +475,9 @@ impl Session {
         }
 
         // A new conversation takes the session's id, so loading or resuming it by that id later
-        // finds it. A resumed one keeps the id it was saved under.
-        if options.resume.is_none() {
+        // finds it, and so does a fork: the CLI saves the copy under the id it is given. A
+        // resumed one keeps the id it was saved under.
+        if options.resume.is_none() || options.fork_session {
             options
                 .extra_args
                 .insert("session-id".to_string(), Some(session_id.clone()));
@@ -1074,6 +1096,23 @@ impl Session {
             "Background processes cleanup completed"
         );
 
+        // 3. Stop the CLI. Closing its input lets it shut down the servers it started; whatever
+        // outlives it (a tool's command, a dev server) is stopped after. The tree is read first,
+        // because once the CLI is gone its orphans can no longer be traced back to it.
+        let session_id = self.session_id.clone();
+        let tree = tokio::task::spawn_blocking(move || {
+            crate::utils::descendants::session_tree(&session_id)
+        })
+        .await
+        .unwrap_or_default();
+        if tokio::time::timeout(CLI_EXIT_GRACE, self.disconnect())
+            .await
+            .is_err()
+        {
+            tracing::debug!(session_id = %self.session_id, "The Claude CLI did not exit in time");
+        }
+        crate::utils::descendants::terminate(&tree, std::time::Duration::from_millis(300)).await;
+
         let elapsed = start_time.elapsed();
         tracing::info!(
             session_id = %self.session_id,
@@ -1447,7 +1486,8 @@ mod tests {
     #[test]
     fn test_bundled_cli_version_valid() {
         use claude_code_agent_sdk::CLI_VERSION;
-        use claude_code_agent_sdk::version::{check_version, parse_version};
+        use claude_code_agent_sdk::version::check_version;
+        use claude_code_agent_sdk::version::parse_version;
 
         // CLI_VERSION must parse as valid semver
         let parsed = parse_version(CLI_VERSION);

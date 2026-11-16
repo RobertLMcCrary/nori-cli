@@ -4,7 +4,8 @@
 //! It's compatible with root user environments where BypassPermissions cannot be used.
 
 use crate::permissions::strategies::PermissionModeStrategy;
-use crate::session::{PermissionMode, ToolPermissionResult};
+use crate::session::PermissionMode;
+use crate::session::ToolPermissionResult;
 use serde_json::Value;
 
 /// Strategy for AcceptEdits mode - auto-approve all tools

@@ -4,13 +4,16 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
+use tokio::time::timeout;
 
 use super::base::Tool;
-use crate::mcp::registry::{ToolContext, ToolResult};
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
 
 /// Maximum output size in characters
 const MAX_OUTPUT_SIZE: usize = 50_000;
@@ -396,7 +399,8 @@ impl Tool for GrepTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
+    use std::fs::File;
+    use std::fs::{self};
     use std::io::Write;
     use tempfile::TempDir;
 

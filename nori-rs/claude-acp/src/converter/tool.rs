@@ -2,8 +2,10 @@
 //!
 //! Extracts user-friendly information from tool calls for UI display.
 
-use crate::types::{ToolInfo, ToolKind};
-use std::path::{Path, PathBuf};
+use crate::types::ToolInfo;
+use crate::types::ToolKind;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// ACP tool name prefix for SDK MCP server tools
 const ACP_TOOL_PREFIX: &str = "mcp__acp__";

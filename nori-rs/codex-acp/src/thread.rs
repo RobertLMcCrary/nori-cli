@@ -1,90 +1,180 @@
-use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::future::Future;
+use std::path::Path;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::time::Duration;
 
-use agent_client_protocol::{
-    Client, ConnectionTo, Error,
-    schema::{
-        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
-        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-        SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
-        TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-        UsageUpdate,
-    },
-};
+use agent_client_protocol::Client;
+use agent_client_protocol::ConnectionTo;
+use agent_client_protocol::Error;
+use agent_client_protocol::schema::AvailableCommand;
+use agent_client_protocol::schema::AvailableCommandInput;
+use agent_client_protocol::schema::AvailableCommandsUpdate;
+use agent_client_protocol::schema::ClientCapabilities;
+use agent_client_protocol::schema::ConfigOptionUpdate;
+use agent_client_protocol::schema::Content;
+use agent_client_protocol::schema::ContentBlock;
+use agent_client_protocol::schema::ContentChunk;
+use agent_client_protocol::schema::Diff;
+use agent_client_protocol::schema::EmbeddedResource;
+use agent_client_protocol::schema::EmbeddedResourceResource;
+use agent_client_protocol::schema::ImageContent;
+use agent_client_protocol::schema::LoadSessionResponse;
+use agent_client_protocol::schema::Meta;
+use agent_client_protocol::schema::PermissionOption;
+use agent_client_protocol::schema::PermissionOptionKind;
+use agent_client_protocol::schema::Plan;
+use agent_client_protocol::schema::PlanEntry;
+use agent_client_protocol::schema::PlanEntryPriority;
+use agent_client_protocol::schema::PlanEntryStatus;
+use agent_client_protocol::schema::PromptRequest;
+use agent_client_protocol::schema::RequestPermissionOutcome;
+use agent_client_protocol::schema::RequestPermissionRequest;
+use agent_client_protocol::schema::RequestPermissionResponse;
+use agent_client_protocol::schema::ResourceLink;
+use agent_client_protocol::schema::SelectedPermissionOutcome;
+use agent_client_protocol::schema::SessionConfigId;
+use agent_client_protocol::schema::SessionConfigOption;
+use agent_client_protocol::schema::SessionConfigOptionCategory;
+use agent_client_protocol::schema::SessionConfigOptionValue;
+use agent_client_protocol::schema::SessionConfigSelectOption;
+use agent_client_protocol::schema::SessionConfigValueId;
+use agent_client_protocol::schema::SessionId;
+use agent_client_protocol::schema::SessionMode;
+use agent_client_protocol::schema::SessionModeId;
+use agent_client_protocol::schema::SessionModeState;
+use agent_client_protocol::schema::SessionNotification;
+use agent_client_protocol::schema::SessionUpdate;
+use agent_client_protocol::schema::StopReason;
+use agent_client_protocol::schema::Terminal;
+use agent_client_protocol::schema::TextContent;
+use agent_client_protocol::schema::TextResourceContents;
+use agent_client_protocol::schema::ToolCall;
+use agent_client_protocol::schema::ToolCallContent;
+use agent_client_protocol::schema::ToolCallId;
+use agent_client_protocol::schema::ToolCallLocation;
+use agent_client_protocol::schema::ToolCallStatus;
+use agent_client_protocol::schema::ToolCallUpdate;
+use agent_client_protocol::schema::ToolCallUpdateFields;
+use agent_client_protocol::schema::ToolKind;
+use agent_client_protocol::schema::UnstructuredCommandInput;
+use agent_client_protocol::schema::UsageUpdate;
 use codex_apply_patch::parse_patch;
-use codex_core::{
-    CodexThread,
-    config::{Config, set_project_trust_level},
-    review_prompts::user_facing_hint,
-};
+use codex_core::CodexThread;
+use codex_core::config::Config;
+use codex_core::config::set_project_trust_level;
+use codex_core::review_prompts::user_facing_hint;
 use codex_history::RolloutItem;
 use codex_login::auth::AuthManager;
-use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::RefreshStrategy;
+use codex_protocol::approvals::ElicitationRequest;
+use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::approvals::GuardianAssessmentAction;
+use codex_protocol::approvals::GuardianCommandSource;
+use codex_protocol::config_types::TrustLevel;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolCallRequest;
+use codex_protocol::error::CodexErr;
+use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::models::WebSearchAction;
+use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::plan_tool::PlanItemArg;
+use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::AgentMessageContentDeltaEvent;
+use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AgentReasoningEvent;
+use codex_protocol::protocol::AgentReasoningRawContentEvent;
+use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
+use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+use codex_protocol::protocol::DynamicToolCallResponseEvent;
+use codex_protocol::protocol::ElicitationAction;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecApprovalRequestEvent;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecCommandStatus;
+use codex_protocol::protocol::ExitedReviewModeEvent;
+use codex_protocol::protocol::FileChange;
+use codex_protocol::protocol::GuardianAssessmentEvent;
+use codex_protocol::protocol::GuardianAssessmentStatus;
+use codex_protocol::protocol::ImageGenerationBeginEvent;
+use codex_protocol::protocol::ImageGenerationEndEvent;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ItemStartedEvent;
+use codex_protocol::protocol::McpInvocation;
+use codex_protocol::protocol::McpStartupCompleteEvent;
+use codex_protocol::protocol::McpStartupUpdateEvent;
+use codex_protocol::protocol::McpToolCallBeginEvent;
+use codex_protocol::protocol::McpToolCallEndEvent;
+use codex_protocol::protocol::ModelRerouteEvent;
+use codex_protocol::protocol::NetworkApprovalContext;
+use codex_protocol::protocol::NetworkPolicyRuleAction;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::PatchApplyBeginEvent;
+use codex_protocol::protocol::PatchApplyEndEvent;
+use codex_protocol::protocol::PatchApplyStatus;
+use codex_protocol::protocol::PatchApplyUpdatedEvent;
+use codex_protocol::protocol::ReasoningContentDeltaEvent;
+use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
+use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::protocol::ReviewRequest;
+use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::StreamErrorEvent;
+use codex_protocol::protocol::TerminalInteractionEvent;
+use codex_protocol::protocol::ThreadGoalStatus;
+use codex_protocol::protocol::ThreadGoalUpdatedEvent;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::TokenCountEvent;
+use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::ViewImageToolCallEvent;
+use codex_protocol::protocol::WarningEvent;
+use codex_protocol::protocol::WebSearchBeginEvent;
+use codex_protocol::protocol::WebSearchEndEvent;
+use codex_protocol::request_permissions::PermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile;
+use codex_protocol::request_permissions::RequestPermissionsEvent;
+use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::review_format::format_review_findings_block;
-use codex_protocol::turn_input::{TurnInputMode, TurnInputSubmission};
-use codex_protocol::{
-    approvals::{
-        ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
-        GuardianCommandSource,
-    },
-    config_types::TrustLevel,
-    dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
-    error::CodexErr,
-    mcp::CallToolResult,
-    models::{
-        ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
-        WebSearchAction,
-    },
-    openai_models::{ModelPreset, ReasoningEffort},
-    parse_command::ParsedCommand,
-    permissions::{
-        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSpecialPath,
-    },
-    plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
-    protocol::{
-        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
-        ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
-        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, StreamErrorEvent, TerminalInteractionEvent,
-        ThreadGoalStatus, ThreadGoalUpdatedEvent, ThreadSettingsOverrides, TokenCountEvent,
-        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
-    },
-    request_permissions::{
-        PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
-        RequestPermissionsResponse,
-    },
-    user_input::UserInput,
-};
+use codex_protocol::turn_input::TurnInputMode;
+use codex_protocol::turn_input::TurnInputSubmission;
+use codex_protocol::user_input::UserInput;
 use codex_shell_command::parse_command::parse_command;
-use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
+use codex_utils_approval_presets::ApprovalPreset;
+use codex_utils_approval_presets::builtin_approval_presets;
 use heck::ToTitleCase;
 use itertools::Itertools;
 use nori_host_tools::HostTools;
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tracing::debug;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 /// Abstraction over the ACP connection for sending notifications and requests
@@ -4208,14 +4298,20 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
-    use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
+    use agent_client_protocol::schema::RequestPermissionResponse;
+    use agent_client_protocol::schema::TextContent;
+    use codex_core::config::ConfigOverrides;
+    use codex_core::test_support::all_model_presets;
     use codex_core_api::TurnInput;
+    use codex_protocol::ThreadId;
     use codex_protocol::config_types::ModeKind;
-    use codex_protocol::{ThreadId, protocol::ThreadGoal};
-    use codex_utils_path_uri::{LegacyAppPathString, PathUri};
+    use codex_protocol::protocol::ThreadGoal;
+    use codex_utils_path_uri::LegacyAppPathString;
+    use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
-    use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
+    use tokio::sync::Mutex;
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::UnboundedSender;
 
     use super::*;
 

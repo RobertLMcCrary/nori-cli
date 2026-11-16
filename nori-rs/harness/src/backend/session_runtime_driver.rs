@@ -596,6 +596,8 @@ impl AcpBackend {
         // Results that arrived while the turn ran are handed over now, unless the turn queued
         // another.
         self.deliver_task_results_if_idle().await;
+        self.maybe_watch_ci().await;
+        self.deliver_ci_if_idle().await;
     }
 
     async fn maybe_submit_goal_continuation(&self, completed_turn: &CompletedTurn) {

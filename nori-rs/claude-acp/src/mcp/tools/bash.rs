@@ -9,15 +9,22 @@ use serde::Deserialize;
 use serde_json::json;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::time::Duration;
+use std::time::Instant;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use super::base::{Tool, ToolKind};
-use crate::mcp::registry::{ToolContext, ToolResult};
-use crate::session::{BackgroundTerminal, ChildHandle, TerminalExitStatus, WrappedChild};
+use super::base::Tool;
+use super::base::ToolKind;
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
+use crate::session::BackgroundTerminal;
+use crate::session::ChildHandle;
+use crate::session::TerminalExitStatus;
+use crate::session::WrappedChild;
 use crate::terminal::TerminalClient;
 
 // Process group management

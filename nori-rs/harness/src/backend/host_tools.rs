@@ -129,6 +129,8 @@ async fn dispatch(
         "git_diff" => service.git_diff(parameters(arguments)?).await,
         "git_log" => service.git_log(parameters(arguments)?).await,
         "git_commit" => service.git_commit(parameters(arguments)?).await,
+        "ci_status" => service.ci_status(parameters(arguments)?).await,
+        "pull_request" => service.pull_request(parameters(arguments)?).await,
         "agent_capabilities" => {
             no_arguments(name, &arguments)?;
             service.agent_capabilities().await
@@ -176,6 +178,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::backend::nori_client_mcp::Workspace;
     use crate::backend::orchestrator::Orchestrator;
     use crate::backend::orchestrator::Seed;
     use crate::backend::thread_goal::ThreadGoalState;
@@ -207,7 +210,10 @@ mod tests {
         );
         NoriHostTools {
             service: NoriClientService::new(match cwd {
-                Some(cwd) => shared.with_cwd(cwd),
+                Some(cwd) => shared.with_workspace(Workspace {
+                    cwd,
+                    workflow: Arc::default(),
+                }),
                 None => shared,
             }),
         }
@@ -224,6 +230,7 @@ mod tests {
             names,
             vec![
                 "agent_capabilities",
+                "ci_status",
                 "create_goal",
                 "delegate_task",
                 "get_goal",
@@ -231,6 +238,7 @@ mod tests {
                 "git_diff",
                 "git_log",
                 "git_status",
+                "pull_request",
                 "task_cancel",
                 "task_list",
                 "task_send",

@@ -1,0 +1,10 @@
+---
+source: tui/src/client_tool_cell.rs
+expression: "render_lines(&cell.display_lines(80)).join(\"\\n\")"
+---
+⇡ Pull request not opened
+  ├ The "land" workflow's pull request rules are not met:
+  ├ - The description has no "Testing" section.
+  ├ - It changes 812 lines; at most 400 are allowed: split the work into a
+  │ series of pull requests.
+  └ Fix this, then call pull_request again.

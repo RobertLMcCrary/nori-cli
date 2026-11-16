@@ -41,6 +41,7 @@ dirs = { workspace = true }
 diffy = { workspace = true }
 nori-acp-host = { workspace = true }
 nori-config = { workspace = true }
+nori-forge = { workspace = true }
 nori-host-tools = { workspace = true }
 nori-script = { workspace = true }
 notify-rust = { workspace = true }
@@ -67,3 +68,4 @@ serial_test = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 which = { workspace = true }
+wiremock = { workspace = true }

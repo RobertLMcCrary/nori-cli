@@ -3,7 +3,9 @@
 //! This module provides predefined slash commands that are sent to clients
 //! via the ACP protocol's `available_commands_update` notification.
 
-use sacp::schema::{AvailableCommand, AvailableCommandInput, UnstructuredCommandInput};
+use sacp::schema::AvailableCommand;
+use sacp::schema::AvailableCommandInput;
+use sacp::schema::UnstructuredCommandInput;
 
 /// Cached regex for matching MCP command format
 /// Pattern: /mcp:server:name [args]

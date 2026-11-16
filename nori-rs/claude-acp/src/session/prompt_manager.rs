@@ -65,7 +65,8 @@ impl PromptManager {
     /// Returns `true` if an old prompt was cancelled, `false` if there was
     /// no active prompt for this session.
     pub async fn cancel_session_prompt(&self, session_id: &str) -> bool {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::Duration;
+        use tokio::time::timeout;
 
         const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 

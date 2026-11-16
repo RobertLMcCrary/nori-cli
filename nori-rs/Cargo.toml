@@ -31,6 +31,7 @@ members = [
     "utils/pty",
     "utils/readiness",
     "utils/string",
+    "forge",
     "harness",
     "host-tools",
     "installed",
@@ -83,6 +84,7 @@ codex-utils-string = { path = "utils/string" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
 core_test_support = { path = "core/tests/common" }
 mcp-types = { path = "mcp-types" }
+nori-forge = { path = "forge" }
 nori-harness = { path = "harness" }
 nori-host-tools = { path = "host-tools" }
 nori-exec = { path = "exec" }

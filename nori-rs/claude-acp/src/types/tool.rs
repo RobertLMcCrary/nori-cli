@@ -1,6 +1,7 @@
 //! Tool-related types for ACP notifications
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Tool kind for categorizing tools in UI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

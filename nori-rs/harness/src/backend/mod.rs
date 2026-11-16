@@ -390,6 +390,8 @@ fn session_context_for_connection(
 pub mod browser_profile;
 #[cfg(unix)]
 pub mod browser_session;
+mod ci_watch;
+mod forge_tools;
 mod git_tools;
 mod goal_ext;
 mod host_tools;

@@ -7,16 +7,24 @@
 //! has (`mcp_message`), and each call runs Nori's code directly. No socket, port or process.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
-use claude_code_agent_sdk::types::mcp::{
-    McpHttpServerConfig, McpSdkServerConfig, McpSseServerConfig, McpStdioServerConfig,
-};
-use claude_code_agent_sdk::{McpServerConfig, SdkMcpServer, ToolDefinition};
-use nori_host_tools::{HostToolOutput, HostToolSpec, HostTools};
-use sacp::schema::{McpServer, Meta};
-use serde_json::{Value, json};
+use claude_code_agent_sdk::McpServerConfig;
+use claude_code_agent_sdk::SdkMcpServer;
+use claude_code_agent_sdk::ToolDefinition;
+use claude_code_agent_sdk::types::mcp::McpHttpServerConfig;
+use claude_code_agent_sdk::types::mcp::McpSdkServerConfig;
+use claude_code_agent_sdk::types::mcp::McpSseServerConfig;
+use claude_code_agent_sdk::types::mcp::McpStdioServerConfig;
+use nori_host_tools::HostToolOutput;
+use nori_host_tools::HostToolSpec;
+use nori_host_tools::HostTools;
+use sacp::schema::McpServer;
+use sacp::schema::Meta;
+use serde_json::Value;
+use serde_json::json;
 
 /// The tools of one session, as the client asked for them.
 #[derive(Clone, Default)]
@@ -92,7 +100,9 @@ impl SessionTools {
                     }),
                 ),
                 _ => {
-                    tracing::warn!("Skipping an MCP server of a transport this driver does not know");
+                    tracing::warn!(
+                        "Skipping an MCP server of a transport this driver does not know"
+                    );
                     continue;
                 }
             };
@@ -263,7 +273,10 @@ impl SdkMcpServer for HostToolsServer {
 mod tests {
     use nori_host_tools::HostToolFuture;
     use pretty_assertions::assert_eq;
-    use sacp::schema::{EnvVariable, HttpHeader, McpServerHttp, McpServerStdio};
+    use sacp::schema::EnvVariable;
+    use sacp::schema::HttpHeader;
+    use sacp::schema::McpServerHttp;
+    use sacp::schema::McpServerStdio;
 
     use super::*;
 
@@ -367,7 +380,11 @@ mod tests {
             panic!("stdio");
         };
         assert_eq!(
-            (files.command.as_str(), files.args.clone(), files.env.clone()),
+            (
+                files.command.as_str(),
+                files.args.clone(),
+                files.env.clone()
+            ),
             (
                 "/bin/files",
                 Some(vec!["--root".to_owned()]),

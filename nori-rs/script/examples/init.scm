@@ -6,6 +6,7 @@
   (on-change "Commit what you just changed as focused commits; explain the why.")
   (on-stop "Run the tests that cover what you changed, and fix what fails.")
   (on-pr "Check that the description lists every user-visible change.")
+  (on-ci-fail "Fix what CI reports, push, and say what broke.")
   (commit-style 'conventional #:max-files 8 #:max-subject 72 #:atomic #t
                 #:batch 'per-change #:require-body #t)
   (commit-agent 'claude #:model "haiku")

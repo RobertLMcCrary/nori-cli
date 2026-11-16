@@ -167,6 +167,7 @@ impl AcpBackend {
         let thread_goal_state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
         let goal_mcp_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let goal_mcp_http_server = Arc::new(Mutex::new(None));
+        let workflow: Arc<Mutex<workflow::WorkflowState>> = Arc::default();
 
         let mut mcp_servers = crate::connection::mcp::to_acp_mcp_servers(
             &config.mcp_servers,
@@ -179,7 +180,10 @@ impl AcpBackend {
             backend_event_tx.clone(),
             Arc::clone(&goal_mcp_connected),
             orchestrator.clone(),
-            &cwd,
+            nori_client_mcp::Workspace {
+                cwd: cwd.clone(),
+                workflow: Arc::clone(&workflow),
+            },
         )
         .await?;
         if let Some(server) = nori_client_server {
@@ -310,7 +314,7 @@ impl AcpBackend {
             notify_after_idle: config.notify_after_idle,
             edit_journal: Arc::new(EditJournal::new()),
             is_first_prompt: Arc::new(Mutex::new(true)),
-            workflow: Arc::default(),
+            workflow,
             prompt_summary_enabled: config.prompt_summary_enabled,
             agent_name: config.agent.clone(),
             cli_version: config.cli_version.clone(),

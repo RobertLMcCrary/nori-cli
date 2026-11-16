@@ -1,47 +1,99 @@
-use acp::schema::{
-    AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
-    AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse,
-};
-use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
+use acp::Agent;
+use acp::Client;
+use acp::ConnectTo;
+use acp::ConnectionTo;
+use acp::Error;
+use acp::schema::AgentAuthCapabilities;
+use acp::schema::AgentCapabilities;
+use acp::schema::AuthEnvVar;
+use acp::schema::AuthMethod;
+use acp::schema::AuthMethodAgent;
+use acp::schema::AuthMethodEnvVar;
+use acp::schema::AuthMethodId;
+use acp::schema::AuthenticateRequest;
+use acp::schema::AuthenticateResponse;
+use acp::schema::CancelNotification;
+use acp::schema::ClientCapabilities;
+use acp::schema::CloseSessionRequest;
+use acp::schema::CloseSessionResponse;
+use acp::schema::Implementation;
+use acp::schema::InitializeRequest;
+use acp::schema::InitializeResponse;
+use acp::schema::ListSessionsRequest;
+use acp::schema::ListSessionsResponse;
+use acp::schema::LoadSessionRequest;
+use acp::schema::LoadSessionResponse;
+use acp::schema::LogoutCapabilities;
+use acp::schema::LogoutRequest;
+use acp::schema::LogoutResponse;
+use acp::schema::McpCapabilities;
+use acp::schema::McpServer;
+use acp::schema::McpServerHttp;
+use acp::schema::McpServerStdio;
+use acp::schema::NewSessionRequest;
+use acp::schema::NewSessionResponse;
+use acp::schema::PromptCapabilities;
+use acp::schema::PromptRequest;
+use acp::schema::PromptResponse;
+use acp::schema::ProtocolVersion;
+use acp::schema::ResumeSessionRequest;
+use acp::schema::ResumeSessionResponse;
+use acp::schema::SessionCapabilities;
+use acp::schema::SessionCloseCapabilities;
+use acp::schema::SessionId;
+use acp::schema::SessionInfo;
+use acp::schema::SessionListCapabilities;
+use acp::schema::SessionResumeCapabilities;
+use acp::schema::SetSessionConfigOptionRequest;
+use acp::schema::SetSessionConfigOptionResponse;
+use acp::schema::SetSessionModeRequest;
+use acp::schema::SetSessionModeResponse;
 use agent_client_protocol as acp;
-use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
-use codex_core::{
-    NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
-    find_thread_path_by_id_str, init_state_db, resolve_installation_id,
-};
-use codex_core_api::{
-    CodexAppsToolsCache, CodexHomeUserInstructionsProvider, EnvironmentManager,
-    ExecServerRuntimeOptions, ExtensionRegistryBuilder, ModelCatalogSettings, StartThreadOptions,
-    ThreadStoreBuilder, build_startup_models, install_image_generation_extension,
-    local_agent_graph_store_from_state_db, passthrough_image_store,
-};
+use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
+use codex_config::McpServerConfig;
+use codex_config::McpServerTransportConfig;
+use codex_core::NewThread;
+use codex_core::RolloutRecorder;
+use codex_core::StateDbHandle;
+use codex_core::ThreadManager;
+use codex_core::config::Config;
+use codex_core::find_thread_path_by_id_str;
+use codex_core::init_state_db;
+use codex_core::resolve_installation_id;
+use codex_core_api::CodexAppsToolsCache;
+use codex_core_api::CodexHomeUserInstructionsProvider;
+use codex_core_api::EnvironmentManager;
+use codex_core_api::ExecServerRuntimeOptions;
+use codex_core_api::ExtensionRegistryBuilder;
+use codex_core_api::ModelCatalogSettings;
+use codex_core_api::StartThreadOptions;
+use codex_core_api::ThreadStoreBuilder;
+use codex_core_api::build_startup_models;
+use codex_core_api::install_image_generation_extension;
+use codex_core_api::local_agent_graph_store_from_state_db;
+use codex_core_api::passthrough_image_store;
 use codex_history::InitialHistory;
-use codex_login::{
-    CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
-    auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
-};
+use codex_login::CODEX_API_KEY_ENV_VAR;
+use codex_login::OPENAI_API_KEY_ENV_VAR;
+use codex_login::auth::AuthManager;
+use codex_login::auth::CodexAuth;
+use codex_login::auth::read_codex_api_key_from_env;
+use codex_login::auth::read_openai_api_key_from_env;
+use codex_protocol::ThreadId;
 use codex_protocol::mcp::ClientMcpExtensions;
-use codex_protocol::{ThreadId, protocol::SessionSource};
-use codex_thread_store::{
-    ListThreadsParams, SortDirection as StoreSortDirection, ThreadSortKey as StoreThreadSortKey,
-    ThreadStore,
-};
+use codex_protocol::protocol::SessionSource;
+use codex_thread_store::ListThreadsParams;
+use codex_thread_store::SortDirection as StoreSortDirection;
+use codex_thread_store::ThreadSortKey as StoreThreadSortKey;
+use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::LegacyAppPathString;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
-use tracing::{debug, info};
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use tracing::debug;
+use tracing::info;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::thread::Thread;

@@ -9590,6 +9590,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nori-forge"
+version = "0.0.0"
+dependencies = [
+ "dirs",
+ "pretty_assertions",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "nori-harness"
 version = "0.0.0"
 dependencies = [
@@ -9608,6 +9622,7 @@ dependencies = [
  "memchr",
  "nori-acp-host",
  "nori-config",
+ "nori-forge",
  "nori-host-tools",
  "nori-protocol",
  "nori-script",
@@ -9634,6 +9649,7 @@ dependencies = [
  "tree-sitter-bash",
  "uuid",
  "which 6.0.3",
+ "wiremock",
 ]
 
 [[package]]

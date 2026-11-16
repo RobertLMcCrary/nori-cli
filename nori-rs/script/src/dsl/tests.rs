@@ -118,7 +118,8 @@ fn every_hook_form_and_alias_maps_to_its_event() {
 (~> (workflow 'hooks)
     (on-change "a") (on-turn "b") (on-commit "c") (on-pr "d") (on-stop "e")
     (hook-after-change "f") (hook-after-turn "g") (hook-after-commit "h")
-    (hook-before-pr "i") (hook-before-stop "j"))
+    (hook-before-pr "i") (hook-before-stop "j")
+    (on-ci-fail "k") (on-ci-pass "l") (hook-after-ci-fail "m") (hook-after-ci-pass "n"))
 "#;
     let hook = |event, prompt: &str| Hook {
         event,
@@ -137,6 +138,10 @@ fn every_hook_form_and_alias_maps_to_its_event() {
             hook(HookEvent::AfterCommit, "h"),
             hook(HookEvent::BeforePr, "i"),
             hook(HookEvent::BeforeStop, "j"),
+            hook(HookEvent::CiFailed, "k"),
+            hook(HookEvent::CiPassed, "l"),
+            hook(HookEvent::CiFailed, "m"),
+            hook(HookEvent::CiPassed, "n"),
         ]
     );
 }

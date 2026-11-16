@@ -1,12 +1,16 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-use agent_client_protocol::{Agent, ByteStreams, ConnectTo};
-use codex_core::config::{ConfigBuilder, ConfigOverrides};
+use agent_client_protocol::Agent;
+use agent_client_protocol::ByteStreams;
+use agent_client_protocol::ConnectTo;
+use codex_core::config::ConfigBuilder;
+use codex_core::config::ConfigOverrides;
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;

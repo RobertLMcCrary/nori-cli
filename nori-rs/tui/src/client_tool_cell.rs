@@ -409,9 +409,13 @@ impl ClientToolCell {
         lines
     }
 
-    /// One of Nori's git or goal tools: what it did, with a glyph for what it is and a tone for
-    /// every piece of text, and its details hung off a small tree.
-    fn render_native_lines(&self, call: &crate::presentation::NativeCall) -> Vec<Line<'static>> {
+    /// One of Nori's own tools: what it did, with a glyph for what it is and a tone for every
+    /// piece of text, and its details hung off a small tree. Long lines wrap under their branch.
+    fn render_native_lines(
+        &self,
+        call: &crate::presentation::NativeCall,
+        width: u16,
+    ) -> Vec<Line<'static>> {
         use crate::presentation::NativeTone as Tone;
 
         let active = self.is_active();
@@ -452,15 +456,19 @@ impl ClientToolCell {
                 .into_iter()
                 .map(|part| style(part.text, part.tone)),
         );
-        let mut lines = vec![Line::from(header)];
+        let width = usize::from(width.max(20));
+        let mut lines = crate::wrapping::word_wrap_lines(
+            [Line::from(header)],
+            crate::wrapping::RtOptions::new(width).subsequent_indent("  ".into()),
+        );
         let count = view.detail.len();
         for (index, detail) in view.detail.into_iter().enumerate() {
-            let connector = if index + 1 == count {
-                "  └ "
+            let (connector, continuation) = if index + 1 == count {
+                ("  └ ", "    ")
             } else {
-                "  ├ "
+                ("  ├ ", "  │ ")
             };
-            let mut spans = vec![connector.dim()];
+            let mut spans = Vec::new();
             if let Some((marker, tone)) = detail.marker {
                 spans.push(style(marker.to_string(), tone));
                 spans.push(" ".into());
@@ -472,7 +480,12 @@ impl ClientToolCell {
                     .into_iter()
                     .map(|part| style(part.text, part.tone)),
             );
-            lines.push(Line::from(spans));
+            lines.extend(crate::wrapping::word_wrap_lines(
+                [Line::from(spans)],
+                crate::wrapping::RtOptions::new(width)
+                    .initial_indent(connector.dim().into())
+                    .subsequent_indent(continuation.dim().into()),
+            ));
         }
         lines
     }
@@ -950,7 +963,7 @@ impl HistoryCell for ClientToolCell {
         } else if let Some(crate::presentation::Invocation::Native(call)) =
             &self.snapshot.invocation
         {
-            self.render_native_lines(call)
+            self.render_native_lines(call, width)
         } else if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
             self.render_exploring_lines(width)
         } else if self.snapshot.kind == crate::presentation::ToolKind::Execute {
@@ -974,7 +987,7 @@ impl HistoryCell for ClientToolCell {
         } else if let Some(crate::presentation::Invocation::Native(call)) =
             &self.snapshot.invocation
         {
-            self.render_native_lines(call)
+            self.render_native_lines(call, width)
         } else if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
             self.render_exploring_lines(width)
         } else if self.snapshot.kind == crate::presentation::ToolKind::Execute {
@@ -2827,6 +2840,54 @@ mod tests {
                 serde_json::json!({"limit": 3}),
                 ToolPhase::Completed,
                 Some(log),
+            ),
+            PathBuf::from("/tmp/test-cwd"),
+            false,
+        );
+        insta::assert_snapshot!(render_lines(&cell.display_lines(80)).join("\n"));
+    }
+
+    #[test]
+    fn ci_status_names_what_failed_and_why() {
+        let status = r#"{"repo":"o/r","branch":"perf/instant-core","pushed":"abc","head_pushed":true,"pull_request":{"number":412,"title":"Instant agent switching","url":"https://github.com/o/r/pull/412","state":"open","draft":false,"base":"main","head":"perf/instant-core","head_sha":"abc"},"checks":{"state":"failing","passed":7,"failed":[{"name":"Run Tests","state":"failed","log":"error[E0308]: mismatched types\nerror: Process completed with exit code 101.\n"}],"running":[{"name":"Build Native (aarch64-apple-darwin)","state":"running"}]}}"#;
+        let cell = ClientToolCell::new(
+            native_snapshot(
+                "mcp__nori-client__ci_status",
+                serde_json::json!({"logs": true}),
+                ToolPhase::Completed,
+                Some(status),
+            ),
+            PathBuf::from("/tmp/test-cwd"),
+            false,
+        );
+        insta::assert_snapshot!(render_lines(&cell.display_lines(80)).join("\n"));
+    }
+
+    #[test]
+    fn an_opened_pull_request_links_to_itself() {
+        let opened = r#"{"created":true,"pull_request":{"number":413,"title":"feat(forge): CI status and pull requests","url":"https://github.com/o/r/pull/413","state":"open","draft":true,"base":"main","head":"feat/forge","head_sha":"abc"}}"#;
+        let cell = ClientToolCell::new(
+            native_snapshot(
+                "mcp__nori-client__pull_request",
+                serde_json::json!({"title": "feat(forge): CI status and pull requests", "body": "## Why"}),
+                ToolPhase::Completed,
+                Some(opened),
+            ),
+            PathBuf::from("/tmp/test-cwd"),
+            false,
+        );
+        insta::assert_snapshot!(render_lines(&cell.display_lines(80)).join("\n"));
+    }
+
+    #[test]
+    fn a_refused_pull_request_lists_the_broken_rules() {
+        let refusal = "The \"land\" workflow's pull request rules are not met:\n- The description has no \"Testing\" section.\n- It changes 812 lines; at most 400 are allowed: split the work into a series of pull requests.\nFix this, then call pull_request again.";
+        let cell = ClientToolCell::new(
+            native_snapshot(
+                "mcp__nori-client__pull_request",
+                serde_json::json!({"title": "t", "body": "b"}),
+                ToolPhase::Failed,
+                Some(refusal),
             ),
             PathBuf::from("/tmp/test-cwd"),
             false,

@@ -5,7 +5,8 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
 use tokio::process::Child;

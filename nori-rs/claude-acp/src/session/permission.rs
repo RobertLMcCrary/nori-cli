@@ -3,16 +3,20 @@
 //! This module provides permission checking using a strategy pattern,
 //! where each permission mode has its own strategy implementation.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::permissions::strategies::{
-    AcceptEditsModeStrategy, BypassPermissionsModeStrategy, DefaultModeStrategy,
-    DontAskModeStrategy, PermissionModeStrategy, PlanModeStrategy,
-};
-use crate::settings::{PermissionChecker, PermissionDecision};
+use crate::permissions::strategies::AcceptEditsModeStrategy;
+use crate::permissions::strategies::BypassPermissionsModeStrategy;
+use crate::permissions::strategies::DefaultModeStrategy;
+use crate::permissions::strategies::DontAskModeStrategy;
+use crate::permissions::strategies::PermissionModeStrategy;
+use crate::permissions::strategies::PlanModeStrategy;
+use crate::settings::PermissionChecker;
+use crate::settings::PermissionDecision;
 use claude_code_agent_sdk::PermissionMode as SdkPermissionMode;
 
 /// Permission mode for tool execution

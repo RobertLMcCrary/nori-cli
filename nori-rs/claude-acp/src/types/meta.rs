@@ -3,7 +3,8 @@
 //! ACP protocol's `new_session` and `load_session` requests support a `_meta` field
 //! for passing additional configuration.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// System prompt configuration from meta field
 ///

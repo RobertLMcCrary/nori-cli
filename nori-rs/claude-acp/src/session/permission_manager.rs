@@ -10,10 +10,14 @@ use std::sync::Arc;
 
 use sacp::Client;
 use sacp::ConnectionTo;
-use sacp::schema::{
-    PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, ToolCallUpdate, ToolCallUpdateFields,
-};
+use sacp::schema::PermissionOption;
+use sacp::schema::PermissionOptionId;
+use sacp::schema::PermissionOptionKind;
+use sacp::schema::RequestPermissionOutcome;
+use sacp::schema::RequestPermissionRequest;
+use sacp::schema::SessionId;
+use sacp::schema::ToolCallUpdate;
+use sacp::schema::ToolCallUpdateFields;
 
 use crate::types::AgentError;
 

@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use sacp::schema::{TerminalExitStatus, TerminalId, TerminalOutputResponse};
+use sacp::schema::TerminalExitStatus;
+use sacp::schema::TerminalId;
+use sacp::schema::TerminalOutputResponse;
 
 use super::TerminalClient;
 use crate::types::AgentError;

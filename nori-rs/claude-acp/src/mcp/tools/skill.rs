@@ -7,9 +7,12 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 
-use crate::mcp::{Tool, ToolContext, ToolResult};
+use crate::mcp::Tool;
+use crate::mcp::ToolContext;
+use crate::mcp::ToolResult;
 
 /// Skill tool
 #[derive(Debug, Default)]

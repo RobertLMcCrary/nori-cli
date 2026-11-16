@@ -56,15 +56,21 @@ pub enum HookEvent {
     BeforePr,
     /// The agent is about to hand control back to the user.
     BeforeStop,
+    /// A check failed on a commit the agent pushed.
+    CiFailed,
+    /// Every check passed on a commit the agent pushed.
+    CiPassed,
 }
 
 impl HookEvent {
-    pub const ALL: [HookEvent; 5] = [
+    pub const ALL: [HookEvent; 7] = [
         HookEvent::AfterChange,
         HookEvent::AfterTurn,
         HookEvent::AfterCommit,
         HookEvent::BeforePr,
         HookEvent::BeforeStop,
+        HookEvent::CiFailed,
+        HookEvent::CiPassed,
     ];
 
     /// The DSL form that declares a hook for this event.
@@ -75,6 +81,8 @@ impl HookEvent {
             HookEvent::AfterCommit => "on-commit",
             HookEvent::BeforePr => "on-pr",
             HookEvent::BeforeStop => "on-stop",
+            HookEvent::CiFailed => "on-ci-fail",
+            HookEvent::CiPassed => "on-ci-pass",
         }
     }
 }

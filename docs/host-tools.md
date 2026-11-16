@@ -1,9 +1,10 @@
 # Host tools
 
 Nori gives every agent a set of its own tools: goals (`get_goal`, `create_goal`,
-`update_goal`), git (`git_status`, `git_diff`, `git_log`, `git_commit`), and
-delegated tasks (`agent_capabilities`, `delegate_task`, `task_status`,
-`task_wait`, `task_send`, `task_cancel`, `task_list`). An agent built into
+`update_goal`), git (`git_status`, `git_diff`, `git_log`, `git_commit`), the
+forge (`ci_status`, `pull_request`; see [forge.md](forge.md)), and delegated
+tasks (`agent_capabilities`, `delegate_task`, `task_status`, `task_wait`,
+`task_send`, `task_cancel`, `task_list`). An agent built into
 Nori's process gets them as **host tools**: plain function calls into Nori, with
 no MCP server, port, socket or process between them. Every other agent gets the
 same tools from the `nori-client` MCP server (see
@@ -58,8 +59,9 @@ the tools `mcp__nori__<tool>`. They are pre-allowed in every permission mode:
 they are Nori's own, and Nori enforces their policy. The git tools,
 `delegate_task`, `task_status` and `task_wait` carry `anthropic/alwaysLoad`, so
 they stay loaded; the rest (`agent_capabilities`, `task_send`, `task_cancel`,
-`task_list`, the goal tools) are found through Claude Code's tool search when
-needed. The client's own MCP servers (stdio, HTTP,
+`task_list`, the goal tools, the forge tools) are found through Claude Code's
+tool search when needed. `pull_request` asks the user itself when the workflow
+says to (see [forge.md](forge.md)), so being pre-allowed skips no question. The client's own MCP servers (stdio, HTTP,
 SSE) are handed to the CLI's `--mcp-config` as they are; the CLI connects to
 them itself.
 
@@ -69,8 +71,8 @@ A call carrying `_meta.nori.hostTool` is recognized by that name
 (`NativeCall::from_tool`, `DelegationCall::from_tool`). A call from the MCP
 path is recognized from its title, which must name `nori-client` and one of the
 tools. Either way the call renders as what it did: `⎇` status and history, `±`
-diff with per-file `+added −removed`, `◆` commit, `◎` goal, and delegation as
-subagents.
+diff with per-file `+added −removed`, `◆` commit, `◎` goal, `◉` CI, `⇡` pull request,
+and delegation as subagents.
 
 ## Adding a tool
 

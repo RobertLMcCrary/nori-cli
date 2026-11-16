@@ -5,11 +5,17 @@ use std::sync::Arc;
 
 use sacp::Client;
 use sacp::ConnectionTo;
-use sacp::schema::{
-    SessionId, SessionNotification, SessionUpdate, Terminal, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-};
-use serde::{Deserialize, Serialize};
+use sacp::schema::SessionId;
+use sacp::schema::SessionNotification;
+use sacp::schema::SessionUpdate;
+use sacp::schema::Terminal;
+use sacp::schema::ToolCallContent;
+use sacp::schema::ToolCallId;
+use sacp::schema::ToolCallStatus;
+use sacp::schema::ToolCallUpdate;
+use sacp::schema::ToolCallUpdateFields;
+use serde::Deserialize;
+use serde::Serialize;
 
 use super::tools::Tool;
 use crate::session::BackgroundProcessManager;

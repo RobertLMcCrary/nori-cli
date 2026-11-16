@@ -63,6 +63,8 @@ fn event_moment(event: HookEvent) -> &'static str {
         HookEvent::AfterCommit => "After each commit",
         HookEvent::BeforePr => "Before you open a pull request",
         HookEvent::BeforeStop => "Before you stop",
+        HookEvent::CiFailed => "When CI fails on a commit you pushed",
+        HookEvent::CiPassed => "When CI passes on a commit you pushed",
     }
 }
 

@@ -5,7 +5,8 @@
 
 use std::sync::Arc;
 
-use crate::session::{PromptManager, SessionManager};
+use crate::session::PromptManager;
+use crate::session::SessionManager;
 use crate::types::AgentConfig;
 
 /// Claude ACP Agent

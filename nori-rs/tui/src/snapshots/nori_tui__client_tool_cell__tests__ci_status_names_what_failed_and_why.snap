@@ -1,0 +1,8 @@
+---
+source: tui/src/client_tool_cell.rs
+expression: "render_lines(&cell.display_lines(80)).join(\"\\n\")"
+---
+◉ CI  perf/instant-core  ✗ 1 failed · 7 passed
+  ├ #412 Instant agent switching
+  ├ ✗ Run Tests  error[E0308]: mismatched types
+  └ ◌ Build Native (aarch64-apple-darwin)

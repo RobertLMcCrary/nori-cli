@@ -5,9 +5,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use claude_code_agent_sdk::{
-    HookCallback, HookContext, HookInput, HookJsonOutput, SyncHookJsonOutput,
-};
+use claude_code_agent_sdk::HookCallback;
+use claude_code_agent_sdk::HookContext;
+use claude_code_agent_sdk::HookInput;
+use claude_code_agent_sdk::HookJsonOutput;
+use claude_code_agent_sdk::SyncHookJsonOutput;
 use futures::future::BoxFuture;
 use tracing::Instrument;
 
@@ -150,7 +152,8 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use serde_json::json;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn test_post_tool_use_hook_executes_callback() {

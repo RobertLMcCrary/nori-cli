@@ -1,0 +1,21 @@
+[package]
+name = "nori-forge"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+dirs = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }

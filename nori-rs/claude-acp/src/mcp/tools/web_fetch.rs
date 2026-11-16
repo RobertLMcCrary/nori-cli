@@ -5,10 +5,12 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 
 use super::base::Tool;
-use crate::mcp::registry::{ToolContext, ToolResult};
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
 
 /// Input parameters for WebFetch
 #[derive(Debug, Deserialize)]

@@ -4,22 +4,39 @@
 //! before executing tools. Following the TypeScript version's design, this callback
 //! is responsible for sending permission requests when needed.
 
-use claude_code_agent_sdk::types::permissions::{
-    CanUseToolCallback, PermissionResult, PermissionResultAllow, PermissionResultDeny,
-    PermissionUpdate, PermissionUpdateDestination, PermissionUpdateType, ToolPermissionContext,
-};
-use sacp::schema::{
-    Content, ContentBlock, PermissionOption, PermissionOptionId, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionId, TextContent, ToolCallContent,
-    ToolCallUpdate, ToolCallUpdateFields,
-};
-use sacp::{Client, ConnectionTo};
-use std::sync::{Arc, OnceLock};
-use tracing::{debug, info, warn};
+use claude_code_agent_sdk::types::permissions::CanUseToolCallback;
+use claude_code_agent_sdk::types::permissions::PermissionResult;
+use claude_code_agent_sdk::types::permissions::PermissionResultAllow;
+use claude_code_agent_sdk::types::permissions::PermissionResultDeny;
+use claude_code_agent_sdk::types::permissions::PermissionUpdate;
+use claude_code_agent_sdk::types::permissions::PermissionUpdateDestination;
+use claude_code_agent_sdk::types::permissions::PermissionUpdateType;
+use claude_code_agent_sdk::types::permissions::ToolPermissionContext;
+use sacp::Client;
+use sacp::ConnectionTo;
+use sacp::schema::Content;
+use sacp::schema::ContentBlock;
+use sacp::schema::PermissionOption;
+use sacp::schema::PermissionOptionId;
+use sacp::schema::PermissionOptionKind;
+use sacp::schema::RequestPermissionOutcome;
+use sacp::schema::RequestPermissionRequest;
+use sacp::schema::SessionId;
+use sacp::schema::TextContent;
+use sacp::schema::ToolCallContent;
+use sacp::schema::ToolCallUpdate;
+use sacp::schema::ToolCallUpdateFields;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
-use crate::session::{
-    PermissionMode, PermissionOutcome, PermissionRequestBuilder, Session, ToolPermissionResult,
-};
+use crate::session::PermissionMode;
+use crate::session::PermissionOutcome;
+use crate::session::PermissionRequestBuilder;
+use crate::session::Session;
+use crate::session::ToolPermissionResult;
 use crate::types::AgentError;
 use std::fs;
 use std::path::PathBuf;

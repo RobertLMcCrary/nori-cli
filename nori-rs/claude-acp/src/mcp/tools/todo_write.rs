@@ -3,13 +3,16 @@
 //! Manages a structured task list for tracking progress during coding sessions.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::base::Tool;
-use crate::mcp::registry::{ToolContext, ToolResult};
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
 
 /// Todo item status
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

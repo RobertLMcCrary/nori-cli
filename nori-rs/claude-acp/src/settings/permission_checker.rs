@@ -2,10 +2,12 @@
 //!
 //! Checks tool permissions against settings rules.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use super::manager::Settings;
-use super::rule::{ParsedRule, PermissionCheckResult};
+use super::rule::ParsedRule;
+use super::rule::PermissionCheckResult;
 use crate::command_safety::extract_command_basename;
 
 /// Permission checker that evaluates tool permissions against settings rules
@@ -252,7 +254,8 @@ impl Default for PermissionChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{PermissionDecision, PermissionSettings};
+    use crate::settings::PermissionDecision;
+    use crate::settings::PermissionSettings;
     use serde_json::json;
 
     fn settings_with_permissions(permissions: PermissionSettings) -> Settings {

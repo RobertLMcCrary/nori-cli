@@ -10,14 +10,20 @@
 //! The pool is process-wide: an agent switch opens a new ACP connection, and the warm session
 //! must outlive the connection that started it.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::PoisonError;
+use std::time::Duration;
+use std::time::Instant;
 
 use sacp::schema::McpServer;
 
 use super::Session;
-use crate::mcp::{HostToolsBinding, SessionTools};
+use crate::mcp::HostToolsBinding;
+use crate::mcp::SessionTools;
 use crate::types::AgentConfig;
 
 /// A warm session older than this is not used: the user's settings may have changed under it.

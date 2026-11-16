@@ -21,6 +21,8 @@ pub enum NativeCall {
     GetGoal,
     CreateGoal { objective: String },
     UpdateGoal { status: String },
+    CiStatus,
+    PullRequest { title: String },
 }
 
 impl NativeCall {
@@ -74,12 +76,16 @@ impl NativeCall {
             "update_goal" => Self::UpdateGoal {
                 status: text("status"),
             },
+            "ci_status" => Self::CiStatus,
+            "pull_request" => Self::PullRequest {
+                title: text("title"),
+            },
             _ => return None,
         })
     }
 }
 
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 9] = [
     "git_status",
     "git_diff",
     "git_log",
@@ -87,6 +93,8 @@ const TOOLS: [&str; 7] = [
     "get_goal",
     "create_goal",
     "update_goal",
+    "ci_status",
+    "pull_request",
 ];
 
 /// How a piece of text should look.
@@ -195,14 +203,34 @@ pub(crate) fn view(
             NativeCall::GetGoal | NativeCall::CreateGoal { .. } | NativeCall::UpdateGoal { .. } => {
                 (GOAL, "Goal tool failed")
             }
+            NativeCall::CiStatus => (super::native_forge::CI, "Could not check CI"),
+            NativeCall::PullRequest { .. } => {
+                (super::native_forge::PULL, "Pull request not opened")
+            }
+        };
+        // A pull request's refusal lists each rule it broke, so it keeps its lines.
+        let shown = match call {
+            NativeCall::PullRequest { .. } => 6,
+            NativeCall::GitStatus
+            | NativeCall::GitDiff { .. }
+            | NativeCall::GitLog
+            | NativeCall::GitCommit { .. }
+            | NativeCall::GetGoal
+            | NativeCall::CreateGoal { .. }
+            | NativeCall::UpdateGoal { .. }
+            | NativeCall::CiStatus => 1,
         };
         return NativeView::new(
             glyph,
             vec![part(title, Tone::Strong)],
             result
-                .and_then(first_line)
-                .map(|line| vec![DetailLine::text(line, Tone::Error)])
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(shown)
+                .map(|line| DetailLine::text(line, Tone::Error))
+                .collect(),
         );
     }
     let json = result.and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
@@ -227,6 +255,10 @@ pub(crate) fn view(
             )],
             vec![DetailLine::text(objective.clone(), Tone::Dim)],
         ),
+        NativeCall::CiStatus => super::native_forge::ci_view(active, json.as_ref()),
+        NativeCall::PullRequest { title } => {
+            super::native_forge::pull_view(active, title, json.as_ref())
+        }
         NativeCall::UpdateGoal { status } => NativeView::new(
             GOAL,
             vec![
@@ -243,13 +275,6 @@ pub(crate) fn view(
             Vec::new(),
         ),
     }
-}
-
-fn first_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_owned)
 }
 
 fn status_view(active: bool, json: Option<&serde_json::Value>) -> NativeView {

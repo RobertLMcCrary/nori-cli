@@ -122,8 +122,15 @@ pub(crate) struct NoriClientShared {
     nori_client_advertised: bool,
     goal_ext_advertised: bool,
     orchestrator: super::orchestrator::Orchestrator,
-    /// The session's working directory, which the git tools operate in.
-    cwd: Option<std::path::PathBuf>,
+    /// Where the git and forge tools work.
+    workspace: Option<Workspace>,
+}
+
+/// Where a session's tools work: its directory, and the workflow whose rules they apply.
+#[derive(Clone)]
+pub(crate) struct Workspace {
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) workflow: Arc<Mutex<super::workflow::WorkflowState>>,
 }
 
 impl NoriClientShared {
@@ -144,13 +151,13 @@ impl NoriClientShared {
             nori_client_advertised,
             goal_ext_advertised,
             orchestrator,
-            cwd: None,
+            workspace: None,
         }
     }
 
-    /// Serve the git tools for `cwd`.
-    pub(crate) fn with_cwd(mut self, cwd: std::path::PathBuf) -> Self {
-        self.cwd = Some(cwd);
+    /// Serve the git and forge tools for `workspace`.
+    pub(crate) fn with_workspace(mut self, workspace: Workspace) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 }
@@ -168,19 +175,34 @@ pub(crate) struct NoriClientService {
 impl NoriClientService {
     /// The working directory the git tools run in.
     pub(super) fn shared_cwd(&self) -> Option<std::path::PathBuf> {
-        self.shared.cwd.clone()
+        self.shared
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.cwd.clone())
+    }
+
+    /// Where the forge tools work.
+    pub(super) fn workspace(&self) -> Option<&Workspace> {
+        self.shared.workspace.as_ref()
     }
 
     pub(super) fn new(shared: NoriClientShared) -> Self {
         Self {
             shared,
-            tool_router: Self::tool_router() + Self::task_tool_router() + Self::git_tool_router(),
+            tool_router: Self::tool_router()
+                + Self::task_tool_router()
+                + Self::git_tool_router()
+                + Self::forge_tool_router(),
         }
     }
 
     /// Every tool, as `tools/list` describes it. The same for every session.
     pub(super) fn all_tools() -> Vec<rmcp::model::Tool> {
-        (Self::tool_router() + Self::task_tool_router() + Self::git_tool_router()).list_all()
+        (Self::tool_router()
+            + Self::task_tool_router()
+            + Self::git_tool_router()
+            + Self::forge_tool_router())
+        .list_all()
     }
 
     #[tool(
@@ -347,10 +369,11 @@ impl ServerHandler for NoriClientService {
 /// What every agent is told about the tools, however it reaches them.
 pub(super) fn tool_instructions() -> String {
     format!(
-        "{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{}",
         thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS,
         super::orchestrator::TASK_INSTRUCTIONS,
         super::git_tools::INSTRUCTIONS,
+        super::forge_tools::INSTRUCTIONS,
     )
 }
 
@@ -677,7 +700,7 @@ pub(super) async fn register_for_session(
     backend_event_tx: mpsc::Sender<BackendEvent>,
     connected: Arc<AtomicBool>,
     orchestrator: super::orchestrator::Orchestrator,
-    cwd: &std::path::Path,
+    workspace: Workspace,
 ) -> Result<Option<PendingNoriClientServer>> {
     let host_tools = super::host_tools::accepted_by(connection);
     if !host_tools && !reachable(connection) {
@@ -693,7 +716,7 @@ pub(super) async fn register_for_session(
         goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta()).is_some(),
         orchestrator,
     )
-    .with_cwd(cwd.to_path_buf());
+    .with_workspace(workspace);
     let previous_connected = connected.load(Ordering::Relaxed);
     let next_server = if host_tools {
         NoriClient::Host {
@@ -881,7 +904,10 @@ mod tests {
                 false,
                 test_orchestrator(),
             )
-            .with_cwd(dir.clone()),
+            .with_workspace(Workspace {
+                cwd: dir.clone(),
+                workflow: Arc::default(),
+            }),
         );
 
         let status: serde_json::Value =

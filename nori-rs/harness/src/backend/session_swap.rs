@@ -62,7 +62,10 @@ impl AcpBackend {
                 self.backend_event_tx.clone(),
                 Arc::clone(&self.goal_mcp_connected),
                 self.orchestrator.clone(),
-                &self.cwd,
+                nori_client_mcp::Workspace {
+                    cwd: self.cwd.clone(),
+                    workflow: Arc::clone(&self.workflow),
+                },
             )
             .await
             {

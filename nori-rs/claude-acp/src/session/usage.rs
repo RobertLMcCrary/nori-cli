@@ -2,7 +2,8 @@
 //!
 //! Tracks cumulative token usage across a session's lifetime.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::types::TokenUsage;
 

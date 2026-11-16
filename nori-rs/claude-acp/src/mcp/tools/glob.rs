@@ -3,14 +3,17 @@
 //! Fast file pattern matching using glob patterns like `**/*.rs`.
 
 use async_trait::async_trait;
-use globset::{Glob, GlobSetBuilder};
+use globset::Glob;
+use globset::GlobSetBuilder;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use std::path::Path;
 use walkdir::WalkDir;
 
 use super::base::Tool;
-use crate::mcp::registry::{ToolContext, ToolResult};
+use crate::mcp::registry::ToolContext;
+use crate::mcp::registry::ToolResult;
 
 /// Maximum number of results to return
 const MAX_RESULTS: usize = 1000;
@@ -211,7 +214,8 @@ impl Tool for GlobTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
+    use std::fs::File;
+    use std::fs::{self};
     use std::io::Write;
     use tempfile::TempDir;
 
