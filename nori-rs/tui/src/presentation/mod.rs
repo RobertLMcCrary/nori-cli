@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 mod delegation;
+mod native_tool;
 
 pub use delegation::DelegationCall;
 pub(crate) use delegation::outcome as delegation_outcome;
+pub use native_tool::NativeCall;
+pub(crate) use native_tool::Tone as NativeTone;
+pub(crate) use native_tool::view as native_view;
 use std::path::PathBuf;
 
 use nori_protocol::acp::MaybeUndefined;
@@ -347,6 +351,8 @@ pub enum Invocation {
     RawJson(serde_json::Value),
     /// A call to one of Nori's delegated-task tools.
     Delegation(DelegationCall),
+    /// A call to one of Nori's git or goal tools.
+    Native(NativeCall),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -626,7 +632,9 @@ impl PlanStatus {
 }
 
 fn is_generic_tool_call(tool_call: &acp::ToolCall) -> bool {
-    tool_call.raw_input.is_none()
+    // Nori's own tools have a view of their own, so even a bare call is shown.
+    NativeCall::recognize(&tool_call.title, None).is_none()
+        && tool_call.raw_input.is_none()
         && tool_call.locations.is_empty()
         && tool_call.content.is_empty()
         && !tool_call.title.contains('/')
@@ -671,7 +679,10 @@ fn tool_snapshot_from_tool_call(tool_call: &acp::ToolCall, phase: ToolPhase) -> 
     let invocation = match DelegationCall::recognize(&tool_call.title, tool_call.raw_input.as_ref())
     {
         Some(call) => Some(Invocation::Delegation(call)),
-        None => invocation_from_tool_call(tool_call, &artifacts),
+        None => match NativeCall::recognize(&tool_call.title, tool_call.raw_input.as_ref()) {
+            Some(call) => Some(Invocation::Native(call)),
+            None => invocation_from_tool_call(tool_call, &artifacts),
+        },
     };
 
     ToolSnapshot {

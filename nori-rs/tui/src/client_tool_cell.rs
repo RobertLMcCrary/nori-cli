@@ -401,6 +401,55 @@ impl ClientToolCell {
         lines
     }
 
+    /// One of Nori's git or goal tools: what it did, with a tone per line.
+    fn render_native_lines(&self, call: &crate::presentation::NativeCall) -> Vec<Line<'static>> {
+        use crate::presentation::NativeTone as Tone;
+
+        let active = self.is_active();
+        let failed = self.snapshot.phase == crate::presentation::ToolPhase::Failed;
+        let result = self
+            .snapshot
+            .artifacts
+            .iter()
+            .find_map(|artifact| match artifact {
+                crate::presentation::Artifact::Text { text, .. } => Some(text.as_str()),
+                crate::presentation::Artifact::Diff(_) => None,
+            });
+        let view = crate::presentation::native_view(call, active, failed, result);
+        let bullet = if active {
+            spinner(self.start_time, self.animations_enabled)
+        } else if failed {
+            "•".red().bold()
+        } else {
+            "•".green().bold()
+        };
+        let style = |text: String, tone: Tone| -> Span<'static> {
+            match tone {
+                Tone::Plain => text.into(),
+                Tone::Dim => text.dim(),
+                Tone::Added => text.green(),
+                Tone::Modified => text.cyan(),
+                Tone::Deleted => text.red(),
+                Tone::Error => text.red(),
+            }
+        };
+        let mut lines = vec![Line::from(vec![bullet, " ".into(), view.header.bold()])];
+        for (index, detail) in view.detail.into_iter().enumerate() {
+            let mut spans = vec![if index == 0 {
+                "  └ ".dim()
+            } else {
+                "    ".into()
+            }];
+            if let Some((marker, tone)) = detail.marker {
+                spans.push(style(marker.to_string(), tone));
+                spans.push(" ".into());
+            }
+            spans.push(style(detail.text, detail.tone));
+            lines.push(Line::from(spans));
+        }
+        lines
+    }
+
     /// `full` shows declared markdown whole, as the transcript does; otherwise its first rows.
     fn render_generic_lines(&self, width: u16, full: bool) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -871,6 +920,10 @@ impl HistoryCell for ClientToolCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         if let Some(crate::presentation::Invocation::Delegation(call)) = &self.snapshot.invocation {
             self.render_delegation_lines(call)
+        } else if let Some(crate::presentation::Invocation::Native(call)) =
+            &self.snapshot.invocation
+        {
+            self.render_native_lines(call)
         } else if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
             self.render_exploring_lines(width)
         } else if self.snapshot.kind == crate::presentation::ToolKind::Execute {
@@ -891,6 +944,10 @@ impl HistoryCell for ClientToolCell {
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         if let Some(crate::presentation::Invocation::Delegation(call)) = &self.snapshot.invocation {
             self.render_delegation_lines(call)
+        } else if let Some(crate::presentation::Invocation::Native(call)) =
+            &self.snapshot.invocation
+        {
+            self.render_native_lines(call)
         } else if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
             self.render_exploring_lines(width)
         } else if self.snapshot.kind == crate::presentation::ToolKind::Execute {
@@ -2618,6 +2675,124 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.starts_with("$ ")),
             "Exploring transcript should NOT use '$ ' shell format, got: {lines:?}"
+        );
+    }
+
+    fn native_snapshot(
+        title: &str,
+        input: serde_json::Value,
+        phase: ToolPhase,
+        result: Option<&str>,
+    ) -> ToolSnapshot {
+        let call = crate::presentation::NativeCall::recognize(title, Some(&input))
+            .expect("a native tool title");
+        ToolSnapshot {
+            call_id: "native-1".into(),
+            title: title.into(),
+            kind: ToolKind::Other("Other".into()),
+            phase,
+            locations: vec![],
+            invocation: Some(Invocation::Native(call)),
+            artifacts: result
+                .map(|text| {
+                    vec![Artifact::Text {
+                        text: text.into(),
+                        format: crate::presentation::TextFormat::Plain,
+                    }]
+                })
+                .unwrap_or_default(),
+            raw_input: Some(input),
+            raw_output: None,
+            owner_request_id: None,
+        }
+    }
+
+    #[test]
+    fn git_status_reads_as_branch_and_changes_not_as_a_tool_call() {
+        let snapshot = native_snapshot(
+            "mcp__nori-client__git_status",
+            serde_json::json!({}),
+            ToolPhase::Completed,
+            Some(
+                r#"{"branch":"main","changes":[{"path":"a.rs","state":"modified"},{"path":"b.rs","state":"added"}]}"#,
+            ),
+        );
+        let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
+        let lines = render_lines(&cell.display_lines(80));
+        assert_eq!(
+            lines,
+            vec![
+                "• Git status · main".to_string(),
+                "  └ 2 changes".to_string(),
+                "    M a.rs".to_string(),
+                "    A b.rs".to_string(),
+            ]
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Tool [") || line.contains("(Other)")),
+            "no raw tool-call chrome: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn git_commit_reads_as_the_commit_it_made_and_a_running_one_says_so() {
+        let input = serde_json::json!({"paths": ["math.py"], "message": "feat(math): add sub"});
+        let done = ClientToolCell::new(
+            native_snapshot(
+                "mcp__nori-client__git_commit",
+                input.clone(),
+                ToolPhase::Completed,
+                Some(r#"{"commit":"07a5d0f9c0ffee","remaining_changes":0}"#),
+            ),
+            PathBuf::from("/tmp/test-cwd"),
+            false,
+        );
+        assert_eq!(
+            render_lines(&done.display_lines(80)),
+            vec![
+                "• Committed 07a5d0f · feat(math): add sub".to_string(),
+                "  └ math.py".to_string(),
+                "    nothing left uncommitted".to_string(),
+            ]
+        );
+
+        let running = ClientToolCell::new(
+            native_snapshot(
+                "mcp__nori-client__git_commit",
+                input,
+                ToolPhase::InProgress,
+                None,
+            ),
+            PathBuf::from("/tmp/test-cwd"),
+            false,
+        );
+        let lines = render_lines(&running.display_lines(80));
+        assert!(
+            lines[0].ends_with("Committing 1 file · feat(math): add sub"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_commit_shows_why() {
+        let cell = ClientToolCell::new(
+            native_snapshot(
+                "mcp__nori-client__git_commit",
+                serde_json::json!({"paths": ["a"], "message": "x"}),
+                ToolPhase::Failed,
+                Some("none of those paths differ from HEAD"),
+            ),
+            PathBuf::from("/tmp/test-cwd"),
+            false,
+        );
+        assert_eq!(
+            render_lines(&cell.display_lines(80)),
+            vec![
+                "• Commit failed".to_string(),
+                "  └ none of those paths differ from HEAD".to_string(),
+            ]
         );
     }
 }
