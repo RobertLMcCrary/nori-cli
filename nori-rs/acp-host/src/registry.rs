@@ -770,11 +770,22 @@ impl AcpAgentConfig {
 
 /// Get list of all available ACP agents for the agent picker
 pub fn list_available_agents() -> Vec<AcpAgentInfo> {
+    #[cfg(debug_assertions)]
+    let mock_binary =
+        get_mock_agent_config("mock-model").map(|config| std::path::PathBuf::from(config.command));
+    #[cfg(not(debug_assertions))]
+    let mock_binary: Option<std::path::PathBuf> = None;
+    list_available_agents_with_mock_binary(mock_binary.as_deref())
+}
+
+fn list_available_agents_with_mock_binary(
+    mock_binary: Option<&std::path::Path>,
+) -> Vec<AcpAgentInfo> {
     let mut agents = Vec::new();
 
-    // Mock agents are only available in debug builds (for testing)
+    // Mock agents are available only when the debug fixture executable exists.
     #[cfg(debug_assertions)]
-    {
+    if mock_binary.is_some_and(std::path::Path::is_file) {
         agents.push(AcpAgentInfo {
             agent: AgentKind::ClaudeCode, // Dummy, not really used
             agent_name: "mock-model".to_string(),
@@ -794,6 +805,8 @@ pub fn list_available_agents() -> Vec<AcpAgentInfo> {
             managed_by: None,
         });
     }
+    #[cfg(not(debug_assertions))]
+    let _ = mock_binary;
 
     // Include all agents from the registry (built-in + custom)
     for registered in get_registry() {
@@ -1657,8 +1670,13 @@ mod tests {
     #[cfg(debug_assertions)]
     fn test_list_available_agents_debug_build() {
         reset_registry();
-        let agents = list_available_agents();
-        assert_eq!(agents.len(), 6, "Debug build should have six agents");
+        let binary = tempfile::NamedTempFile::new().expect("mock executable fixture");
+        let agents = list_available_agents_with_mock_binary(Some(binary.path()));
+        assert_eq!(
+            agents.len(),
+            6,
+            "Available mock binary adds two fixture agents"
+        );
 
         let names: Vec<&str> = agents.iter().map(|a| a.display_name.as_str()).collect();
         assert!(names.contains(&"Mock ACP"), "Should have Mock ACP");
@@ -1667,6 +1685,18 @@ mod tests {
         assert!(names.contains(&"Codex"), "Should have Codex");
         assert!(names.contains(&"Gemini"), "Should have Gemini");
         assert!(names.contains(&"OpenCode"), "Should have OpenCode");
+        let absent = binary.path().with_extension("missing");
+        let without_mock = list_available_agents_with_mock_binary(Some(&absent));
+        assert_eq!(
+            without_mock.len(),
+            4,
+            "Missing mock binary hides both fixture agents"
+        );
+        assert!(
+            without_mock
+                .iter()
+                .all(|agent| !agent.agent_name.starts_with("mock-model"))
+        );
     }
 
     #[test]
