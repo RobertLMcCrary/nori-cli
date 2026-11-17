@@ -383,6 +383,7 @@ mod tests {
     use std::net::TcpStream;
     use std::net::UdpSocket;
     use std::time::Duration;
+    use std::time::Instant;
 
     use crate::history_cell::HistoryCell;
     use nori_config::NoriConfig;
@@ -411,18 +412,28 @@ mod tests {
     async fn open_websocket(addr: SocketAddr) -> TcpStream {
         tokio::task::spawn_blocking(move || {
             let mut stream = TcpStream::connect(addr).expect("connect to ACP listener");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("set read timeout");
             write!(
                 stream,
                 "GET /acp HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
             )
             .expect("write websocket handshake");
-            let mut response = [0_u8; 512];
-            let read = stream.read(&mut response).expect("read websocket handshake");
-            let response = String::from_utf8_lossy(&response[..read]);
+            // Listener scheduling is setup, not the disconnect latency under test.
+            // Read the complete header without consuming a following websocket frame.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut response = Vec::new();
+            while !response.ends_with(b"\r\n\r\n") {
+                let remaining = deadline.checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .expect("websocket handshake setup deadline");
+                stream.set_read_timeout(Some(remaining)).expect("set handshake deadline");
+                let mut byte = [0; 1];
+                stream.read_exact(&mut byte).expect("read websocket handshake");
+                response.push(byte[0]);
+                assert!(response.len() <= 8192, "oversized websocket handshake");
+            }
+            let response = String::from_utf8_lossy(&response);
             assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+            stream.set_read_timeout(Some(Duration::from_secs(2))).expect("restore control deadline");
             stream
         })
         .await
@@ -455,6 +466,7 @@ mod tests {
             ..Default::default()
         };
         let agent = prepare_agent(AgentPrepareSpec {
+            handoff: None,
             config: Arc::new(config),
             cli_version: "remote-control-test".to_string(),
             session_context: None,
@@ -845,7 +857,8 @@ Hint: Tailscale is available; use /remote-control on tailnet.
             .await
             .expect("enable listeners");
         let addrs: Vec<SocketAddr> = report.urls().iter().map(|url| addr_from_url(url)).collect();
-        let mut controller = open_websocket(addrs[1]).await;
+        // A firewall can block connecting to this host through its non-loopback address.
+        let mut controller = open_websocket(addrs[0]).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if report_text(&manager.status(false).await).contains("Controller: connected") {

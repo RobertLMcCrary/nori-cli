@@ -51,8 +51,6 @@ pub async fn run_resume_picker(
     agent_filter: Option<&str>,
     show_all: bool,
 ) -> Result<ResumeSelection> {
-    let alt = AltScreenGuard::enter(tui);
-
     let agent_filter = agent_filter.map(str::to_string);
     let filter_cwd = if show_all {
         None
@@ -62,7 +60,7 @@ pub async fn run_resume_picker(
 
     let mut state = PickerState::new(
         nori_home.to_path_buf(),
-        alt.tui.frame_requester(),
+        tui.frame_requester(),
         agent_filter.clone(),
         show_all,
         filter_cwd,
@@ -70,7 +68,7 @@ pub async fn run_resume_picker(
     state.load_initial_page().await?;
     state.request_frame();
 
-    let mut tui_events = alt.tui.event_stream().fuse();
+    let mut tui_events = tui.event_stream().fuse();
 
     while let Some(ev) = tui_events.next().await {
         match ev {
@@ -83,12 +81,12 @@ pub async fn run_resume_picker(
                 }
             }
             TuiEvent::Draw => {
-                if let Ok(size) = alt.tui.terminal.size() {
+                if let Ok(size) = tui.terminal.size() {
                     let chrome_height = 6 + u16::from(state.search_active);
                     let list_height = size.height.saturating_sub(chrome_height) as usize;
                     state.update_view_rows(list_height);
                 }
-                rendering::draw_picker(alt.tui, &state)?;
+                rendering::draw_picker(tui, &state)?;
             }
             _ => {}
         }
@@ -111,24 +109,6 @@ async fn load_transcript_page(
         num_scanned_files: items.len(),
         items,
     })
-}
-
-/// RAII guard that ensures we leave the alt-screen on scope exit.
-struct AltScreenGuard<'a> {
-    tui: &'a mut Tui,
-}
-
-impl<'a> AltScreenGuard<'a> {
-    fn enter(tui: &'a mut Tui) -> Self {
-        let _ = tui.enter_alt_screen();
-        Self { tui }
-    }
-}
-
-impl Drop for AltScreenGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.tui.leave_alt_screen();
-    }
 }
 
 struct PickerState {

@@ -13,15 +13,22 @@ mod block;
 mod cell;
 mod events;
 mod node;
+mod projection;
 mod roster;
+mod strip;
 mod tree;
 
 pub(crate) use block::SPINNER_FRAMES;
 pub(crate) use block::SPINNER_PERIOD;
+#[cfg(test)]
 pub(crate) use block::SubagentBlock;
 pub(crate) use cell::SubagentSummaryCell;
 pub(crate) use cell::format_elapsed;
 pub(crate) use cell::tool_count_text;
+pub(crate) use projection::project_child_history;
+pub(crate) use strip::StripAction;
+pub(crate) use strip::StripState;
+pub(crate) use strip::SubagentStrip;
 pub(crate) use tree::ChildTarget;
 pub(crate) use tree::FinishedSubagent;
 pub(crate) use tree::SubagentTree;

@@ -4,7 +4,8 @@ use std::collections::VecDeque;
 
 use ratatui::text::Line;
 use ratatui::text::Span;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::render::line_utils::line_to_static;
 
@@ -81,19 +82,25 @@ impl WrittenHistory {
                 continue;
             }
             // Drop the columns of the rows that are above the edge.
-            let mut hidden_columns = hidden_rows * usize::from(self.width.max(1));
+            let width = usize::from(self.width.max(1));
+            let mut row = 0;
+            let mut column = 0;
             let mut visible = Line {
                 spans: Vec::new(),
                 ..line.clone()
             };
             for span in &line.spans {
                 let mut text = String::new();
-                for c in span.content.chars() {
-                    if hidden_columns == 0 {
-                        text.push(c);
-                    } else {
-                        hidden_columns = hidden_columns.saturating_sub(c.width().unwrap_or(0));
+                for grapheme in span.content.graphemes(true) {
+                    let cells = grapheme.width().min(width);
+                    if cells > 0 && column + cells > width {
+                        row += 1;
+                        column = 0;
                     }
+                    if row >= hidden_rows {
+                        text.push_str(grapheme);
+                    }
+                    column += cells;
                 }
                 if !text.is_empty() {
                     visible.spans.push(Span::styled(text, span.style));
@@ -108,7 +115,7 @@ impl WrittenHistory {
 
 /// Terminal rows `line` takes at `width`.
 fn rows_at(line: &Line<'_>, width: u16) -> usize {
-    line.width().max(1).div_ceil(usize::from(width.max(1)))
+    crate::native_history::physical_rows(line, usize::from(width))
 }
 
 #[cfg(test)]
@@ -169,5 +176,12 @@ mod tests {
 
         assert_eq!(text(&history.newest_rows(3)), vec!["bbbbcc", "last"]);
         assert_eq!(text(&history.newest_rows(4)), vec!["aaaabbbbcc", "last"]);
+    }
+
+    #[test]
+    fn clipping_a_soft_wrapped_wide_grapheme_keeps_the_next_row() {
+        let mut history = WrittenHistory::default();
+        history.record(&lines(&["abc界xy"]), 4, 8);
+        assert_eq!(text(&history.newest_rows(1)), vec!["界xy"]);
     }
 }

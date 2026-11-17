@@ -50,6 +50,7 @@ async fn launch_with_wire_log(cwd: &Path, wire_log_dir: &Path) -> LaunchedSessio
         ..Default::default()
     };
     let agent = prepare_agent(AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: "native-compact-branch-test".to_string(),
         session_context: None,
@@ -170,6 +171,86 @@ fn temp_dirs() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("create session directory");
     let wire = temp.path().join("acp-wire");
     (temp, wire)
+}
+
+#[tokio::test]
+#[serial]
+async fn rewind_rebinds_to_fresh_engine_with_only_the_visible_prefix() {
+    let (temp, wire) = temp_dirs();
+    let mut session = launch_with_wire_log(temp.path(), &wire).await;
+    let original_engine = wait_for_started(&mut session).await;
+    session
+        .handle
+        .set_session_config_option("model".to_string(), "mock-model-fast".to_string())
+        .await
+        .expect("select model");
+    let first = submit_text(&session, "Keep this request").await;
+    let (canonical_id, head) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut boundary = None;
+        let mut completed = false;
+        loop {
+            match session.events.recv().await.expect("event stream") {
+                SessionEvent::Nori(NoriEvent::ConversationResponseBoundary(value)) => {
+                    boundary = Some((value.transcript_id, value.end));
+                }
+                SessionEvent::Acp(AcpEvent::Response {
+                    request_id,
+                    response: Ok(acp::v1::AgentResponse::PromptResponse(_)),
+                }) if request_id == first => completed = true,
+                SessionEvent::Nori(NoriEvent::SessionPhaseChanged(
+                    nori_protocol::SessionPhase::Idle,
+                )) if completed && boundary.is_some() => break boundary.unwrap(),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("first turn completes");
+
+    let discarded = submit_text(&session, "Discard this secret").await;
+    drive_prompt_to_completion(&mut session, &discarded).await;
+    // Wait until the reducer is idle before rewinding.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            session.events.recv().await,
+            Some(SessionEvent::Nori(NoriEvent::SessionPhaseChanged(
+                nori_protocol::SessionPhase::Idle
+            )))
+        ) {}
+    })
+    .await
+    .expect("second turn becomes idle");
+    session
+        .handle
+        .rewind_and_rebind(canonical_id.clone(), Some(head))
+        .await
+        .expect("rewind and rebind");
+    let options = session
+        .handle
+        .get_session_config()
+        .await
+        .expect("session options");
+    assert!(options.iter().any(|option| matches!(&option.kind,
+        acp::v1::SessionConfigKind::Select(select)
+            if option.category == Some(acp::v1::SessionConfigOptionCategory::Model)
+                && select.current_value.to_string() == "mock-model-fast"
+    )));
+    let next = submit_text(&session, "Continue after rewind").await;
+    drive_prompt_to_completion(&mut session, &next).await;
+    let recorder = session
+        .handle
+        .conversation_recorder()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recorder.session_id(), canonical_id);
+    let prompts = recorded_prompts(&wire);
+    assert_eq!(prompts.len(), 3);
+    assert_ne!(prompt_session_id(&prompts[2]), original_engine);
+    let retry = serde_json::to_string(&prompts[2]).unwrap();
+    assert!(retry.contains("Keep this request"), "{retry}");
+    assert!(!retry.contains("Discard this secret"), "{retry}");
+    assert!(retry.contains("Continue after rewind"), "{retry}");
 }
 
 #[tokio::test]
@@ -379,6 +460,235 @@ async fn branch_forks_active_session() {
         forked_session_id,
         "post-branch prompt should target the forked session"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn branch_after_rewind_seeds_only_the_visible_history() {
+    if std::env::var_os("NORI_BRANCH_REWIND_TEST_INNER").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "branch_after_rewind_seeds_only_the_visible_history",
+                "--nocapture",
+            ])
+            .env("NORI_BRANCH_REWIND_TEST_INNER", "1")
+            .env("MOCK_AGENT_SUPPORT_SESSION_FORK", "1")
+            .status()
+            .expect("run isolated branch fixture");
+        assert!(status.success(), "isolated branch test failed");
+        return;
+    }
+    let (temp, wire) = temp_dirs();
+    let mut session = launch_with_wire_log(temp.path(), &wire).await;
+    wait_for_started(&mut session).await;
+    let first = submit_text(&session, "kept parent turn").await;
+    let boundary = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut boundary = None;
+        let mut completed = false;
+        loop {
+            match session.events.recv().await.expect("event stream") {
+                SessionEvent::Nori(NoriEvent::ConversationResponseBoundary(value)) => {
+                    boundary = Some(value)
+                }
+                SessionEvent::Acp(AcpEvent::Response {
+                    request_id,
+                    response: Ok(acp::v1::AgentResponse::PromptResponse(_)),
+                }) if request_id == first => completed = true,
+                SessionEvent::Nori(NoriEvent::SessionPhaseChanged(
+                    nori_protocol::SessionPhase::Idle,
+                )) if completed && boundary.is_some() => {
+                    break boundary.expect("first response boundary");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("first turn completes");
+    let second = submit_text(&session, "discarded parent turn").await;
+    drive_prompt_to_completion(&mut session, &second).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            session.events.recv().await,
+            Some(SessionEvent::Nori(NoriEvent::SessionPhaseChanged(
+                nori_protocol::SessionPhase::Idle
+            )))
+        ) {}
+    })
+    .await
+    .expect("second turn becomes idle");
+    let parent = session
+        .handle
+        .conversation_recorder()
+        .await
+        .expect("recorder request")
+        .expect("parent journal");
+    parent.flush().await.expect("flush parent");
+    assert!(
+        std::fs::read_to_string(parent.transcript_path())
+            .expect("legacy transcript")
+            .contains("discarded parent turn")
+    );
+    session
+        .handle
+        .rewind_and_rebind(boundary.transcript_id.clone(), Some(boundary.end))
+        .await
+        .expect("rewind parent");
+    session
+        .handle
+        .branch()
+        .await
+        .expect("branch rewound session");
+    let forked = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let SessionEvent::Nori(NoriEvent::SessionForked(forked)) =
+                session.events.recv().await.expect("event stream")
+            {
+                break forked;
+            }
+        }
+    })
+    .await
+    .expect("fork event");
+    assert_eq!(forked.previous_conversation_id, boundary.transcript_id);
+    let loader = nori_harness::TranscriptLoader::new(temp.path().to_path_buf());
+    let transcript = loader
+        .load_transcript(parent.project_id(), &forked.new_conversation_id)
+        .await
+        .expect("load branch transcript");
+    assert_eq!(
+        transcript.meta.forked_from.as_deref(),
+        Some(boundary.transcript_id.as_str())
+    );
+    let replay = nori_harness::backend::transcript_to_replay_session_events(&transcript);
+    let replay = serde_json::to_string(&replay).expect("serialize branch replay");
+    assert!(replay.contains("kept parent turn"), "{replay}");
+    assert!(!replay.contains("discarded parent turn"), "{replay}");
+    let next = submit_text(&session, "branch follow-up").await;
+    drive_prompt_to_completion(&mut session, &next).await;
+    let prompts = recorded_prompts(&wire);
+    let last =
+        serde_json::to_string(prompts.last().expect("branch prompt")).expect("serialize prompt");
+    assert!(last.contains("kept parent turn"), "{last}");
+    assert!(!last.contains("discarded parent turn"), "{last}");
+}
+
+#[tokio::test]
+#[serial]
+async fn interrupted_rewind_never_resumes_the_old_provider_session() {
+    if std::env::var_os("NORI_REWIND_RECOVERY_TEST_INNER").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "interrupted_rewind_never_resumes_the_old_provider_session",
+                "--nocapture",
+            ])
+            .env("NORI_REWIND_RECOVERY_TEST_INNER", "1")
+            .env("MOCK_AGENT_SUPPORT_LOAD_SESSION", "1")
+            .env("MOCK_AGENT_SUPPORT_SESSION_RESUME", "1")
+            .status()
+            .expect("run isolated recovery fixture");
+        assert!(status.success(), "isolated recovery test failed");
+        return;
+    }
+    let (temp, wire) = temp_dirs();
+    let mut original = launch_with_wire_log(temp.path(), &wire).await;
+    let old_engine = wait_for_started(&mut original).await;
+    let first = submit_text(&original, "recovery keeps A").await;
+    let boundary = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut boundary = None;
+        let mut completed = false;
+        loop {
+            match original.events.recv().await.expect("event stream") {
+                SessionEvent::Nori(NoriEvent::ConversationResponseBoundary(value)) => {
+                    boundary = Some(value)
+                }
+                SessionEvent::Acp(AcpEvent::Response {
+                    request_id,
+                    response: Ok(acp::v1::AgentResponse::PromptResponse(_)),
+                }) if request_id == first => completed = true,
+                SessionEvent::Nori(NoriEvent::SessionPhaseChanged(
+                    nori_protocol::SessionPhase::Idle,
+                )) if completed && boundary.is_some() => {
+                    break boundary.expect("response boundary");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("first turn completes");
+    let second = submit_text(&original, "recovery discards B").await;
+    drive_prompt_to_completion(&mut original, &second).await;
+    let recorder = original
+        .handle
+        .conversation_recorder()
+        .await
+        .expect("recorder request")
+        .expect("journal");
+    recorder.flush().await.expect("flush journal");
+    original.handle.shutdown().await.expect("shutdown original");
+    // Simulate a crash after the durable rewind record and before backend-bound is appended.
+    let mut log =
+        nori_conversation::ConversationLog::open(recorder.transcript_path().with_extension("pkl"))
+            .expect("open journal");
+    log.append(nori_conversation::Event::Rewind {
+        head: Some(boundary.end),
+    })
+    .expect("commit interrupted rewind");
+    let loader = nori_harness::TranscriptLoader::new(temp.path().to_path_buf());
+    let transcript = loader
+        .load_transcript(recorder.project_id(), recorder.session_id())
+        .await
+        .expect("load interrupted transcript");
+    assert_eq!(transcript.latest_acp_session_id(), None);
+    let resume_wire = temp.path().join("resume-wire");
+    let config = NoriConfig {
+        active_agent: "mock-model".to_owned(),
+        cwd: temp.path().to_path_buf(),
+        nori_home: temp.path().to_path_buf(),
+        acp_proxy: nori_config::AcpProxyConfig {
+            enabled: true,
+            log_dir: resume_wire.clone(),
+        },
+        ..Default::default()
+    };
+    let agent = prepare_agent(AgentPrepareSpec {
+        handoff: None,
+        config: Arc::new(config),
+        cli_version: "rewind-recovery-test".to_owned(),
+        session_context: None,
+        initial_context: None,
+    })
+    .await
+    .expect("prepare replacement");
+    let mut resumed = launch_session(SessionLaunchSpec {
+        agent,
+        start: SessionStart::Resume(nori_harness::runtime::SessionResume {
+            // Even a caller that cached the old id must not reactivate it.
+            acp_session_id: Some(old_engine.clone()),
+            transcript: Some(transcript),
+        }),
+    });
+    wait_for_started(&mut resumed).await;
+    let request = submit_text(&resumed, "continue recovery").await;
+    drive_prompt_to_completion(&mut resumed, &request).await;
+    let prompt = serde_json::to_string(
+        recorded_prompts(&resume_wire)
+            .last()
+            .expect("recovery prompt"),
+    )
+    .expect("serialize prompt");
+    assert!(prompt.contains("recovery keeps A"), "{prompt}");
+    assert!(!prompt.contains("recovery discards B"), "{prompt}");
+    let wire_text = std::fs::read_dir(&resume_wire)
+        .expect("wire logs")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<String>();
+    assert!(!wire_text.contains("session/load"), "{wire_text}");
+    assert!(!wire_text.contains("session/resume"), "{wire_text}");
 }
 
 #[tokio::test]

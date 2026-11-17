@@ -30,7 +30,6 @@ use super::footer::footer_height;
 use super::footer::render_footer;
 use super::footer::reset_mode_after_activity;
 use super::footer::textarea_corner_segments;
-use super::footer::toggle_shortcut_mode;
 use super::history_search_popup::HistorySearchPopup;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
@@ -63,6 +62,7 @@ use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 use codex_file_search::FileMatch;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -77,6 +77,10 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 #[derive(Debug, PartialEq)]
 pub enum InputResult {
     Submitted(String),
+    /// Submit ahead of the queue by interrupting the current turn.
+    Steer(String),
+    /// Start the oldest queued prompt by interrupting the current turn.
+    PromoteQueued,
     Command(SlashCommand),
     None,
 }
@@ -112,6 +116,8 @@ impl PromptIndicator {
 }
 
 pub(crate) struct ChatComposer {
+    /// Most recently rendered editable body, used for pointer hit testing.
+    rendered_body_area: Cell<Option<Rect>>,
     textarea: TextArea,
     textarea_state: RefCell<TextAreaState>,
     input_enabled: bool,
@@ -143,6 +149,7 @@ pub(crate) struct ChatComposer {
     footer_mode: FooterMode,
     footer_hint_override: Option<Vec<(String, String)>>,
     context_window_percent: Option<i64>,
+    child_context: bool,
     session_usage: Option<crate::presentation::session_runtime::SessionUsageState>,
     system_info: Option<crate::system_info::SystemInfo>,
     /// The approval mode label to display in the footer (e.g., "Read Only", "Agent", "Full Access").
@@ -192,6 +199,7 @@ impl ChatComposer {
         let use_shift_enter_hint = enhanced_keys_supported;
 
         let mut this = Self {
+            rendered_body_area: Cell::new(None),
             textarea: TextArea::new(),
             textarea_state: RefCell::new(TextAreaState::default()),
             input_enabled: true,
@@ -221,6 +229,7 @@ impl ChatComposer {
             footer_mode: FooterMode::ShortcutSummary,
             footer_hint_override: None,
             context_window_percent: None,
+            child_context: false,
             session_usage: None,
             system_info: None,
             approval_mode_label: None,
@@ -241,7 +250,7 @@ impl ChatComposer {
 
     /// Returns true if the composer currently contains no user input.
     pub(crate) fn is_empty(&self) -> bool {
-        !self.is_shell_mode && self.textarea.is_empty()
+        !self.is_shell_mode && self.textarea.is_empty() && self.attached_images.is_empty()
     }
 
     /// Record the history metadata advertised by `SessionConfiguredEvent` so
@@ -266,13 +275,51 @@ impl ChatComposer {
         self.footer_layout_config = config;
     }
 
+    #[cfg(test)]
+    pub(super) fn set_placeholder_for_test(&mut self, placeholder: &str) {
+        self.placeholder_text = placeholder.to_owned();
+    }
+
     pub(crate) fn set_hotkey_config(&mut self, config: nori_config::HotkeyConfig) {
         self.textarea.set_hotkey_config(config);
     }
 
     pub(crate) fn set_vim_mode(&mut self, value: nori_config::VimEnterBehavior) {
         self.vim_enter_behavior = value;
+        self.textarea.set_kakoune_mode_enabled(false);
         self.textarea.set_vim_mode_enabled(value.is_enabled());
+    }
+
+    pub(crate) fn cursor_style(&self) -> crossterm::cursor::SetCursorStyle {
+        use crate::bottom_pane::textarea::VimModeState;
+        use crossterm::cursor::SetCursorStyle;
+        if !self.input_enabled || self.popup_active() {
+            return SetCursorStyle::DefaultUserShape;
+        }
+        match self.textarea.vim_mode_state_if_enabled() {
+            Some(VimModeState::Insert) => SetCursorStyle::SteadyBar,
+            Some(VimModeState::Normal) => SetCursorStyle::SteadyBlock,
+            None => SetCursorStyle::DefaultUserShape,
+        }
+    }
+
+    pub(crate) fn place_cursor_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if !self.input_enabled || self.popup_active() {
+            return false;
+        }
+        let Some(body) = self.rendered_body_area.get() else {
+            return false;
+        };
+        if body.intersection(area) != body {
+            return false;
+        }
+        let state = *self.textarea_state.borrow();
+        self.textarea.place_cursor_at(body, state, column, row)
+    }
+
+    /// Select the modalkit Kakoune editing engine for the prompt.
+    pub(crate) fn set_kakoune_mode(&mut self, enabled: bool) {
+        self.textarea.set_kakoune_mode_enabled(enabled);
     }
 
     pub(crate) fn should_handle_vim_insert_escape(&self, key_event: KeyEvent) -> bool {
@@ -477,6 +524,10 @@ impl ChatComposer {
         usage: Option<crate::presentation::session_runtime::SessionUsageState>,
     ) {
         self.session_usage = usage;
+    }
+
+    pub(crate) fn set_child_context(&mut self, child: bool) {
+        self.child_context = child;
     }
 
     pub(crate) fn set_system_info(&mut self, info: crate::system_info::SystemInfo) {
@@ -716,6 +767,7 @@ impl Renderable for ChatComposer {
         }
 
         let body_rect = Self::textarea_body_rect(textarea_rect, prompt_indicator);
+        self.rendered_body_area.set(Some(body_rect));
         let mut state = self.textarea_state.borrow_mut();
         StatefulWidgetRef::render_ref(&(&self.textarea), body_rect, buf, &mut state);
         if prompt_indicator.hides_textarea_prefix() && !textarea_rect.is_empty() {
@@ -797,40 +849,46 @@ fn render_textarea_corner_segments(
         return;
     }
 
-    let bottom_y = composer_rect.bottom().saturating_sub(1);
-    render_left_corner(composer_rect, composer_rect.y, buf, segments.top_left);
-    render_right_corner(composer_rect, composer_rect.y, buf, segments.top_right);
-    render_left_corner(composer_rect, bottom_y, buf, segments.bottom_left);
-    render_right_corner(composer_rect, bottom_y, buf, segments.bottom_right);
+    render_corner_row(
+        composer_rect,
+        composer_rect.y,
+        buf,
+        segments.top_left,
+        segments.top_right,
+    );
+    render_corner_row(
+        composer_rect,
+        composer_rect.bottom().saturating_sub(1),
+        buf,
+        segments.bottom_left,
+        segments.bottom_right,
+    );
 }
 
-/// Columns a corner segment may occupy: one in from the composer's left edge,
-/// matching the prompt gutter, and out to its right edge.
-fn corner_span(composer_rect: Rect) -> Option<(u16, u16)> {
-    let available = composer_rect.width.checked_sub(1)?;
-    (available > 0).then_some((composer_rect.x + 1, available))
-}
-
-fn render_left_corner(composer_rect: Rect, y: u16, buf: &mut Buffer, line: Line<'static>) {
-    let Some((x, available)) = corner_span(composer_rect) else {
-        return;
-    };
-    let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
-    if width == 0 || width > available {
-        return;
+/// Keep the leading editor mode visible and clip the two groups without overlap.
+fn render_corner_row(
+    composer_rect: Rect,
+    y: u16,
+    buf: &mut Buffer,
+    left: Line<'static>,
+    right: Line<'static>,
+) {
+    let available = composer_rect.width.saturating_sub(1);
+    let left_width = u16::try_from(left.width()).unwrap_or(u16::MAX);
+    let right_width = u16::try_from(right.width()).unwrap_or(u16::MAX);
+    let minimum_left = left_width.min(6).min(available);
+    let gap = u16::from(minimum_left > 0 && right_width > 0 && minimum_left < available);
+    let right_width = right_width.min(available.saturating_sub(minimum_left + gap));
+    let left_width = left_width.min(available.saturating_sub(right_width + gap));
+    if left_width > 0 {
+        left.render(Rect::new(composer_rect.x + 1, y, left_width, 1), buf);
     }
-    line.render(Rect::new(x, y, width, 1), buf);
-}
-
-fn render_right_corner(composer_rect: Rect, y: u16, buf: &mut Buffer, line: Line<'static>) {
-    let Some((x, available)) = corner_span(composer_rect) else {
-        return;
-    };
-    let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
-    if width == 0 || width > available {
-        return;
+    if right_width > 0 {
+        right.render(
+            Rect::new(composer_rect.right() - right_width, y, right_width, 1),
+            buf,
+        );
     }
-    line.render(Rect::new(x + available - width, y, width, 1), buf);
 }
 
 fn prompt_selection_action(

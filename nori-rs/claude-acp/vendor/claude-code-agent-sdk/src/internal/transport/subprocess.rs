@@ -1,0 +1,1027 @@
+//! Subprocess transport implementation for Claude Code CLI
+
+use async_trait::async_trait;
+use futures::stream::Stream;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::process::Child;
+use tokio::process::ChildStdin;
+use tokio::process::ChildStdout;
+use tokio::process::Command;
+use tokio::sync::Mutex;
+use tracing::debug;
+use tracing::error;
+use tracing::info;
+use tracing::instrument;
+use tracing::warn;
+
+use crate::errors::ClaudeError;
+use crate::errors::CliNotFoundError;
+use crate::errors::ConnectionError;
+use crate::errors::JsonDecodeError;
+use crate::errors::ProcessError;
+use crate::errors::Result;
+use crate::types::config::ClaudeAgentOptions;
+use crate::types::mcp::McpServerConfig;
+use crate::types::mcp::McpServers;
+use crate::types::messages::UserContentBlock;
+use crate::version::ENTRYPOINT;
+use crate::version::MIN_CLI_VERSION;
+use crate::version::SDK_VERSION;
+use crate::version::SKIP_VERSION_CHECK_ENV;
+use crate::version::check_version;
+
+use super::Transport;
+use super::ring_buffer::CircularBuffer;
+
+const DEFAULT_MAX_BUFFER_SIZE: usize = 20 * 1024 * 1024; // 20MB
+
+/// Query prompt type
+#[derive(Clone)]
+pub enum QueryPrompt {
+    /// Text prompt (one-shot mode)
+    Text(String),
+    /// Structured content blocks (supports images and text)
+    Content(Vec<UserContentBlock>),
+    /// Streaming mode (no initial prompt)
+    Streaming,
+}
+
+impl From<String> for QueryPrompt {
+    fn from(text: String) -> Self {
+        QueryPrompt::Text(text)
+    }
+}
+
+impl From<&str> for QueryPrompt {
+    fn from(text: &str) -> Self {
+        QueryPrompt::Text(text.to_string())
+    }
+}
+
+impl From<Vec<UserContentBlock>> for QueryPrompt {
+    fn from(blocks: Vec<UserContentBlock>) -> Self {
+        QueryPrompt::Content(blocks)
+    }
+}
+
+/// Subprocess transport for communicating with Claude Code CLI
+pub struct SubprocessTransport {
+    cli_path: PathBuf,
+    cwd: Option<PathBuf>,
+    options: ClaudeAgentOptions,
+    prompt: QueryPrompt,
+    process: Arc<Mutex<Option<Child>>>,
+    pub(crate) stdin: Arc<Mutex<Option<ChildStdin>>>,
+    pub(crate) stdout: Arc<Mutex<Option<BufReader<ChildStdout>>>>,
+    /// Circular buffer for transport message reading
+    /// Uses ringbuf for automatic old data recycling
+    buffer: Arc<Mutex<CircularBuffer>>,
+    ready: Arc<AtomicBool>,
+}
+
+impl SubprocessTransport {
+    /// Create a new subprocess transport
+    pub fn new(prompt: QueryPrompt, options: ClaudeAgentOptions) -> Result<Self> {
+        // Validate cwd early, before CLI lookup, for better error messages
+        if let Some(ref cwd) = options.cwd {
+            if !cwd.exists() {
+                return Err(ClaudeError::InvalidConfig(format!(
+                    "Working directory does not exist: {}. Please ensure the directory exists before connecting.",
+                    cwd.display()
+                )));
+            }
+            if !cwd.is_dir() {
+                return Err(ClaudeError::InvalidConfig(format!(
+                    "Working directory path is not a directory: {}",
+                    cwd.display()
+                )));
+            }
+        }
+
+        let cli_path = if let Some(ref path) = options.cli_path {
+            path.clone()
+        } else {
+            Self::find_cli(&options)?
+        };
+
+        let cwd = options.cwd.clone().or_else(|| std::env::current_dir().ok());
+        let max_buffer_size = options.max_buffer_size.unwrap_or(DEFAULT_MAX_BUFFER_SIZE);
+        let buffer = Arc::new(Mutex::new(CircularBuffer::new(max_buffer_size)));
+
+        Ok(Self {
+            cli_path,
+            cwd,
+            options,
+            prompt,
+            process: Arc::new(Mutex::new(None)),
+            stdin: Arc::new(Mutex::new(None)),
+            stdout: Arc::new(Mutex::new(None)),
+            buffer,
+            ready: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Find the Claude CLI executable
+    fn find_cli(options: &ClaudeAgentOptions) -> Result<PathBuf> {
+        // Strategy 0 (bundled): Check bundled CLI path
+        // ~/.claude/sdk/bundled/{CLI_VERSION}/claude
+        // Always checked regardless of bundled-cli feature (path won't exist if not downloaded)
+        if let Some(bundled_path) = crate::version::bundled_cli_path()
+            && bundled_path.exists()
+            && bundled_path.is_file()
+        {
+            info!("Using bundled Claude CLI: {}", bundled_path.display());
+            return Ok(bundled_path);
+        }
+
+        // Strategy 0.5 (adjacent): Check for CLI next to the current executable.
+        // This supports cargo-dist packaging where both binaries are in the same archive.
+        // After `npm install`, the CLI binary sits next to the agent binary.
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(exe_dir) = exe_path
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let cli_name = if cfg!(target_os = "windows") {
+                "claude.exe"
+            } else {
+                "claude"
+            };
+            let adjacent_path = exe_dir.join(cli_name);
+            if adjacent_path.exists() && adjacent_path.is_file() {
+                // Verify the adjacent binary is actually a Claude CLI with a valid version
+                if let Ok(output) = std::process::Command::new(&adjacent_path)
+                    .arg("--version")
+                    .output()
+                    && output.status.success()
+                {
+                    let version_str = String::from_utf8_lossy(&output.stdout);
+                    let version = version_str
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().next())
+                        .unwrap_or("")
+                        .trim();
+                    if check_version(version) {
+                        info!(
+                            "Using adjacent Claude CLI (v{}): {}",
+                            version,
+                            adjacent_path.display()
+                        );
+                        return Ok(adjacent_path);
+                    }
+                    warn!(
+                        "Adjacent Claude CLI at {} has unsupported version '{}', skipping",
+                        adjacent_path.display(),
+                        version
+                    );
+                } else {
+                    warn!(
+                        "Adjacent binary at {} is not a valid Claude CLI, skipping",
+                        adjacent_path.display()
+                    );
+                }
+            }
+        }
+
+        // Strategy 1: Try executing 'claude' directly from PATH
+        // This is the most reliable method as it respects the shell's PATH resolution
+        if let Ok(output) = std::process::Command::new("claude")
+            .arg("--version")
+            .output()
+            && output.status.success()
+        {
+            // 'claude' is in PATH and executable, return it as-is
+            // The OS will resolve it when we spawn the process
+            return Ok(PathBuf::from("claude"));
+        }
+
+        // Strategy 2: Use 'which' command to locate claude in PATH (Unix-like systems)
+        #[cfg(not(target_os = "windows"))]
+        if let Ok(output) = std::process::Command::new("which").arg("claude").output()
+            && output.status.success()
+        {
+            let path_str = String::from_utf8_lossy(&output.stdout);
+            let path = PathBuf::from(path_str.trim());
+            // Verify the path exists and is executable
+            if path.exists() && path.is_file() {
+                return Ok(path);
+            }
+        }
+
+        // Strategy 3: Use 'where' command on Windows
+        #[cfg(target_os = "windows")]
+        if let Ok(output) = std::process::Command::new("where").arg("claude").output() {
+            if output.status.success() {
+                let path_str = String::from_utf8_lossy(&output.stdout);
+                // 'where' returns all matches, take the first one
+                if let Some(first_line) = path_str.lines().next() {
+                    let path = PathBuf::from(first_line.trim());
+                    if path.exists() && path.is_file() {
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+
+        // Strategy 4: Check common installation locations
+        // Get home directory for path expansion
+        let home_dir = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE")) // Windows fallback
+            .ok()
+            .map(PathBuf::from);
+
+        // Common installation locations
+        let mut common_paths: Vec<PathBuf> = vec![];
+
+        // Unix-like paths
+        #[cfg(not(target_os = "windows"))]
+        {
+            common_paths.extend(vec![
+                PathBuf::from("/usr/local/bin/claude"),
+                PathBuf::from("/opt/homebrew/bin/claude"),
+                PathBuf::from("/usr/bin/claude"),
+            ]);
+
+            // Add home-relative paths if home directory is available
+            if let Some(ref home) = home_dir {
+                common_paths.push(home.join(".local/bin/claude"));
+                common_paths.push(home.join("bin/claude"));
+            }
+        }
+
+        // Windows paths
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(ref home) = home_dir {
+                common_paths.extend(vec![
+                    home.join("AppData\\Local\\Programs\\Claude\\claude.exe"),
+                    home.join("AppData\\Roaming\\npm\\claude.cmd"),
+                    home.join("AppData\\Roaming\\npm\\claude.exe"),
+                ]);
+            }
+            common_paths.extend(vec![
+                PathBuf::from("C:\\Program Files\\Claude\\claude.exe"),
+                PathBuf::from("C:\\Program Files (x86)\\Claude\\claude.exe"),
+            ]);
+        }
+
+        // Check each common path
+        for path in common_paths {
+            if path.exists() && path.is_file() {
+                return Ok(path);
+            }
+        }
+
+        // Strategy 5: Check if CLAUDE_CLI_PATH environment variable is set
+        if let Ok(cli_path) = std::env::var("CLAUDE_CLI_PATH") {
+            let path = PathBuf::from(cli_path);
+            if path.exists() && path.is_file() {
+                return Ok(path);
+            }
+        }
+
+        // Strategy 6 (auto-download): Download CLI to bundled path as last resort.
+        // Only triggered when explicitly opted in via auto_download_cli option.
+        // This ensures first-run experience works for npm/binary distribution users
+        // who have explicitly enabled this feature.
+        let mut download_error: Option<String> = None;
+        if options.auto_download_cli {
+            info!(
+                "Claude CLI not found, attempting to download v{}...",
+                crate::version::CLI_VERSION
+            );
+            match crate::version::download_cli() {
+                Ok(path) => {
+                    info!("Claude CLI downloaded to: {}", path.display());
+                    return Ok(path);
+                }
+                Err(e) => {
+                    warn!("Failed to auto-download CLI: {}", e);
+                    download_error = Some(e);
+                }
+            }
+        }
+
+        let mut message = "Claude Code CLI not found. Please ensure 'claude' is in your PATH or set CLAUDE_CLI_PATH environment variable.".to_string();
+        if let Some(dl_err) = download_error {
+            message.push_str(&format!(" Auto-download also failed: {dl_err}"));
+        } else if !options.auto_download_cli {
+            message.push_str(" Hint: set auto_download_cli=true in ClaudeAgentOptions to enable automatic CLI download.");
+        }
+
+        Err(ClaudeError::CliNotFound(CliNotFoundError::new(
+            message, None,
+        )))
+    }
+
+    /// Build command arguments from options
+    fn build_command(&self) -> Vec<String> {
+        let mut args = vec!["--output-format".to_string(), "stream-json".to_string()];
+
+        // Always add --verbose (matches Python SDK behavior which sends it unconditionally)
+        args.push("--verbose".to_string());
+
+        // For streaming mode or content mode, enable stream-json input
+        if matches!(
+            self.prompt,
+            QueryPrompt::Streaming | QueryPrompt::Content(_)
+        ) {
+            args.push("--input-format".to_string());
+            args.push("stream-json".to_string());
+        }
+
+        // Add system prompt
+        // Python SDK behavior (subprocess_cli.py):
+        // - If None: send --system-prompt "" to explicitly clear the default prompt
+        // - If string: use --system-prompt
+        // - If preset with append: use --append-system-prompt (NOT --system-prompt-preset)
+        //   This relies on default Claude Code prompt and just appends to it
+        if let Some(ref system_prompt) = self.options.system_prompt {
+            match system_prompt {
+                crate::types::config::SystemPrompt::Text(text) => {
+                    args.push("--system-prompt".to_string());
+                    args.push(text.clone());
+                }
+                crate::types::config::SystemPrompt::Preset(preset) => {
+                    // Only add append if present (uses default Claude Code prompt)
+                    if let Some(ref append) = preset.append {
+                        args.push("--append-system-prompt".to_string());
+                        args.push(append.clone());
+                    }
+                    // Note: preset.preset field is ignored - CLI uses default prompt
+                }
+            }
+        } else {
+            // When system_prompt is None, explicitly clear the default prompt
+            // This matches Python SDK behavior (subprocess_cli.py:170-171)
+            args.push("--system-prompt".to_string());
+            args.push(String::new());
+        }
+
+        // Add tools configuration
+        if let Some(ref tools) = self.options.tools {
+            match tools {
+                crate::types::config::Tools::List(tool_list) => {
+                    if tool_list.is_empty() {
+                        args.push("--tools".to_string());
+                        args.push(String::new());
+                    } else {
+                        args.push("--tools".to_string());
+                        args.push(tool_list.join(","));
+                    }
+                }
+                crate::types::config::Tools::Preset(_) => {
+                    // Preset object - 'claude_code' preset maps to 'default'
+                    args.push("--tools".to_string());
+                    args.push("default".to_string());
+                }
+            }
+        }
+
+        // Add permission mode
+        if let Some(mode) = self.options.permission_mode {
+            let mode_str = match mode {
+                crate::types::config::PermissionMode::Default => "default",
+                crate::types::config::PermissionMode::AcceptEdits => "acceptEdits",
+                crate::types::config::PermissionMode::Plan => "plan",
+                crate::types::config::PermissionMode::BypassPermissions => "bypassPermissions",
+            };
+            args.push("--permission-mode".to_string());
+            args.push(mode_str.to_string());
+        }
+
+        // Add allowed tools (Python SDK uses --allowedTools with comma-separated values)
+        if !self.options.allowed_tools.is_empty() {
+            args.push("--allowedTools".to_string());
+            args.push(self.options.allowed_tools.join(","));
+        }
+
+        // Add disallowed tools (Python SDK uses --disallowedTools with comma-separated values)
+        if !self.options.disallowed_tools.is_empty() {
+            args.push("--disallowedTools".to_string());
+            args.push(self.options.disallowed_tools.join(","));
+        }
+
+        // Add model
+        if let Some(ref model) = self.options.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+
+        // Add fallback model
+        if let Some(ref fallback_model) = self.options.fallback_model {
+            args.push("--fallback-model".to_string());
+            args.push(fallback_model.clone());
+        }
+
+        // Add beta features
+        if !self.options.betas.is_empty() {
+            let betas: Vec<String> = self
+                .options
+                .betas
+                .iter()
+                .map(|b| match b {
+                    crate::types::config::SdkBeta::Context1M => "context-1m-2025-08-07".to_string(),
+                })
+                .collect();
+            args.push("--betas".to_string());
+            args.push(betas.join(","));
+        }
+
+        // Add max budget USD
+        if let Some(max_budget) = self.options.max_budget_usd {
+            args.push("--max-budget-usd".to_string());
+            args.push(max_budget.to_string());
+        }
+
+        // Add max thinking tokens
+        if let Some(max_thinking) = self.options.max_thinking_tokens {
+            args.push("--max-thinking-tokens".to_string());
+            args.push(max_thinking.to_string());
+        }
+
+        // Add permission prompt tool name
+        if let Some(ref tool_name) = self.options.permission_prompt_tool_name {
+            args.push("--permission-prompt-tool".to_string());
+            args.push(tool_name.clone());
+        }
+
+        // Add output format (structured outputs / JSON schema)
+        // Expected format: {"type": "json_schema", "schema": {...}}
+        if let Some(ref output_format) = self.options.output_format
+            && output_format.get("type") == Some(&serde_json::json!("json_schema"))
+            && let Some(schema) = output_format.get("schema")
+        {
+            args.push("--json-schema".to_string());
+            args.push(schema.to_string());
+        }
+
+        // Add max turns
+        if let Some(max_turns) = self.options.max_turns {
+            args.push("--max-turns".to_string());
+            args.push(max_turns.to_string());
+        }
+
+        // Add resume session
+        if let Some(ref session_id) = self.options.resume {
+            args.push("--resume".to_string());
+            args.push(session_id.clone());
+        }
+
+        // Add continue conversation
+        if self.options.continue_conversation {
+            args.push("--continue".to_string());
+        }
+
+        // Add settings (combined with sandbox if both are provided)
+        let settings_value = self.build_settings_value();
+        if let Some(ref settings) = settings_value {
+            args.push("--settings".to_string());
+            args.push(settings.clone());
+        }
+
+        // Add additional directories
+        for dir in &self.options.add_dirs {
+            args.push("--add-dir".to_string());
+            args.push(dir.display().to_string());
+        }
+
+        // Add include partial messages
+        if self.options.include_partial_messages {
+            args.push("--include-partial-messages".to_string());
+        }
+
+        // Add fork session
+        if self.options.fork_session {
+            args.push("--fork-session".to_string());
+        }
+
+        // Note: Agents are sent via the initialize request body, not via CLI flags.
+        // This avoids OS ARG_MAX limits with large agent definitions (matches Python SDK behavior).
+
+        // Add setting sources
+        // Always send --setting-sources, even as empty string when None,
+        // to prevent CLI from using default setting sources (matches Python SDK behavior)
+        let sources_str = match &self.options.setting_sources {
+            Some(sources) => sources
+                .iter()
+                .map(|s| match s {
+                    crate::types::config::SettingSource::User => "user",
+                    crate::types::config::SettingSource::Project => "project",
+                    crate::types::config::SettingSource::Local => "local",
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            None => String::new(),
+        };
+        args.push("--setting-sources".to_string());
+        args.push(sources_str);
+
+        // Add plugins
+        for plugin in &self.options.plugins {
+            if let Some(path) = plugin.path() {
+                args.push("--plugin-dir".to_string());
+                args.push(path.display().to_string());
+            }
+        }
+
+        // Note: add_dirs is already added above (lines ~379-383), don't add again
+
+        // Add extra args
+        for (key, value) in &self.options.extra_args {
+            args.push(format!("--{}", key));
+            if let Some(v) = value {
+                args.push(v.clone());
+            }
+        }
+
+        // Add MCP config for SDK servers
+        match &self.options.mcp_servers {
+            McpServers::Dict(servers) => {
+                let mcp_config = build_mcp_config(servers);
+                // Check if mcpServers object inside is empty
+                let is_empty = mcp_config
+                    .get("mcpServers")
+                    .and_then(|v| v.as_object())
+                    .is_none_or(|o| o.is_empty());
+                if !is_empty {
+                    args.push("--mcp-config".to_string());
+                    if let Ok(config_str) = serde_json::to_string(&mcp_config) {
+                        tracing::info!("MCP config: {}", config_str);
+                        args.push(config_str);
+                    }
+                } else {
+                    tracing::warn!("MCP config is empty, no SDK servers registered");
+                }
+            }
+            McpServers::Path(path) => {
+                // Pass the file path directly to --mcp-config (same as Python SDK)
+                args.push("--mcp-config".to_string());
+                args.push(path.display().to_string());
+                tracing::info!("MCP config from file: {}", path.display());
+            }
+            McpServers::Empty => {
+                tracing::debug!("No MCP servers configured");
+            }
+        }
+
+        tracing::info!("CLI args: {:?}", args);
+
+        args
+    }
+
+    /// Build settings value, merging sandbox settings if provided.
+    ///
+    /// Returns the settings value as either:
+    /// - A JSON string (if sandbox is provided or settings is JSON)
+    /// - A file path (if only settings path is provided without sandbox)
+    /// - None if neither settings nor sandbox is provided
+    fn build_settings_value(&self) -> Option<String> {
+        let has_settings = self.options.settings.is_some();
+        let has_sandbox = self.options.sandbox.is_some();
+
+        if !has_settings && !has_sandbox {
+            return None;
+        }
+
+        // If only settings path and no sandbox, pass through as-is
+        if has_settings && !has_sandbox {
+            return self.options.settings.clone();
+        }
+
+        // If we have sandbox settings, we need to merge into a JSON object
+        let mut settings_obj = serde_json::Map::new();
+
+        if let Some(settings_str) = &self.options.settings {
+            let trimmed = settings_str.trim();
+            // Check if settings is a JSON string or a file path
+            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                // Parse JSON string
+                if let Ok(serde_json::Value::Object(obj)) =
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+                {
+                    settings_obj = obj;
+                }
+            } else {
+                // It's a file path - try to read and parse
+                if let Ok(content) = std::fs::read_to_string(trimmed)
+                    && let Ok(serde_json::Value::Object(obj)) =
+                        serde_json::from_str::<serde_json::Value>(&content)
+                {
+                    settings_obj = obj;
+                }
+            }
+        }
+
+        // Merge sandbox settings
+        if let Some(sandbox) = &self.options.sandbox
+            && let Ok(sandbox_value) = serde_json::to_value(sandbox)
+        {
+            settings_obj.insert("sandbox".to_string(), sandbox_value);
+        }
+
+        Some(serde_json::to_string(&serde_json::Value::Object(settings_obj)).unwrap_or_default())
+    }
+
+    /// Check Claude CLI version
+    async fn check_claude_version(&self) -> Result<()> {
+        // Skip if environment variable is set
+        if std::env::var(SKIP_VERSION_CHECK_ENV).is_ok() {
+            return Ok(());
+        }
+
+        // Skip if configured in options
+        if self.options.skip_version_check {
+            return Ok(());
+        }
+
+        let output = Command::new(&self.cli_path)
+            .arg("--version")
+            .output()
+            .await
+            .map_err(|e| {
+                ClaudeError::Connection(ConnectionError::new(format!(
+                    "Failed to get Claude version: {}",
+                    e
+                )))
+            })?;
+
+        let version_output = String::from_utf8_lossy(&output.stdout);
+        let version = version_output
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or("")
+            .trim();
+
+        if !check_version(version) {
+            warn!(
+                "Claude Code CLI ({}) version {} is below minimum required version {}. Some features may not work correctly.",
+                self.cli_path.display(),
+                version,
+                MIN_CLI_VERSION
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Build environment variables
+    fn build_env(&self) -> HashMap<String, String> {
+        let mut env = self.options.env.clone();
+        env.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), ENTRYPOINT.to_string());
+        env.insert(
+            "CLAUDE_AGENT_SDK_VERSION".to_string(),
+            SDK_VERSION.to_string(),
+        );
+
+        // Enable file checkpointing if requested
+        if self.options.enable_file_checkpointing {
+            env.insert(
+                "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".to_string(),
+                "true".to_string(),
+            );
+        }
+
+        env
+    }
+}
+
+#[async_trait]
+impl Transport for SubprocessTransport {
+    #[instrument(name = "claude.transport.connect", skip(self), fields(cli_path = %self.cli_path.display()))]
+    async fn connect(&mut self) -> Result<()> {
+        info!("Starting Claude CLI subprocess");
+        debug!("CLI path: {}", self.cli_path.display());
+
+        // Note: cwd validation is done in new() for early error detection
+
+        // Check version
+        self.check_claude_version().await?;
+
+        // Build command
+        let args = self.build_command();
+        let env = self.build_env();
+
+        // Build command
+        let mut cmd = Command::new(&self.cli_path);
+        cmd.args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .envs(&env);
+
+        if let Some(ref cwd) = self.cwd {
+            cmd.current_dir(cwd);
+        }
+
+        // Spawn process
+        let mut child = cmd.spawn().map_err(|e| {
+            error!("Failed to spawn Claude CLI: {}", e);
+            ClaudeError::Process(ProcessError::new(
+                format!("Failed to spawn Claude CLI process: {}", e),
+                None,
+                None,
+            ))
+        })?;
+        info!("Claude CLI process spawned (PID: {:?})", child.id());
+
+        // Take stdin and stdout
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ClaudeError::Connection(ConnectionError::new("Failed to get stdin".to_string()))
+        })?;
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ClaudeError::Connection(ConnectionError::new("Failed to get stdout".to_string()))
+        })?;
+
+        let stderr = child.stderr.take();
+
+        // Spawn stderr handler if callback is provided
+        if let (Some(stderr), Some(callback)) = (stderr, &self.options.stderr_callback) {
+            let callback = Arc::clone(callback);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line).await {
+                    if n == 0 {
+                        break;
+                    }
+                    callback(line.clone());
+                    line.clear();
+                }
+            });
+        }
+
+        *self.stdin.lock().await = Some(stdin);
+        *self.stdout.lock().await = Some(BufReader::new(stdout));
+        *self.process.lock().await = Some(child);
+        self.ready.store(true, Ordering::Release);
+
+        // Send initial prompt based on type
+        match &self.prompt {
+            QueryPrompt::Text(text) => {
+                let text_owned = text.clone();
+                self.write(&text_owned).await?;
+                self.end_input().await?;
+            }
+            QueryPrompt::Content(blocks) => {
+                // Format as JSON user message for stream-json input format
+                let user_message = serde_json::json!({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": blocks
+                    }
+                });
+                let content_json = serde_json::to_string(&user_message).map_err(|e| {
+                    ClaudeError::Transport(format!("Failed to serialize content blocks: {}", e))
+                })?;
+                self.write(&content_json).await?;
+                self.end_input().await?;
+            }
+            QueryPrompt::Streaming => {
+                // Don't send initial prompt or close stdin - leave it open for streaming
+            }
+        }
+
+        info!("Claude CLI subprocess connected successfully");
+        Ok(())
+    }
+
+    #[instrument(name = "claude.transport.write", skip(self, data), fields(data_length = data.len()))]
+    async fn write(&mut self, data: &str) -> Result<()> {
+        let mut stdin_guard = self.stdin.lock().await;
+        if let Some(ref mut stdin) = *stdin_guard {
+            stdin
+                .write_all(data.as_bytes())
+                .await
+                .map_err(|e| ClaudeError::Transport(format!("Failed to write to stdin: {}", e)))?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .map_err(|e| ClaudeError::Transport(format!("Failed to write newline: {}", e)))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|e| ClaudeError::Transport(format!("Failed to flush stdin: {}", e)))?;
+            Ok(())
+        } else {
+            Err(ClaudeError::Transport("stdin not available".to_string()))
+        }
+    }
+
+    fn read_messages(
+        &mut self,
+    ) -> Pin<Box<dyn Stream<Item = Result<serde_json::Value>> + Send + '_>> {
+        let stdout = Arc::clone(&self.stdout);
+        let buffer = Arc::clone(&self.buffer);
+
+        Box::pin(async_stream::stream! {
+            let mut stdout_guard = stdout.lock().await;
+            if let Some(ref mut reader) = *stdout_guard {
+                let mut line = String::new();
+
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => {
+                            tracing::warn!("SDK transport: EOF received from CLI stdout");
+                            // EOF
+                            break;
+                        }
+                        Ok(n) => {
+                            if n > 0 {
+                                tracing::trace!("SDK transport: read {} bytes from CLI", n);
+
+                                // Write to circular buffer (old data auto-recycled by ringbuf)
+                                buffer.lock().await.write(line.as_bytes());
+
+                                // Try to read a complete line from the circular buffer
+                                match buffer.lock().await.read_line() {
+                                    Ok(Some(data)) => {
+                                        let trimmed = std::str::from_utf8(&data)
+                                            .unwrap_or("")
+                                            .trim();
+                                        if trimmed.is_empty() {
+                                            continue;
+                                        }
+
+                                        match serde_json::from_str::<serde_json::Value>(trimmed) {
+                                            Ok(json) => {
+                                                yield Ok(json);
+                                            }
+                                            Err(e) => {
+                                                yield Err(ClaudeError::JsonDecode(JsonDecodeError::new(
+                                                    format!("Failed to parse JSON: {}", e),
+                                                    trimmed.to_string(),
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // Incomplete line in buffer, wait for more data
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        yield Err(ClaudeError::Transport(format!(
+                                            "Circular buffer error: {}", e
+                                        )));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(ClaudeError::Transport(format!("Failed to read line: {}", e)));
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        // Close stdin
+        if let Some(mut stdin) = self.stdin.lock().await.take() {
+            let _ = stdin.shutdown().await;
+        }
+
+        // Wait for process to exit
+        if let Some(mut process) = self.process.lock().await.take() {
+            let status = process.wait().await.map_err(|e| {
+                ClaudeError::Process(ProcessError::new(
+                    format!("Failed to wait for process: {}", e),
+                    None,
+                    None,
+                ))
+            })?;
+
+            if !status.success() {
+                return Err(ClaudeError::Process(ProcessError::new(
+                    "Claude CLI exited with non-zero status".to_string(),
+                    status.code(),
+                    None,
+                )));
+            }
+        }
+
+        self.ready.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
+    async fn end_input(&mut self) -> Result<()> {
+        if let Some(mut stdin) = self.stdin.lock().await.take() {
+            stdin
+                .shutdown()
+                .await
+                .map_err(|e| ClaudeError::Transport(format!("Failed to close stdin: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    fn get_stdin(&self) -> Option<Arc<Mutex<Option<tokio::process::ChildStdin>>>> {
+        Some(Arc::clone(&self.stdin))
+    }
+}
+
+impl Drop for SubprocessTransport {
+    fn drop(&mut self) {
+        match self.process.try_lock() {
+            Ok(mut guard) => {
+                if let Some(mut process) = guard.take() {
+                    debug!("Terminating Claude CLI process in Drop");
+                    let _ = process.start_kill();
+                }
+            }
+            Err(_) => {
+                // Lock is held by another task, process will be cleaned up by OS
+                // This is safe - tokio will ensure the process is reaped
+                warn!("Failed to acquire process lock in Drop, OS will clean up the process");
+            }
+        }
+    }
+}
+
+/// Build MCP config JSON for CLI --mcp-config argument
+///
+/// This converts MCP server configurations to JSON format that Claude CLI understands.
+/// The format is: `{"mcpServers": {"server_name": {"type": "...", ...}, ...}}`
+///
+/// For SDK servers, we pass only `{"type": "sdk", "name": "..."}` (no tools array).
+/// The tools are discovered at runtime via the `mcp_message` control protocol when
+/// CLI sends `tools/list` request.
+fn build_mcp_config(servers: &HashMap<String, McpServerConfig>) -> serde_json::Value {
+    let mut mcp_servers = serde_json::Map::new();
+
+    for (name, server_config) in servers {
+        match server_config {
+            McpServerConfig::Sdk(sdk) => {
+                // SDK servers: pass type and name only, tools are discovered via mcp_message
+                // This matches how Python SDK handles SDK servers
+                tracing::debug!("Adding SDK server '{}' to --mcp-config", name);
+                mcp_servers.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "type": "sdk",
+                        "name": sdk.name
+                    }),
+                );
+            }
+            McpServerConfig::Stdio(stdio) => {
+                let mut entry = serde_json::json!({
+                    "type": "stdio",
+                    "command": stdio.command
+                });
+                if let Some(args) = &stdio.args {
+                    entry["args"] = serde_json::json!(args);
+                }
+                if let Some(env) = &stdio.env {
+                    entry["env"] = serde_json::json!(env);
+                }
+                mcp_servers.insert(name.clone(), entry);
+            }
+            McpServerConfig::Sse(sse) => {
+                let mut entry = serde_json::json!({
+                    "type": "sse",
+                    "url": sse.url
+                });
+                if let Some(headers) = &sse.headers {
+                    entry["headers"] = serde_json::json!(headers);
+                }
+                mcp_servers.insert(name.clone(), entry);
+            }
+            McpServerConfig::Http(http) => {
+                let mut entry = serde_json::json!({
+                    "type": "http",
+                    "url": http.url
+                });
+                if let Some(headers) = &http.headers {
+                    entry["headers"] = serde_json::json!(headers);
+                }
+                mcp_servers.insert(name.clone(), entry);
+            }
+        }
+    }
+
+    // Wrap in {"mcpServers": ...} as expected by CLI
+    serde_json::json!({
+        "mcpServers": serde_json::Value::Object(mcp_servers)
+    })
+}

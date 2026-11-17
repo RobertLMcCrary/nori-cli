@@ -27,6 +27,17 @@ pub(crate) enum HarnessAction {
     },
     Compact,
     Branch,
+    ForkHistory {
+        context: String,
+        source: Option<(String, i64, i64)>,
+    },
+    SendSubagentMessage {
+        key: crate::subagent_switcher::SubagentKey,
+        session_id: nori_protocol::acp::v1::SessionId,
+        text: String,
+        image_paths: Vec<PathBuf>,
+        steer: bool,
+    },
     UndoTo(i64),
     LoadUndoSnapshots,
     RunUserShell(String),
@@ -105,7 +116,7 @@ pub(crate) enum AppEvent {
     /// listing. The successful value still owns that exact live connection.
     AgentPrepared {
         generation: SessionGeneration,
-        agent: Result<nori_harness::runtime::PreparedAgent, String>,
+        agent: anyhow::Result<nori_harness::runtime::PreparedAgent>,
         intent: AgentPrepareIntent,
     },
 
@@ -174,6 +185,33 @@ pub(crate) enum AppEvent {
     DiffResult(String),
 
     InsertHistoryCell(Box<dyn HistoryCell>),
+    RevealUserQuestion,
+    UpdateHistoryToolSnapshot {
+        generation: SessionGeneration,
+        snapshot: Box<crate::presentation::ToolSnapshot>,
+    },
+    FinalizeHistoryTools {
+        generation: SessionGeneration,
+        call_ids: Vec<String>,
+    },
+    /// Associate a completed rendered answer with its canonical log records.
+    ResponseBoundary(nori_protocol::ConversationResponseBoundary),
+    ResponseRewindFinished {
+        generation: SessionGeneration,
+        cell: std::sync::Arc<dyn HistoryCell>,
+        result: Result<(), String>,
+    },
+    ChildHistoryReady {
+        request_id: i64,
+        key: crate::subagent_switcher::SubagentKey,
+        focus_responses: bool,
+        result: Result<Vec<nori_protocol::SessionEvent>, String>,
+    },
+    ChildHistoryActionFinished {
+        key: crate::subagent_switcher::SubagentKey,
+        rewound: bool,
+        result: Result<Vec<nori_protocol::SessionEvent>, String>,
+    },
 
     /// The session's history starts or stops being replayed into the scrollback.
     HistoryReplay(HistoryReplay),
@@ -250,10 +288,16 @@ pub(crate) enum AppEvent {
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 
-    /// Immediately prepare a live candidate connection for an agent switch.
-    PrepareAgentCandidate {
-        /// The agent name of the selected agent (e.g., "mock-model", "gemini-2.5-flash")
+    /// Start the existing sign-in flow for a selected provider.
+    LoginProvider {
         agent_name: String,
+    },
+
+    /// Select a model while retaining alternative routes for that same model.
+    SelectModelRoutes {
+        routes: Vec<crate::nori::unified_model_picker::ModelRoute>,
+        value_name: String,
+        origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     },
 
     /// Abandon the prepared candidate while keeping the active session.
@@ -323,6 +367,24 @@ pub(crate) enum AppEvent {
     /// by default).
     CycleEffort(crate::chatwidget::ModelStep),
 
+    /// The independent control plane for a focused subagent, when it has one.
+    SubagentControlsReady {
+        key: crate::subagent_switcher::SubagentKey,
+        revision: i64,
+        handle: Option<nori_harness::runtime::HarnessHandle>,
+        config_options: Vec<SessionConfigOption>,
+        error: Option<String>,
+    },
+
+    SubagentConfigSetResult {
+        key: crate::subagent_switcher::SubagentKey,
+        result: Result<Vec<SessionConfigOption>, String>,
+        config_id: String,
+        value: String,
+        route_fallback_eligible: bool,
+        route_token: Option<i64>,
+    },
+
     /// Set an ACP session config option value.
     SetAcpSessionConfigOption {
         config_id: String,
@@ -334,6 +396,7 @@ pub(crate) enum AppEvent {
         /// rejects can still be run by persisting it and restarting with the
         /// model injected at spawn.
         is_custom_model: bool,
+        route_token: Option<i64>,
         /// Whether the `/config` panel reopens once the value is set.
         origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     },
@@ -354,6 +417,8 @@ pub(crate) enum AppEvent {
         origin: crate::nori::session_config_picker::ConfigPickerOrigin,
         config_options: Option<Vec<SessionConfigOption>>,
         error: Option<String>,
+        route_fallback_eligible: bool,
+        route_token: Option<i64>,
     },
 
     /// Latest raw ACP session config for silently seeding local UI state.
@@ -367,6 +432,13 @@ pub(crate) enum AppEvent {
         generation: i64,
         mode: Option<AcpModeConfig>,
     },
+
+    /// A provider login began for the root or focused child session.
+    LoginStarted {
+        target: Option<crate::subagent_switcher::SubagentKey>,
+    },
+    /// A provider login was cancelled before its completion event.
+    LoginCancelled,
 
     /// Result of OAuth login flow completion.
     LoginComplete {
@@ -542,6 +614,34 @@ pub(crate) enum AppEvent {
         result: Result<String, String>,
     },
 
+    /// Show searchable past conversations for insertion into the draft.
+    ShowReferenceSessionPicker {
+        sessions: Vec<crate::nori::reference_session_picker::ReferenceSession>,
+        target: crate::subagent_switcher::Target,
+    },
+
+    /// Load the selected source conversation before inserting its reference.
+    LoadSessionReference {
+        project_id: String,
+        session_id: String,
+        agent: String,
+        target: crate::subagent_switcher::Target,
+    },
+
+    /// Update a past conversation preview in the open picker.
+    ReferenceSessionPreview {
+        project_id: String,
+        session_id: String,
+        agent: String,
+        preview: String,
+    },
+
+    /// Insert a selected conversation reference at the draft cursor.
+    InsertSessionReference {
+        text: String,
+        target: crate::subagent_switcher::Target,
+    },
+
     /// Show the viewonly session picker with loaded sessions.
     ShowViewonlySessionPicker {
         /// The loaded session metadata for the picker
@@ -683,6 +783,30 @@ pub(crate) enum AppEvent {
     /// swapping the active session to the forked one.
     BranchFromCurrent,
 
+    /// Continue a selected history prefix in a separate child session.
+    ForkResponseSubagent {
+        context: String,
+        source: Option<(String, i64, i64)>,
+    },
+    SendSubagentMessage {
+        key: crate::subagent_switcher::SubagentKey,
+        text: String,
+        image_paths: Vec<PathBuf>,
+        steer: bool,
+    },
+    SubagentMessageFailed {
+        key: crate::subagent_switcher::SubagentKey,
+        text: String,
+        image_paths: Vec<PathBuf>,
+        error: String,
+    },
+    /// Show a transient notice without adding it to the transcript.
+    TransientNotice(String),
+    ChildSessionOutput {
+        key: crate::subagent_switcher::SubagentKey,
+        text: String,
+    },
+
     /// Fork the conversation to just before the selected user message.
     ForkToMessage {
         /// Index of the target user message cell in `transcript_cells`.
@@ -712,6 +836,6 @@ pub(crate) enum AgentPrepareIntent {
 /// The bounds of a replayed history among the cells inserted into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryReplay {
-    Started,
+    Started(nori_protocol::ReplaySource),
     Finished,
 }

@@ -1,14 +1,15 @@
 ---
 source: tui-components/src/picker/tests.rs
+assertion_line: 393
 expression: "snapshot(&state, 62, 10)"
 ---
 "                                                              "
 "  Resume a session                                            "
 "  Search ACP sessions or start fresh                          "
 "  All  Local  Cloud                                           "
+"  ⌕  Title, project, or session id                            "
 "                                                              "
 "  ◌ Loading sessions…                                         "
 "    Results will appear without rebuilding the picker.        "
-"                                                              "
 "  ↑↓/j/k move  / search  enter select  esc close              "
 "                                                              "

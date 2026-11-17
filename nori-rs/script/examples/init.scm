@@ -3,6 +3,8 @@
 ;; Land work as small, reviewable commits and a tidy pull request.
 (define-workflow land
   (turns 3)
+  ;; Optional subscription fallback order; use IDs from your agent's catalog.
+  ;; (fallback-models "provider/preferred-alternative" "provider/other-alternative")
   (on-change "Commit what you just changed as focused commits; explain the why.")
   (on-stop "Run the tests that cover what you changed, and fix what fails.")
   (on-pr "Check that the description lists every user-visible change.")

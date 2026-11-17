@@ -33,7 +33,7 @@ struct ReleaseInfo {
 }
 
 pub fn get_upgrade_version(config: &NoriConfig) -> Option<String> {
-    if !config.check_for_update_on_startup {
+    if !config.check_for_update_on_startup || CODEX_CLI_VERSION == "0.0.0" {
         return None;
     }
 

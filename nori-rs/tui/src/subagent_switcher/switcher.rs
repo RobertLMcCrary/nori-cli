@@ -6,7 +6,11 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use crossterm::event::MouseButton;
+use crossterm::event::MouseEvent;
+use crossterm::event::MouseEventKind;
 use nori_config::HotkeyBinding;
+use ratatui::layout::Position;
 use ratatui::layout::Rect;
 
 use super::Transition;
@@ -82,6 +86,7 @@ pub(crate) struct Switcher {
     pub(super) body: Option<Body>,
     pub(super) animations: bool,
     pub(super) tick: i64,
+    pointer: Option<(Target, u16, u16, bool)>,
 }
 
 impl Switcher {
@@ -91,6 +96,7 @@ impl Switcher {
             body: None,
             animations: roster.animations,
             tick: roster.tick,
+            pointer: None,
         }
     }
 
@@ -121,6 +127,7 @@ impl Switcher {
 
     /// Act on a key. `toggle` is the binding that opened the switcher, which also closes it.
     pub(crate) fn on_key(&mut self, key: KeyEvent, toggle: &HotkeyBinding) -> Option<Transition> {
+        self.pointer = None;
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return None;
         }
@@ -134,7 +141,7 @@ impl Switcher {
             KeyCode::Char('c') if ctrl => return Some(Transition::Close),
             KeyCode::Enter => {
                 return match self.list.selected_entry().map(|entry| entry.target) {
-                    Some(Target::Main) => Some(Transition::Close),
+                    Some(Target::Main) => Some(Transition::FocusMain),
                     Some(Target::Subagent(subagent)) => Some(Transition::Focus(subagent)),
                     None => None,
                 };
@@ -151,6 +158,60 @@ impl Switcher {
             KeyCode::Char('u') if ctrl => self.list.clear_query(),
             KeyCode::Char('w') if ctrl => self.list.delete_word(),
             KeyCode::Char(ch) if plain => self.list.push_char(ch),
+            _ => {}
+        }
+        None
+    }
+
+    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent, area: Rect) -> Option<Transition> {
+        let parts = layout(area);
+        let inside = parts.list.contains(Position::new(mouse.column, mouse.row));
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if inside => {
+                self.pointer = None;
+                self.list.step(if mouse.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                });
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pointer = inside
+                    .then(|| usize::from(mouse.row - parts.list.y) + self.list.scroll_top)
+                    .and_then(|row| self.list.rows().get(row))
+                    .map(|row| (row.entry.target, mouse.column, mouse.row, false));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((_, column, last_row, dragged)) = &mut self.pointer {
+                    let delta =
+                        isize::try_from(i32::from(*last_row) - i32::from(mouse.row)).unwrap_or(0);
+                    *dragged |= mouse.column != *column || delta != 0;
+                    *last_row = mouse.row;
+                    if delta != 0 {
+                        self.list.jump(delta);
+                        self.list
+                            .scroll_to_selection(usize::from(parts.list.height));
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some((target, _, _, false)) = self.pointer.take() else {
+                    return None;
+                };
+                if !inside {
+                    return None;
+                }
+                let row = usize::from(mouse.row - parts.list.y) + self.list.scroll_top;
+                if self.list.rows().get(row).map(|row| row.entry.target) != Some(target) {
+                    return None;
+                }
+                self.list.select_index_at(row);
+                return Some(match target {
+                    Target::Main => Transition::FocusMain,
+                    Target::Subagent(subagent) => Transition::Focus(subagent),
+                });
+            }
+            MouseEventKind::Down(_) | MouseEventKind::Up(_) => self.pointer = None,
             _ => {}
         }
         None

@@ -10,25 +10,18 @@ use std::sync::atomic::Ordering;
 use crossterm::cursor::MoveTo;
 use crossterm::cursor::Show;
 use crossterm::event::KeyCode;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
 use ratatui::crossterm::execute;
-use ratatui::layout::Position;
 use ratatui::layout::Rect;
 
 use crate::key_hint;
 
-use super::DisableAlternateScroll;
-use super::EnableAlternateScroll;
 use super::Terminal;
 
 pub const SUSPEND_KEY: key_hint::KeyBinding = key_hint::ctrl(KeyCode::Char('z'));
 
 /// Coordinates suspend/resume handling so the TUI can restore terminal context after SIGTSTP.
 ///
-/// On suspend, it records which resume path to take (realign inline viewport vs. restore alt
-/// screen) and caches the inline cursor row so the cursor can be placed meaningfully before
-/// yielding.
+/// On suspend, it records the inline viewport position and caches the cursor row before yielding.
 ///
 /// After resume, `prepare_resume_action` consumes the pending intent and returns a
 /// `PreparedResumeAction` describing any viewport adjustments to apply inside the synchronized
@@ -57,21 +50,16 @@ impl SuspendContext {
 
     /// Capture how to resume, stash cursor position, and temporarily yield during SIGTSTP.
     ///
-    /// - If the alt screen is active, exit alt-scroll/alt-screen and record `RestoreAlt`;
-    ///   otherwise record `RealignInline`.
-    /// - Update the cached inline cursor row so suspend can place the cursor meaningfully.
-    /// - Trigger SIGTSTP so the process can be resumed and continue drawing with the saved state.
-    pub(crate) fn suspend(&self, alt_screen_active: &Arc<AtomicBool>) -> Result<()> {
-        if alt_screen_active.load(Ordering::Relaxed) {
-            // Leave alt-screen so the terminal returns to the normal buffer while suspended; also turn off alt-scroll.
-            let _ = execute!(stdout(), DisableAlternateScroll);
-            let _ = execute!(stdout(), LeaveAlternateScreen);
-            self.set_resume_action(ResumeAction::RestoreAlt);
-        } else {
-            self.set_resume_action(ResumeAction::RealignInline);
-        }
+    /// Record the inline resume position and yield to the shell.
+    pub(crate) fn suspend(&self, _alt_screen_active: &Arc<AtomicBool>) -> Result<()> {
+        self.set_resume_action(ResumeAction::RealignInline);
         let y = self.suspend_cursor_y.load(Ordering::Relaxed);
-        let _ = execute!(stdout(), MoveTo(0, y), Show);
+        let _ = execute!(
+            stdout(),
+            crossterm::cursor::SetCursorStyle::DefaultUserShape,
+            MoveTo(0, y),
+            Show
+        );
         suspend_process()
     }
 
@@ -82,7 +70,7 @@ impl SuspendContext {
     pub(crate) fn prepare_resume_action(
         &self,
         terminal: &mut Terminal,
-        alt_saved_viewport: &mut Option<Rect>,
+        _alt_saved_viewport: &mut Option<Rect>,
     ) -> Option<PreparedResumeAction> {
         let action = self.take_resume_action()?;
         match action {
@@ -92,14 +80,6 @@ impl SuspendContext {
                     .unwrap_or(terminal.last_known_cursor_pos);
                 let viewport = Rect::new(0, cursor_pos.y, 0, 0);
                 Some(PreparedResumeAction::RealignViewport(viewport))
-            }
-            ResumeAction::RestoreAlt => {
-                if let Ok(Position { y, .. }) = terminal.get_cursor_position()
-                    && let Some(saved) = alt_saved_viewport.as_mut()
-                {
-                    saved.y = y;
-                }
-                Some(PreparedResumeAction::RestoreAltScreen)
             }
         }
     }
@@ -131,23 +111,18 @@ impl SuspendContext {
 
 /// Captures what should happen when returning from suspend.
 ///
-/// Either realign the inline viewport to keep the cursor position, or re-enter the alt screen
-/// to restore the overlay UI.
+/// Realign the inline viewport to keep the cursor position.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResumeAction {
     /// Shift the inline viewport to keep the cursor anchored after resume.
     RealignInline,
-    /// Re-enter the alt screen and restore the overlay UI.
-    RestoreAlt,
 }
 
 /// Describes the viewport change to apply when resuming from suspend during the synchronized draw.
 ///
-/// Either restore the alt screen (with viewport reset) or realign the inline viewport.
+/// Realign the inline viewport after resuming.
 #[derive(Clone, Debug)]
 pub(crate) enum PreparedResumeAction {
-    /// Re-enter the alt screen and reset the viewport to the terminal dimensions.
-    RestoreAltScreen,
     /// Apply a viewport shift to keep the inline cursor position stable.
     RealignViewport(Rect),
 }
@@ -160,15 +135,6 @@ impl PreparedResumeAction {
                 // The shell wrote to the screen while Nori was suspended, so the rows above the
                 // viewport are no longer the ones Nori wrote.
                 terminal.written_history.clear();
-            }
-            PreparedResumeAction::RestoreAltScreen => {
-                execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                // Enable "alternate scroll" so terminals may translate wheel to arrows
-                execute!(terminal.backend_mut(), EnableAlternateScroll)?;
-                if let Ok(size) = terminal.size() {
-                    terminal.set_viewport_area(Rect::new(0, 0, size.width, size.height));
-                    terminal.clear()?;
-                }
             }
         }
         Ok(())

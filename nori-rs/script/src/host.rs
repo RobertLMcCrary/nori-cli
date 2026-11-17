@@ -17,6 +17,7 @@ use crate::inline;
 use crate::inline::InlinePrompt;
 use crate::load::Loaded;
 use crate::load::load_scripts;
+use crate::load::load_scripts_with_defaults;
 
 enum Request {
     Loaded(mpsc::Sender<Result<Loaded, ScriptError>>),
@@ -35,10 +36,26 @@ impl ScriptHost {
     /// once (see [`load`](crate::load)). Pass a project path only for a
     /// trusted directory.
     pub fn spawn(global: Option<PathBuf>, project: Option<PathBuf>) -> std::io::Result<Self> {
+        Self::spawn_inner(global, project, false)
+    }
+
+    /// Starts with Nori's built-in Steel workflow before the user's scripts.
+    pub fn spawn_with_defaults(
+        global: Option<PathBuf>,
+        project: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_inner(global, project, true)
+    }
+
+    fn spawn_inner(
+        global: Option<PathBuf>,
+        project: Option<PathBuf>,
+        builtin_defaults: bool,
+    ) -> std::io::Result<Self> {
         let (requests, inbox) = mpsc::channel();
         thread::Builder::new()
             .name("nori-script".to_string())
-            .spawn(move || serve(global, project, &inbox))?;
+            .spawn(move || serve(global, project, builtin_defaults, &inbox))?;
         Ok(Self { requests })
     }
 
@@ -78,8 +95,18 @@ impl ScriptHost {
     }
 }
 
-fn serve(global: Option<PathBuf>, project: Option<PathBuf>, inbox: &mpsc::Receiver<Request>) {
-    let (mut engine, loaded) = match load_scripts(global.as_deref(), project.as_deref()) {
+fn serve(
+    global: Option<PathBuf>,
+    project: Option<PathBuf>,
+    builtin_defaults: bool,
+    inbox: &mpsc::Receiver<Request>,
+) {
+    let loaded_scripts = if builtin_defaults {
+        load_scripts_with_defaults(global.as_deref(), project.as_deref(), true)
+    } else {
+        load_scripts(global.as_deref(), project.as_deref())
+    };
+    let (mut engine, loaded) = match loaded_scripts {
         Ok((engine, loaded)) => (engine, Ok(loaded)),
         // Inline DSL still works after a failed load, in a clean engine.
         Err(error) => (None, Err(error)),

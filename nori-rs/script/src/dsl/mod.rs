@@ -118,6 +118,12 @@ pub(crate) fn module(registry: &SharedRegistry) -> BuiltInModule {
         .register_value("instruct", SteelVal::FuncV(instruct))
         .register_value("commit-style", SteelVal::FuncV(commit_style))
         .register_value("commit-agent", SteelVal::FuncV(commit_agent))
+        .register_value("commit-review", SteelVal::FuncV(commit_review))
+        .register_value("fallback-models", SteelVal::FuncV(fallback_models))
+        .register_value(
+            "fallback-ranked-models",
+            SteelVal::FuncV(fallback_ranked_models),
+        )
         .register_value("pr", SteelVal::FuncV(pr));
     for event in HookEvent::ALL {
         module.register_value(event.form(), hook(event));
@@ -205,6 +211,48 @@ fn workflow(args: &[SteelVal]) -> Result<SteelVal> {
 fn is_workflow(args: &[SteelVal]) -> Result<SteelVal> {
     let [value] = args::exact::<1>("workflow?", "(workflow? value)", args)?;
     Ok(SteelVal::BoolV(args::workflow("workflow?", value).is_ok()))
+}
+
+/// `(fallback-models "provider/model" ...)` replaces the ordered fallback list.
+fn fallback_models(args: &[SteelVal]) -> Result<SteelVal> {
+    const FORM: &str = "fallback-models";
+    let Some((workflow, models)) = args.split_first() else {
+        return Err(args::arity(
+            FORM,
+            "(fallback-models \"provider/model\" ...)",
+        ));
+    };
+    let mut workflow = args::workflow(FORM, workflow)?;
+    let mut selected = Vec::new();
+    for model in models {
+        let id = args::text(FORM, "a model ID", model)?;
+        if id.chars().any(char::is_whitespace) {
+            return Err(args::error(
+                FORM,
+                format_args!("model IDs must not contain whitespace, got {id:?}"),
+            ));
+        }
+        if selected.contains(&id) {
+            return Err(args::error(
+                FORM,
+                format_args!("model ID {id:?} is given twice"),
+            ));
+        }
+        selected.push(id);
+    }
+    workflow.fallback_models = selected;
+    workflow.fallback_ranked = false;
+    args::into_value(workflow)
+}
+
+/// Use the ranked provider catalog instead of an explicit list.
+fn fallback_ranked_models(args: &[SteelVal]) -> Result<SteelVal> {
+    const FORM: &str = "fallback-ranked-models";
+    let [workflow] = args::exact::<1>(FORM, "(fallback-ranked-models)", args)?;
+    let mut workflow = args::workflow(FORM, workflow)?;
+    workflow.fallback_models.clear();
+    workflow.fallback_ranked = true;
+    args::into_value(workflow)
 }
 
 fn turns(args: &[SteelVal]) -> Result<SteelVal> {
@@ -349,6 +397,27 @@ fn commit_agent(args: &[SteelVal]) -> Result<SteelVal> {
     let mut rules: CommitRules = workflow.commit.take().unwrap_or_default();
     rules.agent = Some(designated);
     workflow.commit = Some(rules);
+    args::into_value(workflow)
+}
+
+/// `(commit-review 'claude #:model "haiku")` designates a review-only child.
+fn commit_review(args: &[SteelVal]) -> Result<SteelVal> {
+    const FORM: &str = "commit-review";
+    let [workflow, agent, options @ ..] = args else {
+        return Err(args::arity(
+            FORM,
+            "(commit-review 'claude #:model \"haiku\")",
+        ));
+    };
+    let mut workflow = args::workflow(FORM, workflow)?;
+    let mut reviewer = CommitAgent {
+        agent: args::name(FORM, "the agent", agent)?,
+        model: None,
+    };
+    for (keyword, (), value) in args::keywords(FORM, &[("#:model", ())], options)? {
+        reviewer.model = Some(args::text(FORM, keyword, value)?);
+    }
+    workflow.commit_reviewer = Some(reviewer);
     args::into_value(workflow)
 }
 

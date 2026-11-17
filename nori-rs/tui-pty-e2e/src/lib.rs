@@ -94,13 +94,16 @@ fn set_nonblocking(fd: std::os::unix::io::RawFd) -> Result<()> {
 pub use keys::Key;
 mod input;
 mod keys;
+mod terminal_responses;
 
 /// PTY session for driving the codex TUI
 pub struct TuiSession {
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
     parser: Parser,
+    pending_control: Vec<u8>,
+    output: Option<Vec<u8>>,
     child: Box<dyn portable_pty::Child + Send>,
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -325,6 +328,12 @@ trust_level = "trusted"
             if !config_content.is_empty() {
                 std::fs::write(&config_path, config_content)?;
             }
+            if let Some(policy) = &config.policy_pkl {
+                std::fs::write(codex_home.join("init.pkl"), policy)?;
+            }
+            if let Some(models) = &config.agent_models_json {
+                std::fs::write(codex_home.join("agent-models.json"), models)?;
+            }
         }
 
         // Pass through mock agent env vars
@@ -404,10 +413,12 @@ trust_level = "trusted"
         let writer = pair.master.take_writer()?;
 
         Ok(Self {
-            _master: pair.master,
+            master: pair.master,
             reader,
             writer,
-            parser: Parser::new(rows, cols, 0),
+            parser: Parser::new(rows, cols, 10_000),
+            pending_control: Vec::new(),
+            output: None,
             child,
             _temp_dir: temp_dir,
         })
@@ -487,8 +498,15 @@ trust_level = "trusted"
                     );
                 }
                 // Intercept and respond to control sequences before parsing
-                let processed = self.intercept_control_sequences(&buf[..n])?;
-                self.parser.process(&processed);
+                if let Some(output) = &mut self.output {
+                    output.extend_from_slice(&buf[..n]);
+                }
+                terminal_responses::process(
+                    &mut self.parser,
+                    &mut self.writer,
+                    &mut self.pending_control,
+                    &buf[..n],
+                )?;
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -512,35 +530,6 @@ trust_level = "trusted"
                 Err(e.into())
             }
         }
-    }
-
-    /// Intercept control sequences and inject responses
-    ///
-    /// Detects cursor position queries (ESC[6n) and writes responses back to the PTY
-    /// Returns filtered data with control sequences removed
-    fn intercept_control_sequences(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let mut result = Vec::with_capacity(data.len());
-        let mut i = 0;
-
-        while i < data.len() {
-            // Detect cursor position query: ESC[6n
-            if i + 3 < data.len()
-                && data[i] == 0x1b      // ESC
-                && data[i+1] == b'['
-                && data[i+2] == b'6'
-                && data[i+3] == b'n'
-            {
-                // Write response back to PTY: ESC[1;1R (cursor at row 1, col 1)
-                self.writer.write_all(b"\x1b[1;1R")?;
-                self.writer.flush()?;
-                // Skip the control sequence - don't pass it to the parser
-                i += 4;
-            } else {
-                result.push(data[i]);
-                i += 1;
-            }
-        }
-        Ok(result)
     }
 
     /// Wait for predicate with timeout
@@ -647,6 +636,47 @@ trust_level = "trusted"
         self.parser.screen().contents()
     }
 
+    /// Read physical screen rows without joining terminal soft wraps.
+    pub fn screen_rows(&self) -> Vec<String> {
+        let (_, width) = self.parser.screen().size();
+        self.parser.screen().rows(0, width).collect()
+    }
+
+    /// Read an earlier native scrollback page, restoring the live view afterwards.
+    pub fn scrollback_contents(&mut self, rows: usize) -> String {
+        self.parser.screen_mut().set_scrollback(rows);
+        let contents = self.parser.screen().contents();
+        self.parser.screen_mut().set_scrollback(0);
+        contents
+    }
+
+    /// Whether this visible row continues onto the next terminal row by soft wrapping.
+    pub fn screen_row_soft_wrapped(&self, row: u16) -> bool {
+        self.parser.screen().row_wrapped(row)
+    }
+
+    /// Resize both the terminal emulator and the child PTY.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.parser.screen_mut().set_size(rows, cols);
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        Ok(())
+    }
+
+    /// Start capturing bytes written by the TUI to the PTY, including terminal mode sequences.
+    pub fn start_output_capture(&mut self) {
+        self.output = Some(Vec::new());
+    }
+
+    /// Captured bytes written by the TUI to the PTY.
+    pub fn output_bytes(&self) -> Option<&[u8]> {
+        self.output.as_deref()
+    }
+
     /// Type a string
     pub fn send_str(&mut self, s: &str) -> std::io::Result<()> {
         self.writer.write_all(s.as_bytes())?;
@@ -725,6 +755,10 @@ pub struct SessionConfig {
     /// `[tui.footer_segments]`) without losing the auto-generated trust
     /// block that keeps approval mode at the trusted default.
     pub extra_config_toml: Option<String>,
+    /// Pkl workflow policy installed before the session starts.
+    pub policy_pkl: Option<String>,
+    /// Cached agent model catalog installed before the session starts.
+    pub agent_models_json: Option<String>,
     /// Initialize the temp directory as a git repository.
     /// This prevents the "Snapshots disabled" BackgroundEvent from overwriting
     /// the "Working" status indicator during streaming tests.
@@ -758,6 +792,8 @@ impl SessionConfig {
             cwd: None,
             config_toml: None,
             extra_config_toml: None,
+            policy_pkl: None,
+            agent_models_json: None,
             git_init: true,
             allow_http_fallback: false, // Default to ACP-only mode for tests
             extra_path: Vec::new(),
@@ -855,6 +891,16 @@ impl SessionConfig {
     /// and want to keep the auto-generated trust block.
     pub fn with_extra_config_toml(mut self, content: impl Into<String>) -> Self {
         self.extra_config_toml = Some(content.into());
+        self
+    }
+
+    pub fn with_policy_pkl(mut self, content: impl Into<String>) -> Self {
+        self.policy_pkl = Some(content.into());
+        self
+    }
+
+    pub fn with_agent_models_json(mut self, content: impl Into<String>) -> Self {
+        self.agent_models_json = Some(content.into());
         self
     }
 

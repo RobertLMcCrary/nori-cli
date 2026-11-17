@@ -242,7 +242,50 @@ fn a_replay_is_bracketed_so_the_app_paints_it_at_once() {
             _ => {}
         }
     }
-    assert_eq!(events.first().map(String::as_str), Some("Started"));
+    assert_eq!(
+        events.first().map(String::as_str),
+        Some("Started(Transcript)")
+    );
     assert_eq!(events.last().map(String::as_str), Some("Finished"));
     assert!(events.len() > 2, "{events:?}");
+}
+
+#[test]
+fn response_boundary_follows_stream_consolidation() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+    let boundary = nori_protocol::ConversationResponseBoundary {
+        transcript_id: "session".to_owned(),
+        start: 3,
+        end: 9,
+    };
+
+    chat.handle_session_event(generation, answer("A **formatted** response.\n", None));
+    chat.handle_session_event(
+        generation,
+        nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::ConversationResponseBoundary(
+            boundary.clone(),
+        )),
+    );
+
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let cell = events
+        .iter()
+        .position(|event| matches!(event, AppEvent::InsertHistoryCell(_)))
+        .expect("the flushed answer is inserted");
+    let consolidation = events
+        .iter()
+        .position(|event| matches!(event, AppEvent::ConsolidateAgentMessage { .. }))
+        .expect("the streamed answer is consolidated");
+    let response_boundary = events
+        .iter()
+        .position(|event| matches!(event, AppEvent::ResponseBoundary(_)))
+        .expect("the response boundary is emitted");
+
+    assert!(cell < consolidation, "{events:?}");
+    assert!(consolidation < response_boundary, "{events:?}");
+    assert!(matches!(
+        &events[response_boundary],
+        AppEvent::ResponseBoundary(actual) if actual == &boundary
+    ));
 }

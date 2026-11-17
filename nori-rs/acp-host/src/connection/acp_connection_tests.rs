@@ -242,6 +242,77 @@ async fn test_prompt_receives_text_updates() {
     assert_eq!(stop_reason, acp::StopReason::EndTurn);
 }
 
+#[tokio::test]
+#[serial]
+async fn user_question_extension_round_trips_root_and_child_cancellation() {
+    let Some(config) = mock_agent_config() else {
+        panic!("build mock-acp-agent before this test")
+    };
+    let temp_dir = tempdir().expect("temp dir");
+    let mut conn = AcpConnection::spawn(
+        &config,
+        temp_dir.path(),
+        nori_config::AcpProxyConfig::disabled(),
+    )
+    .await
+    .expect("spawn");
+    let mut events = conn.take_event_receiver();
+    let root = conn
+        .create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+    let conn = Arc::new(conn);
+    for (text, expected_target, answer) in [
+        (
+            "fixture:user-question",
+            root.to_string(),
+            serde_json::json!({"answers":{"choice":{"answers":["yes"]}}}),
+        ),
+        (
+            "fixture:child-user-question",
+            "nested-child".to_owned(),
+            serde_json::json!({"cancelled":true}),
+        ),
+    ] {
+        let connection = conn.clone();
+        let session = root.clone();
+        let turn = tokio::spawn(async move {
+            connection
+                .prompt(
+                    session,
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+                )
+                .await
+        });
+        let request = recv_approval_request(&mut events).await;
+        let acp::AgentRequest::ExtMethodRequest(extension) = &request.request else {
+            panic!("expected question extension")
+        };
+        assert_eq!(extension.method.as_ref(), "_nori/request_user_input");
+        let params: Value = serde_json::from_str(extension.params.get()).expect("question params");
+        assert_eq!(params["sessionId"], expected_target);
+        assert_eq!(params["questions"][0]["question"], "Proceed?");
+        let raw = serde_json::value::RawValue::from_string(answer.to_string()).unwrap();
+        request
+            .response_tx
+            .send(Ok(acp::ClientResponse::ExtMethodResponse(
+                acp::ExtResponse::new(raw.into()),
+            )))
+            .expect("respond");
+        let text = recv_agent_message_text(&mut events).await;
+        let actual: Value = serde_json::from_str(
+            text.strip_prefix("question-response:")
+                .expect("answer text"),
+        )
+        .unwrap();
+        assert_eq!(actual, answer);
+        assert_eq!(
+            turn.await.expect("turn task").expect("turn"),
+            acp::StopReason::EndTurn
+        );
+    }
+}
+
 /// Test that the connection exposes one ordered event inbox for prompt updates.
 #[tokio::test]
 #[serial]
@@ -518,6 +589,7 @@ async fn test_event_receiver_preserves_update_then_approval_order() {
             }
             ConnectionEvent::DelegatedRequest(approval) => break approval,
             ConnectionEvent::Acp(_)
+            | ConnectionEvent::Barrier(_)
             | ConnectionEvent::SessionClosed
             | ConnectionEvent::SessionUpdate(_)
             | ConnectionEvent::Subagent(_)
@@ -1109,6 +1181,7 @@ async fn test_child_exit_emits_event_with_stderr_tail() {
                 break (status, stderr_tail);
             }
             ConnectionEvent::Acp(_)
+            | ConnectionEvent::Barrier(_)
             | ConnectionEvent::SessionClosed
             | ConnectionEvent::SessionUpdate(_)
             | ConnectionEvent::Subagent(_)

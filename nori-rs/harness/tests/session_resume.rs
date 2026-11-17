@@ -50,6 +50,7 @@ async fn resume(
         ..Default::default()
     };
     let agent = prepare_agent(AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: "resume-test".to_string(),
         session_context: None,
@@ -66,29 +67,12 @@ async fn resume(
     });
     let mut events = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut started = false;
-        let mut replaying = false;
         loop {
             let event = session.events.recv().await.expect("event stream open");
-            match &event {
-                SessionEvent::Nori(NoriEvent::SessionStarted(_)) => started = true,
-                SessionEvent::Nori(NoriEvent::ReplayStarted(_)) => replaying = true,
-                SessionEvent::Nori(NoriEvent::ReplayFinished) => replaying = false,
-                _ => {}
-            }
+            let ready = matches!(event, SessionEvent::Nori(NoriEvent::SessionReady(_)));
             events.push(event);
-            if started && !replaying {
-                // Anything that follows at once, such as a replay that starts right behind.
-                match tokio::time::timeout(Duration::from_millis(300), session.events.recv()).await
-                {
-                    Ok(Some(event)) => {
-                        if matches!(event, SessionEvent::Nori(NoriEvent::ReplayStarted(_))) {
-                            replaying = true;
-                        }
-                        events.push(event);
-                    }
-                    Ok(None) | Err(_) => break,
-                }
+            if ready {
+                break;
             }
         }
     })
@@ -161,6 +145,13 @@ async fn a_resume_with_a_transcript_reattaches_and_paints_from_the_transcript() 
         .expect("load transcript");
 
     let events = resume(home.path(), "acp-session-1", Some(transcript)).await;
+    assert!(
+        matches!(events.last(), Some(SessionEvent::Nori(NoriEvent::SessionReady(id))) if events.iter().any(|event| matches!(event, SessionEvent::Nori(NoriEvent::SessionStarted(started)) if &started.acp_session_id == id)))
+    );
+    assert!(matches!(
+        events.iter().rev().nth(1),
+        Some(SessionEvent::Nori(NoriEvent::ReplayFinished))
+    ));
     assert_eq!(replay_sources(&events), vec![ReplaySource::Transcript]);
     assert!(
         user_texts(&events)

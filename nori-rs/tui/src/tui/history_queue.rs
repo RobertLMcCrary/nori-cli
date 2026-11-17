@@ -8,6 +8,7 @@
 //! committed in the same frame as a repaint is written exactly once, whichever came first.
 
 use std::io;
+use std::io::Write as _;
 
 use ratatui::backend::Backend;
 use ratatui::text::Line;
@@ -22,6 +23,9 @@ pub(crate) struct HistoryQueue {
     repaint: bool,
     /// The next frame scrolls everything above the prompt into the scrollback.
     clear_above: bool,
+    /// The clear-screen action hid the transcript above the prompt. This survives redraws and terminal
+    /// resizes; rebuilding the transcript from memory would otherwise make it reappear.
+    above_hidden: bool,
     /// Whether anything is above the prompt for a clear to hide: what the shell left when Nori
     /// started, then whatever Nori has written. Clearing nothing would only push blank rows into
     /// the scrollback.
@@ -36,6 +40,7 @@ pub(crate) struct HistoryQueue {
     /// screen instead of scrolling it away: `up` over history rows above it, `down` over blank
     /// rows below it.
     stretch: Stretch,
+    projection_resized: bool,
 }
 
 /// How far a transient popup stretched the viewport past the prompt's own rows.
@@ -46,6 +51,18 @@ struct Stretch {
 }
 
 impl HistoryQueue {
+    pub(crate) fn has_pending_lines(&self) -> bool {
+        !self.lines.is_empty()
+    }
+
+    pub(crate) fn pending_line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(crate) fn base_height(&self, viewport_height: u16) -> u16 {
+        viewport_height.saturating_sub(self.stretch.up.saturating_add(self.stretch.down))
+    }
+
     pub(crate) fn push(&mut self, lines: Vec<Line<'static>>) {
         if !lines.is_empty() {
             self.content_above = true;
@@ -61,10 +78,23 @@ impl HistoryQueue {
         self.repaint = true;
     }
 
+    /// A screen resize changes the bottom edge even when the prompt's height stays the same.
+    pub(crate) fn note_resize(&mut self) {
+        self.pinned = false;
+    }
+
+    pub(crate) fn note_projection_resize(&mut self) {
+        self.projection_resized |= self.stretch != Stretch::default();
+    }
+
     /// Hide everything above the prompt: the next frame scrolls it into the scrollback, which is
     /// left whole, and leaves the screen above the prompt empty.
     pub(crate) fn request_clear_above(&mut self) {
         self.clear_above = true;
+    }
+
+    pub(crate) fn above_hidden(&self) -> bool {
+        self.above_hidden
     }
 
     /// Repaint what Nori owns if a repaint was asked for, place the viewport for a frame `height`
@@ -102,6 +132,8 @@ impl HistoryQueue {
             self.content_above |= stretched.y > 0;
         }
         let before = std::mem::take(&mut self.stretch);
+        let clear_projection_spill =
+            std::mem::take(&mut self.projection_resized) && before != Stretch::default();
         if before != Stretch::default() {
             let mut base = stretched;
             base.y += before.up;
@@ -125,9 +157,10 @@ impl HistoryQueue {
             && (self.content_above || terminal.owned_history_rows() > 0)
         {
             self.content_above = false;
+            self.above_hidden = true;
             let top = terminal.viewport_area.top();
             if top > 0 {
-                terminal.backend_mut().scroll_region_up(0..top, top)?;
+                reserve_primary_rows(terminal, top)?;
             }
             // What was above the prompt is in the scrollback now, where nothing repaints it.
             terminal.written_history.clear();
@@ -141,9 +174,10 @@ impl HistoryQueue {
         area.width = size.width;
         // If the viewport has expanded, scroll everything else up to make room.
         if area.bottom() > size.height {
-            terminal
-                .backend_mut()
-                .scroll_region_up(0..area.top(), area.bottom() - size.height)?;
+            let top = area.top().min(size.height);
+            if top > 1 {
+                scroll_history_with_linefeeds(terminal, top, area.bottom() - size.height)?;
+            }
             area.y = size.height - area.height;
         } else if area.y == 0 && area.height < size.height {
             // Viewport was full-screen (y=0) and has shrunk. Reposition
@@ -198,7 +232,28 @@ impl HistoryQueue {
             terminal.set_viewport_area(area);
         }
         let stretch = self.stretch_for(terminal, popup_rows);
+        if before == Stretch::default() && stretch.up > 0 && terminal.viewport_area.top() > 1 {
+            // A primary-screen overlay must not overwrite shell or history rows that
+            // the terminal may have reflowed beyond our cache. Move the visible region
+            // into native scrollback once and draw the temporary view over fresh rows.
+            let top = terminal.viewport_area.top();
+            reserve_primary_rows(terminal, top)?;
+            terminal.written_history.clear();
+        }
         self.show_popup(terminal, (before, stretched, base_before), stretch)?;
+
+        if clear_projection_spill {
+            // Placement can move the old projected border into the reserved top rows.
+            // Clear those application-owned rows only after the viewport has settled.
+            let height = terminal.size()?.height;
+            for row in 0..height.min(2) {
+                crossterm::queue!(
+                    terminal.backend_mut(),
+                    crossterm::cursor::MoveTo(0, row),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine)
+                )?;
+            }
+        }
 
         if self.lines.is_empty() {
             return Ok(false);
@@ -228,6 +283,57 @@ impl HistoryQueue {
         }
         Ok(inserted && !self.lines.is_empty())
     }
+}
+
+/// Preserve the visible history in native scrollback and reserve fresh rows.
+fn reserve_primary_rows<B>(terminal: &mut Terminal<B>, top: u16) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + io::Write,
+{
+    let height = terminal.size()?.height;
+    if height == 0 {
+        return Ok(());
+    }
+    let top = top.min(height);
+    let writer = terminal.backend_mut();
+    // Full-screen line feeds are retained by terminals that discard CSI S or
+    // partial-region scrolling from their scrollback.
+    write!(writer, "\x1b[r\x1b[{height};1H")?;
+    for _ in 0..top {
+        write!(writer, "\r\n")?;
+    }
+    // Only the displaced Nori composer remains above the fresh region.
+    for row in 0..height.saturating_sub(top) {
+        crossterm::queue!(
+            writer,
+            crossterm::cursor::MoveTo(0, row),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine)
+        )?;
+    }
+    Ok(())
+}
+
+/// Scroll a top-anchored history region using line feeds rather than CSI S.
+/// Terminals such as xterm.js preserve line-feed scrolling in native history.
+fn scroll_history_with_linefeeds<B>(
+    terminal: &mut Terminal<B>,
+    top: u16,
+    count: u16,
+) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + io::Write,
+{
+    let writer = terminal.backend_mut();
+    crossterm::queue!(
+        writer,
+        crate::insert_history::SetScrollRegion(1..top),
+        crossterm::cursor::MoveTo(0, top - 1)
+    )?;
+    for _ in 0..count {
+        write!(writer, "\r\n")?;
+    }
+    crossterm::queue!(writer, crate::insert_history::ResetScrollRegion)?;
+    Ok(())
 }
 
 impl HistoryQueue {
@@ -382,17 +488,68 @@ mod tests {
     }
 
     #[test]
-    fn a_popup_covers_the_screen_and_gives_it_back_when_it_closes() {
+    fn terminal_resize_repins_the_prompt_to_the_new_bottom() {
+        let mut terminal = terminal_after_a_shell();
+        let mut queue = HistoryQueue::default();
+        queue.write_frame(&mut terminal, 2).expect("initial frame");
+        draw_prompt(&mut terminal);
+
+        terminal
+            .backend_mut()
+            .vt100_mut()
+            .screen_mut()
+            .set_size(16, 50);
+        queue.note_resize();
+        queue.write_frame(&mut terminal, 2).expect("expanded frame");
+        draw_prompt(&mut terminal);
+        assert_eq!(terminal.viewport_area, Rect::new(0, 14, 50, 2));
+        let expanded = terminal
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, 50)
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(expanded);
+
+        terminal
+            .backend_mut()
+            .vt100_mut()
+            .screen_mut()
+            .set_size(7, 20);
+        queue.note_resize();
+        queue.write_frame(&mut terminal, 2).expect("shrunk frame");
+        draw_prompt(&mut terminal);
+        assert_eq!(terminal.viewport_area, Rect::new(0, 5, 20, 2));
+    }
+
+    #[test]
+    fn a_popup_moves_visible_history_into_scrollback_once() {
         let mut terminal = terminal_after_a_shell();
         let mut queue = HistoryQueue::default();
         queue.write_frame(&mut terminal, 2).expect("frame");
         queue.push((0..5).map(|n| Line::from(format!("history {n}"))).collect());
         queue.write_frame(&mut terminal, 2).expect("frame");
         draw_prompt(&mut terminal);
-        let resting = screen(&terminal);
+        queue
+            .write_frame_with_popup(&mut terminal, 6, 4)
+            .expect("frame");
+        draw_prompt(&mut terminal);
         let scrolled = terminal.backend().scrollback_rows().len();
-
-        for _ in 0..3 {
+        let history = terminal
+            .backend()
+            .scrollback_rows()
+            .iter()
+            .map(|(row, _)| row.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|row| row.contains("history 4"))
+                .count(),
+            1
+        );
+        for _ in 0..2 {
             queue
                 .write_frame_with_popup(&mut terminal, 6, 4)
                 .expect("frame");
@@ -407,7 +564,12 @@ mod tests {
         draw_prompt(&mut terminal);
 
         assert_eq!(terminal.viewport_area, Rect::new(0, HEIGHT - 2, WIDTH, 2));
-        assert_eq!(screen(&terminal), resting);
+        assert!(
+            screen(&terminal)[..HEIGHT as usize - 2]
+                .iter()
+                .all(String::is_empty)
+        );
+        insta::assert_snapshot!("primary_overlay_closed", screen(&terminal).join("\n"));
         assert_eq!(terminal.backend().scrollback_rows().len(), scrolled);
     }
 
@@ -478,6 +640,7 @@ mod tests {
         // emulator behind this test does not keep rows a region scroll pushes out); it is
         // checked against a real terminal.
         assert_eq!(terminal.owned_history_rows(), 0);
+        assert!(queue.above_hidden());
     }
 
     #[test]
@@ -555,5 +718,6 @@ mod tests {
         );
         let rows = screen(&terminal);
         assert_eq!(rows[HEIGHT as usize - 2], "> prompt");
+        assert!(!queue.above_hidden());
     }
 }

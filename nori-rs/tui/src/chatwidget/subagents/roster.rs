@@ -22,6 +22,136 @@ use crate::subagent_switcher::Target;
 use crate::subagent_switcher::cell_lines;
 
 impl SubagentTree {
+    pub(crate) fn projection_len(&self, key: SubagentKey) -> Option<usize> {
+        let id = NodeId(key.0);
+        self.live
+            .get(&id)
+            .map(super::node::Node::projection_len)
+            .or_else(|| {
+                self.ended.get(&id).map(|record| {
+                    record
+                        .finished
+                        .detail
+                        .len()
+                        .max(usize::from(!record.finished.message.trim().is_empty()))
+                })
+            })
+    }
+
+    pub(crate) fn projection_revision(&self, key: SubagentKey, index: usize) -> Option<i64> {
+        let id = NodeId(key.0);
+        if let Some(node) = self.live.get(&id) {
+            return node.projection_revision(index);
+        }
+        let record = self.ended.get(&id)?;
+        let len = record
+            .finished
+            .detail
+            .len()
+            .max(usize::from(!record.finished.message.trim().is_empty()));
+        (index < len).then_some(record.revision)
+    }
+
+    pub(crate) fn projection_continuation(&self, key: SubagentKey, index: usize) -> Option<bool> {
+        let id = NodeId(key.0);
+        if let Some(node) = self.live.get(&id) {
+            return node.projection_continuation(index);
+        }
+        let finished = &self.ended.get(&id)?.finished;
+        if let Some(cell) = finished.detail.get(index) {
+            Some(cell.is_stream_continuation())
+        } else if index == 0 && finished.detail.is_empty() && !finished.message.trim().is_empty() {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn project_cell(
+        &self,
+        key: SubagentKey,
+        index: usize,
+        width: u16,
+        expanded: &std::collections::HashSet<String>,
+    ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
+        let id = NodeId(key.0);
+        if let Some(node) = self.live.get(&id) {
+            return node.project_cell(index, &self.context.cwd, width, expanded);
+        }
+        let finished = &self.ended.get(&id)?.finished;
+        let mut projection = crate::chatwidget::tool_projection::ToolProjection::default();
+        if let Some(cell) = finished.detail.get(index) {
+            projection.push(cell.as_ref(), width, expanded);
+        } else if index == 0 && finished.detail.is_empty() && !finished.message.trim().is_empty() {
+            projection.push(
+                &AgentMarkdownCell::new(finished.message.clone(), &self.context.cwd),
+                width,
+                expanded,
+            );
+        } else {
+            return None;
+        }
+        Some(projection)
+    }
+    pub(crate) fn tool_projection(
+        &self,
+        key: SubagentKey,
+        width: u16,
+        expanded: &std::collections::HashSet<String>,
+    ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
+        let id = NodeId(key.0);
+        if let Some(node) = self.live.get(&id) {
+            return Some(node.tool_projection(&self.context.cwd, width, expanded));
+        }
+        let finished = &self.ended.get(&id)?.finished;
+        let mut projection = crate::chatwidget::tool_projection::ToolProjection::default();
+        for cell in &finished.detail {
+            projection.push(cell.as_ref(), width, expanded);
+        }
+        if finished.detail.is_empty() && !finished.message.trim().is_empty() {
+            projection.push(
+                &AgentMarkdownCell::new(finished.message.clone(), &self.context.cwd),
+                width,
+                expanded,
+            );
+        }
+        Some(projection)
+    }
+    pub(crate) fn parent_for_key(&self, key: SubagentKey) -> Option<SubagentKey> {
+        let id = NodeId(key.0);
+        self.live
+            .get(&id)
+            .and_then(|node| node.history_parent)
+            .or_else(|| self.ended.get(&id).and_then(|record| record.history_parent))
+            .map(|id| SubagentKey(id.0))
+    }
+    pub(crate) fn agent_for_key(&self, key: SubagentKey) -> Option<&str> {
+        let id = NodeId(key.0);
+        self.live
+            .get(&id)
+            .and_then(|node| node.agent.as_deref())
+            .or_else(|| {
+                self.ended
+                    .get(&id)
+                    .and_then(|record| record.agent.as_deref())
+            })
+    }
+
+    pub(crate) fn session_for_key(
+        &self,
+        key: SubagentKey,
+    ) -> Option<nori_protocol::acp::v1::SessionId> {
+        let id = NodeId(key.0);
+        self.live
+            .get(&id)
+            .and_then(|node| node.session_id.clone())
+            .or_else(|| {
+                self.ended
+                    .get(&id)
+                    .and_then(|record| record.session_id.clone())
+            })
+    }
+
     /// Every subagent so far: the running ones and the finished ones.
     pub(crate) fn entries(&self, now: Instant) -> (Vec<Entry>, Vec<(SubagentKey, SubagentKey)>) {
         let mut entries = Vec::with_capacity(self.live.len() + self.ended.len());
@@ -36,13 +166,17 @@ impl SubagentTree {
                 parent,
                 agent: node.kind().map(str::to_owned),
                 model: None,
-                status: Status::Running,
+                status: if node.idle {
+                    Status::Idle
+                } else {
+                    Status::Running
+                },
                 detail: None,
                 elapsed: now.saturating_duration_since(node.started_at),
                 ended_ago: None,
                 tool_count: node.tool_count,
                 revision: node.revision,
-                active_at: node.active_at,
+                active_at: node.work_at,
             });
         }
         for (id, record) in &self.ended {
@@ -50,7 +184,7 @@ impl SubagentTree {
             let (status, detail) = match &finished.outcome {
                 SubagentOutcome::Completed { .. } => (Status::Completed, None),
                 SubagentOutcome::Failed { reason } => (Status::Failed, reason.clone()),
-                SubagentOutcome::Cancelled => (Status::Cancelled, None),
+                SubagentOutcome::Cancelled | SubagentOutcome::Closed => (Status::Cancelled, None),
             };
             entries.push(Entry {
                 target: Target::Subagent(key(*id)),
@@ -63,8 +197,8 @@ impl SubagentTree {
                 elapsed: finished.elapsed,
                 ended_ago: Some(now.saturating_duration_since(record.ended_at)),
                 tool_count: finished.tool_count,
-                revision: ENDED_REVISION,
-                active_at: record.ended_at,
+                revision: record.revision,
+                active_at: record.work_at,
             });
         }
         let replaced = self
@@ -104,18 +238,68 @@ impl SubagentTree {
                 width,
             ));
         }
-        Some((ENDED_REVISION, tail.finish()))
+        Some((self.ended.get(&id)?.revision, tail.finish()))
     }
 }
-
-/// A finished subagent never changes again, so one revision stands for all of its states.
-const ENDED_REVISION: i64 = -1;
 
 fn key(id: NodeId) -> SubagentKey {
     SubagentKey(id.0)
 }
 
 impl ChatWidget {
+    pub(crate) fn child_projection_len(&self, key: SubagentKey) -> Option<usize> {
+        self.subagents.projection_len(key)
+    }
+    pub(crate) fn child_projection_revision(&self, key: SubagentKey, index: usize) -> Option<i64> {
+        self.subagents.projection_revision(key, index)
+    }
+    pub(crate) fn child_projection_continuation(
+        &self,
+        key: SubagentKey,
+        index: usize,
+    ) -> Option<bool> {
+        self.subagents.projection_continuation(key, index)
+    }
+    pub(crate) fn project_child_cell(
+        &self,
+        key: SubagentKey,
+        index: usize,
+        width: u16,
+        expanded: &std::collections::HashSet<String>,
+    ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
+        self.subagents.project_cell(key, index, width, expanded)
+    }
+    pub(crate) fn subagent_tool_projection(
+        &self,
+        key: SubagentKey,
+        width: u16,
+        expanded: &std::collections::HashSet<String>,
+    ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
+        self.subagents.tool_projection(key, width, expanded)
+    }
+    pub(crate) fn replace_subagent_history(
+        &mut self,
+        key: SubagentKey,
+        events: &[nori_protocol::SessionEvent],
+    ) {
+        let id = NodeId(key.0);
+        let context = self.subagents.context.clone();
+        if let Some(node) = self.subagents.live.get_mut(&id) {
+            node.replace_replay(events, &context.cwd, context.animations);
+        } else if let Some(ended) = self.subagents.ended.get_mut(&id) {
+            ended.finished.detail =
+                super::projection::project_child_history(events, &context.cwd).0;
+            ended.revision = ended.revision.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn subagent_session(
+        &self,
+        key: SubagentKey,
+    ) -> Option<nori_protocol::acp::v1::SessionId> {
+        self.subagents.session_for_key(key)
+    }
+
     /// The roster for the subagent switcher, with the root session first.
     pub(crate) fn subagent_roster(&self, now: Instant) -> Roster {
         let (subagents, replaced) = self.subagents.entries(now);

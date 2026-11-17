@@ -4,10 +4,12 @@ Path: @/nori-rs/script
 
 ### Overview
 
-`nori-script` evaluates Nori's workflow DSL (`nori/workflow`) on an embedded,
-sandboxed Steel engine and returns plain data: `Workflow`, `Hook`,
-`CommitRules`, `PrRules`. The vocabulary, file locations, inline syntax, and
-sandbox rules are in `@/docs/workflows.md`.
+The ACP harness uses `nori-pkl` for active workflow policy and conversation
+programs. See `@/docs/workflows.md` and `@/docs/conversation-programs.md`.
+`nori-script` supplies shared `Workflow`, `Hook`, `CommitRules`, and `PrRules`
+data types and their rendering. Its legacy Steel evaluator remains available
+to library callers and compatibility tests; Nori does not invoke it for ACP
+workflow loading. The evaluator APIs described below are that legacy surface.
 
 ### How it fits into the larger codebase
 

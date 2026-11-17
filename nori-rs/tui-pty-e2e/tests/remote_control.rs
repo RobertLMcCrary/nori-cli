@@ -89,6 +89,24 @@ fn wait_for_hosted_session(port: u16) -> (Client, String) {
     }
 }
 
+fn wait_for_replaced_hosted_session(port: u16, previous_session_id: &str) -> (Client, String) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (client, session_ids) = connect_and_list(port);
+        if let [session_id] = session_ids.as_slice()
+            && session_id != previous_session_id
+        {
+            return (client, session_id.clone());
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a replacement hosted session; latest catalog: {session_ids:?}"
+        );
+        drop(client);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn latest_loopback_acp_port(screen: &str) -> u16 {
     let regex = regex::Regex::new(r"ws://127\.0\.0\.1:(\d+)/acp").expect("URL regex");
     regex
@@ -114,8 +132,25 @@ fn has_loopback_acp_port_other_than(screen: &str, old_port: u16) -> bool {
 #[test]
 fn startup_runtime_disable_reenable_and_agent_switch_share_one_remote_control_owner() {
     let startup_port = reserve_loopback_port();
+    let refreshed_at: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_secs()
+        .try_into()
+        .expect("timestamp fits in i64");
+    let cached_models = json!({
+        "mock-model-alt": {
+            "models": [
+                {"value": "mock-model-default", "name": "GPT-6 Astra"},
+                {"value": "mock-model-fast", "name": "Fable 5.2"}
+            ],
+            "settings": [],
+            "refreshed_at": refreshed_at
+        }
+    });
     let config = SessionConfig::new()
         .with_agent("mock-model".to_string())
+        .with_agent_models_json(cached_models.to_string())
         .with_mock_response("remote response before switch")
         .with_agent_env(
             "MOCK_AGENT_RESPONSE_MOCK_MODEL_ALT",
@@ -207,24 +242,23 @@ fn startup_runtime_disable_reenable_and_agent_switch_share_one_remote_control_ow
     assert_eq!(current_session_id, original_session_id);
     drop(runtime_client);
 
-    session.submit_input("/agent").expect("submit command");
+    session.submit_input("/model").expect("submit command");
     session
-        .wait_for_text("Select agent", Duration::from_secs(10))
-        .expect("agent picker");
-    session.send_key(Key::Down).expect("select alternate agent");
-    // An agent with no earlier sessions starts one at once, without a picker.
+        .wait_for_text("Select model", Duration::from_secs(10))
+        .expect("model picker");
+    session.type_input("Fable 5.2").expect("filter models");
+    session
+        .wait_for_text("Fable 5.2", Duration::from_secs(10))
+        .expect("cached alternate-provider model");
     session
         .send_key(Key::Enter)
-        .expect("prepare alternate agent");
+        .expect("prepare alternate provider model");
     session
-        .wait_for_text(
-            "Started new conversation with agent: Mock ACP Alt",
-            Duration::from_secs(10),
-        )
-        .expect("candidate SessionStarted commit");
+        .wait_for_text("Mock Fast Model", Duration::from_secs(10))
+        .expect("candidate provider model activation");
 
-    let (mut switched_client, switched_session_id) = wait_for_hosted_session(runtime_port);
-    assert_ne!(switched_session_id, original_session_id);
+    let (mut switched_client, switched_session_id) =
+        wait_for_replaced_hosted_session(runtime_port, &original_session_id);
     let prompt_after_switch = "remote prompt after switch";
     let response = request(
         &mut switched_client,

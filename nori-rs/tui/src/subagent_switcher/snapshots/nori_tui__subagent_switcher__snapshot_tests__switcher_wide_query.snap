@@ -1,14 +1,15 @@
 ---
 source: tui/src/subagent_switcher/snapshot_tests.rs
+assertion_line: 278
 expression: terminal.backend()
 ---
-"/ S U B A G E N T S / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / "
+"╭─ ◇ Conversations ────────────────────────────────────────────────────────────────────────────────────────────────────╮"
 "› rea│                                                                                                                  "
 "› ✓ Read a.txt contents  1 tool · 27s · 2m ago        │ ✓ Read a.txt contents                                           "
 "                                                      │ general-purpose · done · 1 tool · 27s · 2m ago                  "
 "                                                      │ ────────────────────────────────────────────────────────────────"
-"                                                      │ • Explored                                                      "
-"                                                      │   └ Read a.txt                                                  "
+"                                                      │ ▾ • Explored                                                    "
+"                                                      │   ◇ a.txt                                                       "
 "                                                      │                                                                 "
 "                                                      │ • The file holds alpha.                                         "
 "                                                      │                                                                 "
@@ -19,4 +20,4 @@ expression: terminal.backend()
 "                                                      │                                                                 "
 "                                                      │                                                                 "
 "                                                      │                                                                 "
-" ↑↓ move · enter switch · esc close · ctrl+space close                                                              1/1 "
+"╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1/1 ╯"

@@ -16,6 +16,11 @@ agent = "claude-code"
 
 Built-in agents are `claude-code`, `codex`, and `gemini`.
 
+Nori starts Codex ACP sessions with approval policy `never` and sandbox mode
+`danger-full-access`, including resumed sessions. Other Codex account settings,
+such as the model and reasoning effort, remain in effect. The standalone Codex
+ACP adapter keeps its own configuration behavior outside Nori.
+
 ## Default models: `[default_models]`
 
 Maps an agent slug to the model id Nori applies when it starts a session with
@@ -84,3 +89,27 @@ key of `CODEX_CONFIG`) and ignore this field. For env-based channels, Nori's
 injected value takes precedence over the agent's own configured model (for
 example `~/.claude/settings.json`) for Nori-spawned sessions — Nori's
 `[default_models]` is authoritative there by design.
+
+### Experimental Gemini Core adapter
+
+Build Nori with the `native-gemini` feature to opt into the in-process ACP
+adapter. Install Node and `@google/gemini-cli-core` version 0.68.0, then configure
+an agent explicitly:
+
+```toml
+[[agents]]
+name = "Gemini Core"
+slug = "gemini-core"
+model_override = { env = "GEMINI_MODEL" }
+
+[agents.distribution.native]
+agent = "gemini"
+config = ["core_path=/absolute/path/to/node_modules/@google/gemini-cli-core/dist/index.js", "auth=gemini"]
+```
+
+Set `GEMINI_API_KEY` for `auth=gemini`, or use `auth=vertex` with Vertex AI
+credentials. `node_path=/absolute/path/to/node` is optional when Node is on
+`PATH`. `NORI_GEMINI_CORE_MODULE` can supply the Core path instead of
+`core_path`. The default `gemini` agent continues to use the official CLI and
+its Google-account sign-in. Native Core sessions do not support session reload;
+MCP and other feature parity are still being verified.

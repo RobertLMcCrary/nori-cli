@@ -52,6 +52,28 @@ fn missing_scripts_load_nothing() {
 }
 
 #[test]
+fn fallback_policy_loads_from_global_and_can_be_replaced_by_project() {
+    let home = home(
+        Some(
+            r#"(define-workflow standard (fallback-models "provider/a" "provider/b")) (default-workflow standard)"#,
+        ),
+        Some(
+            r#"(define-workflow standard (use 'standard) (fallback-models "provider/c" "provider/a")) (default-workflow standard)"#,
+        ),
+    );
+    let global = load(Some(&home.global), None).expect("global loads");
+    let project = load(Some(&home.global), Some(&home.project)).expect("project loads");
+    assert_eq!(
+        global.default_workflow().expect("default").fallback_models,
+        vec!["provider/a", "provider/b"]
+    );
+    assert_eq!(
+        project.default_workflow().expect("default").fallback_models,
+        vec!["provider/c", "provider/a"]
+    );
+}
+
+#[test]
 fn the_project_script_sees_and_overrides_the_global_one() {
     let home = home(
         Some(

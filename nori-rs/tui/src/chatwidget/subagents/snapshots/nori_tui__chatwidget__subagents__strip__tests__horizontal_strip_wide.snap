@@ -1,0 +1,6 @@
+---
+source: tui/src/chatwidget/subagents/strip.rs
+assertion_line: 184
+expression: "render(&tree, &state, 80, None)"
+---
+ │○ Verify        ││○ Review        ││○ Implement     ││○ Research      │

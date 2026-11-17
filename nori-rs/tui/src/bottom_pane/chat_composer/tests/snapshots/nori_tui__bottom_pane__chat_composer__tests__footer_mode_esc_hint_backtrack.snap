@@ -1,5 +1,6 @@
 ---
 source: tui/src/bottom_pane/chat_composer/tests/mod.rs
+assertion_line: 43
 expression: terminal.backend()
 ---
 "                                                                                                    "
@@ -10,4 +11,3 @@ expression: terminal.backend()
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
-"  esc again to edit previous message                                                                "

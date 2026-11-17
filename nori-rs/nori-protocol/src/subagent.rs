@@ -39,8 +39,7 @@ impl<T> Patch<T> {
     }
 }
 
-/// How a subagent's work ended. A subagent that has an outcome never runs again; an agent that
-/// reopens one gives it a new session.
+/// How a subagent's work ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SubagentOutcome {
@@ -52,6 +51,8 @@ pub enum SubagentOutcome {
         reason: Option<String>,
     },
     Cancelled,
+    /// The session itself was closed and cannot receive another turn.
+    Closed,
 }
 
 /// Where a subagent is in its life.
@@ -59,6 +60,8 @@ pub enum SubagentOutcome {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SubagentState {
     Running,
+    /// The current turn finished, but this session can receive more work.
+    Idle,
     Ended(SubagentOutcome),
 }
 
@@ -79,14 +82,14 @@ impl SubagentState {
         };
         Some(match name {
             "running" | "working" | "pending" => Self::Running,
+            "turn_idle" => Self::Idle,
             "failed" | "errored" | "error" | "disconnected" | "timed_out" => {
                 Self::Ended(SubagentOutcome::Failed {
                     reason: stop_reason,
                 })
             }
-            "cancelled" | "canceled" | "stopped" | "closed" => {
-                Self::Ended(SubagentOutcome::Cancelled)
-            }
+            "closed" => Self::Ended(SubagentOutcome::Closed),
+            "cancelled" | "canceled" | "stopped" => Self::Ended(SubagentOutcome::Cancelled),
             _ => Self::Ended(SubagentOutcome::Completed { stop_reason }),
         })
     }
@@ -99,6 +102,9 @@ pub struct SubagentUpdate {
     pub parent_session_id: SessionId,
     /// The child's own session id.
     pub session_id: SessionId,
+    /// Canonical provider slug, when known by the owning backend.
+    #[serde(default)]
+    pub agent: Patch<String>,
     pub title: Patch<String>,
     pub description: Patch<String>,
     pub state: Patch<SubagentState>,
@@ -156,6 +162,7 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
         "subagent_update" => Some(SubagentWire::Update(SubagentUpdate {
             parent_session_id: SessionId::new(delivered_on),
             session_id: session_field("sessionId")?,
+            agent: Patch::Keep,
             title: text_field("title"),
             description: text_field("description"),
             state: state_field(),
@@ -163,6 +170,7 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
         "subagent_spawned" => Some(SubagentWire::Update(SubagentUpdate {
             parent_session_id: SessionId::new(delivered_on),
             session_id: session_field("subagentSessionId")?,
+            agent: Patch::Keep,
             title: text_field("name"),
             description: text_field("task"),
             state: Patch::Set(SubagentState::Running),
@@ -170,6 +178,7 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
         "subagent_state_update" => Some(SubagentWire::Update(SubagentUpdate {
             parent_session_id: SessionId::new(delivered_on),
             session_id: session_field("subagentSessionId")?,
+            agent: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: state_field(),
@@ -249,6 +258,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn older_announcements_deserialize_without_provider() {
+        let update: SubagentUpdate = serde_json::from_value(json!({
+            "parent_session_id": "parent",
+            "session_id": "child",
+            "title": {"patch": "keep"},
+            "description": {"patch": "keep"},
+            "state": {"patch": "keep"}
+        }))
+        .expect("older announcement");
+        assert_eq!(update.agent, Patch::Keep);
+    }
+
+    #[test]
     fn claude_announcement_with_patch_semantics() {
         let announce = json!({
             "sessionId": "root",
@@ -266,6 +288,7 @@ mod tests {
             Some(SubagentWire::Update(SubagentUpdate {
                 parent_session_id: SessionId::new("root"),
                 session_id: SessionId::new("child"),
+                agent: Patch::Keep,
                 title: Patch::Set("general-purpose".into()),
                 description: Patch::Set("Read a.txt contents".into()),
                 state: Patch::Set(SubagentState::Running),
@@ -321,6 +344,7 @@ mod tests {
             ),
             ("failed", SubagentOutcome::Failed { reason: None }),
             ("cancelled", SubagentOutcome::Cancelled),
+            ("closed", SubagentOutcome::Closed),
             ("disconnected", SubagentOutcome::Failed { reason: None }),
         ] {
             let state = json!({
@@ -365,6 +389,17 @@ mod tests {
                 chunk: false,
             }))
         );
+    }
+
+    #[test]
+    fn legacy_opencode_tool_metadata_is_not_a_lifecycle_event() {
+        for kind in ["tool_call", "tool_call_update"] {
+            let update = json!({"sessionId":"root", "update":{
+                "sessionUpdate":kind, "toolCallId":"call", "status":"completed",
+                "_meta":{"opencode/child-session":{"id":"child","parentID":"root"}}
+            }});
+            assert_eq!(parse_subagent_update(&update), None);
+        }
     }
 
     #[test]

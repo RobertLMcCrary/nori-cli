@@ -776,6 +776,9 @@ impl Session {
         // Set cancelled flag first
         // Use Release ordering to ensure visibility to other threads
         self.cancelled.store(true, Ordering::Release);
+        if let Some(tools) = &self.host_tools {
+            tools.cancel_all();
+        }
 
         tracing::info!(
             session_id = %self.session_id,
@@ -820,6 +823,9 @@ impl Session {
         // Use Release ordering for consistency, though Relaxed would also work here
         // since we're just clearing the flag at the start of a new prompt
         self.cancelled.store(false, Ordering::Release);
+        if let Some(tools) = &self.host_tools {
+            tools.reset_cancelled();
+        }
     }
 
     /// Get the permission handler

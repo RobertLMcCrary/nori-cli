@@ -740,9 +740,7 @@ where
                                     Ok(response) => request_cx.respond(response),
                                     Err(e) => {
                                         tracing::error!("Prompt error: {}", e);
-                                        request_cx.respond_with_error(sacp::util::internal_error(
-                                            e.to_string(),
-                                        ))
+                                        request_cx.respond_with_error(e.to_acp_error())
                                     }
                                 }
                             }

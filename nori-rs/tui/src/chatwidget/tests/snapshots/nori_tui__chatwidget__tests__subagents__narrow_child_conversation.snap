@@ -1,0 +1,30 @@
+---
+source: tui/src/chatwidget/tests/subagents.rs
+assertion_line: 451
+expression: rendered
+---
+
+Research task · running
+I found the failure.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Nori to do anything
+
+ │● Count lin ││● Read a.tx │

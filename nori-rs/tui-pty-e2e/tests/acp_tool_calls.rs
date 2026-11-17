@@ -25,14 +25,6 @@
 //! ✓ Called server.tool_name({"arg":"value"}) (1.2s)
 //! ```
 
-use std::time::Duration;
-use tui_pty_e2e::SessionConfig;
-use tui_pty_e2e::TIMEOUT;
-use tui_pty_e2e::TIMEOUT_INPUT;
-use tui_pty_e2e::TIMEOUT_PRESNAPSHOT;
-use tui_pty_e2e::TuiSession;
-use tui_pty_e2e::normalize_for_input_snapshot;
-
 /// Test that an ACP tool call is rendered in the TUI
 ///
 /// This test verifies the full ACP tool call rendering pipeline:
@@ -196,26 +188,21 @@ fn test_acp_tool_call_no_duplicate_messages() {
 
     let contents = session.screen_contents();
 
-    // The Execute tool renders using the command from Invocation::Command
-    // (extracted from raw_input). The command is "test", so the TUI shows
-    // "Running test" (in-progress) or "Ran test" (completed).
-    // Count occurrences to verify no duplicates (both Running and Ran visible).
+    // Completion must replace the original running cell in place.
     let running_count = contents.matches("Running test").count();
     let ran_count = contents.matches("Ran test").count();
-    let total = running_count + ran_count;
-
     assert_eq!(
-        total, 1,
-        "Execute tool should appear exactly once (either 'Running test' or 'Ran test'), \
-         but appeared {total} times (Running: {running_count}, Ran: {ran_count}).\n\
-         This indicates duplicate messages (both states visible).\n\
-         Screen contents:\n{contents}",
+        running_count, 0,
+        "completed call still running:\n{contents}"
+    );
+    assert_eq!(
+        ran_count, 1,
+        "completed call must occur exactly once:\n{contents}"
     );
 
     // The tool cell should appear BEFORE the interleaved text (correct chronological order)
     let tool_pos = contents
-        .find("Running test")
-        .or_else(|| contents.find("Ran test"))
+        .find("Ran test")
         .expect("Should contain tool cell with command");
     let text_pos = contents
         .find("Interleaved test done")
@@ -231,6 +218,14 @@ fn test_acp_tool_call_no_duplicate_messages() {
         "acp_tool_call_no_duplicates",
         normalize_for_input_snapshot(contents)
     );
+
+    session.send_key(tui_pty_e2e::Key::Ctrl('e')).unwrap();
+    session
+        .wait_for_text("Exit code", Duration::from_secs(10))
+        .expect("expanded completed tool shows its exit status");
+    session
+        .wait_for_text("Command completed", Duration::from_secs(10))
+        .expect("expanded completed tool shows its output");
 }
 
 /// Snapshot test for ACP tool call rendering

@@ -13,8 +13,7 @@ use super::PickerState;
 use crate::tui::Tui;
 
 pub(super) fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
-    let height = tui.terminal.size()?.height;
-    tui.draw(height, 0, |frame| {
+    tui.draw_overlay(|frame| {
         let component_state = component_state(state);
         let area = frame.area();
         picker(&component_state).render(area, frame.buffer_mut());

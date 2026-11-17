@@ -11,6 +11,19 @@ const TRANSCRIPT_SUMMARY_WARN_CHARS: usize = 200_000;
 pub fn transcript_to_replay_session_events(
     transcript: &crate::transcript::Transcript,
 ) -> Vec<nori_protocol::SessionEvent> {
+    replay_session_events(transcript, false)
+}
+
+pub(crate) fn transcript_to_child_replay_session_events(
+    transcript: &crate::transcript::Transcript,
+) -> Vec<nori_protocol::SessionEvent> {
+    replay_session_events(transcript, true)
+}
+
+fn replay_session_events(
+    transcript: &crate::transcript::Transcript,
+    preserve_child_responses: bool,
+) -> Vec<nori_protocol::SessionEvent> {
     let has_raw_notifications = transcript.entries.iter().any(|line| {
         matches!(
             &line.entry,
@@ -57,10 +70,100 @@ pub fn transcript_to_replay_session_events(
         .unwrap_or_else(|| format!("transcript-{}", transcript.meta.session_id));
     let mut timing = super::replay_timing::TurnTiming::default();
     let mut replay = Vec::new();
-    for line in &transcript.entries {
+    let mut response_end = None;
+    let first_id = transcript.event_ids.first().copied();
+    for (index, line) in transcript.entries.iter().enumerate() {
         if let crate::transcript::TranscriptEntry::SessionEvent(entry) = &line.entry {
+            // These are live control signals. The journal retains them, but replaying them
+            // would retry a historical request or show an obsolete provider failure.
+            if matches!(
+                entry.event,
+                nori_protocol::SessionEvent::Nori(
+                    nori_protocol::NoriEvent::SubscriptionExhausted(_)
+                        | nori_protocol::NoriEvent::RequestFailed(_)
+                )
+            ) {
+                continue;
+            }
+            let assistant_chunk = matches!(&entry.event,
+                nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                    nori_protocol::acp::v1::AgentNotification::SessionNotification(notification)
+                )) if matches!(notification.update, nori_protocol::acp::v1::SessionUpdate::AgentMessageChunk(_)));
+            let boundary = matches!(&entry.event,
+                nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                    nori_protocol::acp::v1::AgentNotification::SessionNotification(notification)
+                )) if matches!(notification.update,
+                    nori_protocol::acp::v1::SessionUpdate::AgentThoughtChunk(_)
+                    | nori_protocol::acp::v1::SessionUpdate::UserMessageChunk(_)
+                    | nori_protocol::acp::v1::SessionUpdate::ToolCall(_)))
+                || matches!(
+                    &entry.event,
+                    nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Request { .. })
+                        | nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response {
+                            response: Ok(nori_protocol::acp::v1::AgentResponse::PromptResponse(_)),
+                            ..
+                        })
+                        | nori_protocol::SessionEvent::Nori(
+                            nori_protocol::NoriEvent::ContextCompacted(_)
+                        )
+                        | nori_protocol::SessionEvent::Nori(
+                            nori_protocol::NoriEvent::SessionEnded(_)
+                        )
+                );
+            let boundary = boundary
+                || (preserve_child_responses
+                    && matches!(
+                        &entry.event,
+                        nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response {
+                            response: Err(_),
+                            ..
+                        })
+                    ));
+            if boundary && let (Some(start), Some(end)) = (first_id, response_end.take()) {
+                replay.push(nori_protocol::SessionEvent::Nori(
+                    nori_protocol::NoriEvent::ConversationResponseBoundary(
+                        nori_protocol::ConversationResponseBoundary {
+                            transcript_id: transcript.meta.session_id.clone(),
+                            start,
+                            end,
+                        },
+                    ),
+                ));
+            }
+            if assistant_chunk && !entry.historical_evidence {
+                response_end = transcript.event_ids.get(index).copied();
+            }
             if entry.historical_evidence {
                 continue;
+            }
+            match &entry.event {
+                nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response { .. })
+                    if preserve_child_responses =>
+                {
+                    replay.push(entry.event.clone());
+                    continue;
+                }
+                nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(wire)) => {
+                    let mut wire = wire.clone();
+                    if let nori_protocol::SubagentWire::Update(update) = &mut wire
+                        && matches!(
+                            &update.state,
+                            nori_protocol::Patch::Set(nori_protocol::SubagentState::Running)
+                        )
+                    {
+                        update.state =
+                            nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle);
+                    }
+                    replay.push(nori_protocol::SessionEvent::Nori(
+                        nori_protocol::NoriEvent::Subagent(wire),
+                    ));
+                    continue;
+                }
+                nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(_)) => {
+                    replay.push(entry.event.clone());
+                    continue;
+                }
+                _ => {}
             }
             timing.observe(entry);
             if has_raw_notifications
@@ -123,6 +226,17 @@ pub fn transcript_to_replay_session_events(
                 ),
             ))
         }));
+    }
+    if let (Some(start), Some(end)) = (first_id, response_end) {
+        replay.push(nori_protocol::SessionEvent::Nori(
+            nori_protocol::NoriEvent::ConversationResponseBoundary(
+                nori_protocol::ConversationResponseBoundary {
+                    transcript_id: transcript.meta.session_id.clone(),
+                    start,
+                    end,
+                },
+            ),
+        ));
     }
     replay
 }
@@ -254,9 +368,8 @@ pub fn client_events_to_replay_client_events(
 /// Convert a loaded transcript into a human-readable summary string suitable
 /// for injecting into the first prompt via `pending_compact_summary`.
 ///
-/// The summary captures user messages, assistant responses, and tool call
-/// names so the agent has context about the previous conversation without
-/// needing the full tool lifecycle details.
+/// The summary captures user messages, assistant responses, and the recorded
+/// tool lifecycle in order, including tool input and output.
 ///
 /// No truncation is applied — the full transcript is preserved so the agent
 /// retains as much context as possible on resume. If the resulting prompt
@@ -264,11 +377,39 @@ pub fn client_events_to_replay_client_events(
 /// "prompt too long" error, which is handled gracefully by the caller.
 pub fn transcript_to_summary(transcript: &crate::transcript::Transcript) -> String {
     let mut seen_tool_calls = std::collections::HashSet::new();
+    let raw_tool_ids: std::collections::HashSet<String> = transcript
+        .entries
+        .iter()
+        .filter_map(|line| {
+            let crate::transcript::TranscriptEntry::SessionEvent(entry) = &line.entry else {
+                return None;
+            };
+            if entry.historical_evidence {
+                return None;
+            }
+            let nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                nori_protocol::acp::v1::AgentNotification::SessionNotification(notification),
+            )) = &entry.event
+            else {
+                return None;
+            };
+            match &notification.update {
+                nori_protocol::acp::v1::SessionUpdate::ToolCall(call) => {
+                    Some(call.tool_call_id.to_string())
+                }
+                nori_protocol::acp::v1::SessionUpdate::ToolCallUpdate(update) => {
+                    Some(update.tool_call_id.to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect();
     let mut summary = String::new();
     let mut pending_raw_assistant = String::new();
 
     for line in &transcript.entries {
         if let crate::transcript::TranscriptEntry::SessionEvent(session_event) = &line.entry
+            && !session_event.historical_evidence
             && let nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
                 nori_protocol::acp::v1::AgentNotification::SessionNotification(notification),
             )) = &session_event.event
@@ -286,6 +427,26 @@ pub fn transcript_to_summary(transcript: &crate::transcript::Transcript) -> Stri
         }
 
         match &line.entry {
+            crate::transcript::TranscriptEntry::SessionEvent(entry)
+                if !entry.historical_evidence =>
+            {
+                if let nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                    nori_protocol::acp::v1::AgentNotification::SessionNotification(notification),
+                )) = &entry.event
+                    && matches!(
+                        &notification.update,
+                        nori_protocol::acp::v1::SessionUpdate::ToolCall(_)
+                            | nori_protocol::acp::v1::SessionUpdate::ToolCallUpdate(_)
+                    )
+                {
+                    match serde_json::to_string(&notification.update) {
+                        Ok(event) => summary.push_str(&format!("Tool event: {event}\n")),
+                        Err(error) => {
+                            tracing::warn!(%error, "could not serialize tool event in transcript context")
+                        }
+                    }
+                }
+            }
             crate::transcript::TranscriptEntry::User(user) => {
                 summary.push_str(&format!("User: {}\n", user.content));
             }
@@ -303,13 +464,24 @@ pub fn transcript_to_summary(transcript: &crate::transcript::Transcript) -> Stri
                     summary.push_str(&format!("Assistant: {text}\n"));
                 }
             }
-            crate::transcript::TranscriptEntry::ToolCall(tool) => {
-                summary.push_str(&format!("[Tool: {}]\n", tool.name));
+            crate::transcript::TranscriptEntry::ToolCall(tool)
+                if !raw_tool_ids.contains(&tool.call_id) =>
+            {
+                summary.push_str(&format!("[Tool: {}] Input: {}\n", tool.name, tool.input));
+            }
+            crate::transcript::TranscriptEntry::ToolResult(tool)
+                if !raw_tool_ids.contains(&tool.call_id) =>
+            {
+                summary.push_str(&format!(
+                    "[Tool result: {}] {}\n",
+                    tool.call_id, tool.output
+                ));
             }
             crate::transcript::TranscriptEntry::ClientEvent(client_event) => {
                 match &client_event.event {
                     crate::normalized::ClientEvent::ToolSnapshot(tool_snapshot)
-                        if seen_tool_calls.insert(tool_snapshot.call_id.clone()) =>
+                        if !raw_tool_ids.contains(&tool_snapshot.call_id)
+                            && seen_tool_calls.insert(tool_snapshot.call_id.clone()) =>
                     {
                         summary.push_str(&format!("[Tool: {}]\n", tool_snapshot.title));
                     }
@@ -421,7 +593,63 @@ mod tests {
         Transcript {
             meta,
             entries: lines,
+            backend_binding: None,
+            requires_fresh_binding: false,
+            event_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn replay_does_not_redeliver_historical_fallback_controls() {
+        let request_id = nori_protocol::acp::v1::RequestId::from(42);
+        let exhausted = nori_protocol::SessionEvent::Nori(
+            nori_protocol::NoriEvent::SubscriptionExhausted(nori_protocol::SubscriptionExhausted {
+                request_id: request_id.clone(),
+                echo_id: None,
+                models: vec!["provider/model".into()],
+                ranked: false,
+                content: Vec::new(),
+                context: None,
+                original_error: "subscription exhausted".into(),
+            }),
+        );
+        let failed = nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::RequestFailed(
+            nori_protocol::RequestFailure {
+                request_id: Some(request_id),
+                message: "subscription exhausted".into(),
+                kind: nori_protocol::RequestFailureKind::Retryable,
+            },
+        ));
+        let transcript = make_transcript(vec![
+            TranscriptEntry::SessionEvent(SessionEventEntry::new(exhausted)),
+            TranscriptEntry::SessionEvent(SessionEventEntry::new(failed)),
+        ]);
+        assert!(transcript_to_replay_session_events(&transcript).is_empty());
+        assert_eq!(transcript.entries.len(), 3);
+    }
+
+    #[test]
+    fn canonical_replay_restores_response_source_range() {
+        let update = nori_protocol::acp::v1::SessionUpdate::AgentMessageChunk(
+            nori_protocol::acp::v1::ContentChunk::new(nori_protocol::acp::v1::ContentBlock::Text(
+                nori_protocol::acp::v1::TextContent::new("answer"),
+            )),
+        );
+        let event = nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+            nori_protocol::acp::v1::AgentNotification::SessionNotification(
+                nori_protocol::acp::v1::SessionNotification::new("session", update),
+            ),
+        ));
+        let mut transcript = make_transcript(vec![TranscriptEntry::SessionEvent(
+            SessionEventEntry::new(event),
+        )]);
+        transcript.event_ids = vec![1, 7];
+        let replay = transcript_to_replay_session_events(&transcript);
+        assert!(
+            matches!(replay.last(), Some(nori_protocol::SessionEvent::Nori(
+            nori_protocol::NoriEvent::ConversationResponseBoundary(boundary)
+        )) if boundary.transcript_id == "session-1" && boundary.start == 1 && boundary.end == 7)
+        );
     }
 
     #[test]

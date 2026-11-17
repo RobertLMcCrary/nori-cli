@@ -10,6 +10,8 @@ use crate::error::Origin;
 use crate::error::ScriptError;
 use crate::model::Workflow;
 
+pub(crate) const DEFAULT_SCRIPT: &str = include_str!("../default.scm");
+
 /// The global script's name inside `$NORI_HOME`.
 pub const GLOBAL_SCRIPT: &str = "init.scm";
 
@@ -51,6 +53,7 @@ pub struct Loaded {
     workflows: Vec<Workflow>,
     default: Option<String>,
     pub(crate) scripts: Vec<Script>,
+    pub(crate) builtin_defaults: bool,
 }
 
 impl Loaded {
@@ -94,6 +97,14 @@ pub(crate) fn load_scripts(
     global: Option<&Path>,
     project: Option<&Path>,
 ) -> Result<(Option<ScriptEngine>, Loaded), ScriptError> {
+    load_scripts_with_defaults(global, project, false)
+}
+
+pub(crate) fn load_scripts_with_defaults(
+    global: Option<&Path>,
+    project: Option<&Path>,
+    builtin_defaults: bool,
+) -> Result<(Option<ScriptEngine>, Loaded), ScriptError> {
     let mut scripts = Vec::new();
     for path in [global, project].into_iter().flatten() {
         match std::fs::read_to_string(path) {
@@ -111,11 +122,22 @@ pub(crate) fn load_scripts(
             }
         }
     }
-    let Some(first) = scripts.first() else {
+    if scripts.is_empty() && !builtin_defaults {
         return Ok((None, Loaded::default()));
-    };
-    let mut engine = ScriptEngine::new()
-        .map_err(|failure| failure.locate(Origin::File(first.path.clone()), ""))?;
+    }
+    let mut engine = ScriptEngine::new().map_err(|failure| {
+        failure.locate(
+            scripts
+                .first()
+                .map_or(Origin::Prompt, |first| Origin::File(first.path.clone())),
+            "",
+        )
+    })?;
+    if builtin_defaults {
+        engine
+            .run(DEFAULT_SCRIPT)
+            .map_err(|failure| failure.locate(Origin::Prompt, DEFAULT_SCRIPT))?;
+    }
     for script in &scripts {
         script.run(&mut engine)?;
     }
@@ -124,6 +146,7 @@ pub(crate) fn load_scripts(
         workflows: registry.workflows,
         default: registry.default,
         scripts,
+        builtin_defaults,
     };
     Ok((Some(engine), loaded))
 }

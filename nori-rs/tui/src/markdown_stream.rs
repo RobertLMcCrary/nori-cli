@@ -107,6 +107,31 @@ impl MarkdownStreamCollector {
         self.dirty
     }
 
+    /// A bounded suffix of an exceptionally long unfinished source line.
+    pub(crate) fn long_unfinished_tail(&self, max_bytes: usize) -> Option<&str> {
+        let open = &self.buffer[self.frozen_len..];
+        let line = memchr::memrchr(b'\n', open.as_bytes()).map_or(open, |index| &open[index + 1..]);
+        if line.len() <= max_bytes {
+            return None;
+        }
+        let mut start = line.len() - max_bytes;
+        while !line.is_char_boundary(start) {
+            start += 1;
+        }
+        Some(&line[start..])
+    }
+
+    pub(crate) fn open_source_len(&self) -> usize {
+        self.buffer.len().saturating_sub(self.frozen_len)
+    }
+
+    pub(crate) fn open_source_has_many_lines(&self, limit: usize) -> bool {
+        memchr::memchr_iter(b'\n', &self.buffer.as_bytes()[self.frozen_len..])
+            .take(limit.saturating_add(1))
+            .count()
+            > limit
+    }
+
     /// Bytes handed to the markdown parser so far.
     #[cfg(test)]
     pub fn parsed_bytes(&self) -> usize {

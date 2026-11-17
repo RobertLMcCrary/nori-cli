@@ -323,6 +323,7 @@ async fn launch(
     start: nori_harness::runtime::SessionStart,
 ) -> nori_harness::runtime::LaunchedSession {
     let agent = nori_harness::runtime::prepare_agent(nori_harness::runtime::AgentPrepareSpec {
+        handoff: None,
         config: std::sync::Arc::new(nori_config::NoriConfig {
             active_agent: "mock-model".into(),
             cwd: cwd.into(),
@@ -347,11 +348,16 @@ async fn receive_matching(
     predicate: impl Fn(&SessionEvent) -> bool,
 ) -> SessionEvent {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut observed = Vec::new();
         loop {
-            let event = session.events.recv().await.expect("event stream closed");
+            let event =
+                session.events.recv().await.unwrap_or_else(|| {
+                    panic!("event stream closed; observed events: {observed:#?}")
+                });
             if predicate(&event) {
                 return event;
             }
+            observed.push(event);
         }
     })
     .await
@@ -513,10 +519,28 @@ async fn live_saved_forked_and_repeatedly_resumed_history_share_original_checkpo
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let expected_replayed_text = (0..expected.turns.len())
+            .flat_map(|_| ["Test message 1", "Test message 2"])
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         assert_eq!(
-            replayed_text,
-            vec!["replay chunk 0", "replay chunk 1"],
-            "provider replay newer than local evidence must be retained once"
+            replayed_text, expected_replayed_text,
+            "the canonical transcript keeps each completed response exactly once"
+        );
+        assert!(
+            !replayed_text
+                .iter()
+                .any(|text| text.starts_with("replay chunk")),
+            "opaque provider replay must not be appended over canonical history"
+        );
+        let user_entries = transcript
+            .records()
+            .filter(|record| matches!(record, nori_harness::TranscriptRecord::User { .. }))
+            .count();
+        assert_eq!(
+            user_entries,
+            expected.turns.len(),
+            "repeated resume must not duplicate visible user history"
         );
         let inherited_turns = expected.turns.len();
         prompt(&mut resumed).await;

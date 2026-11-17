@@ -377,13 +377,14 @@ the same `nori-client` server: `agent_capabilities`, `delegate_task`,
   which relays to the same service on a unix socket in a directory only the
   user can enter (`set_stdio_bridge`, set by the CLI at startup).
 - **A child is a full harness session.** It has its own agent process,
-  approvals, and `nori-client` server, so it can delegate in turn. It starts
-  with the parent's current approval policy and never a broader one, and keeps
-  no transcript of its own. Its updates reach the parent's stream as
+  canonical transcript, approvals, and `nori-client` server, so it can delegate
+  in turn. It starts with the parent's current approval policy and never a
+  broader one. Its updates reach the parent's stream as
   `NoriEvent::Subagent` and `AcpEvent::ChildNotification`, under a view
-  session id unique to each task. Its permission requests are asked in the
-  parent conversation and answered back to the child; they are withdrawn when
-  the task ends.
+  session id unique to each task; the parent also retains those relayed events
+  in its own transcript. A history-fork child records its selected source range
+  in its journal. Its permission requests are asked in the parent conversation
+  and answered back to the child; they are withdrawn when the task ends.
 - **Results come back once, without polling.** `delegate_task` returns at once
   by default. When a task ends unread, the parent agent receives its result in
   a hidden `QueuedPromptKind::TaskResults` turn as soon as it is idle, either
@@ -392,9 +393,10 @@ the same `nori-client` server: `agent_capabilities`, `delegate_task`,
   `NoriEvent::TaskResultsDelivered`. Reading a finished task with
   `task_status` or `task_wait` delivers it instead.
 - **Waiting is bounded.** A blocking `task_wait` or `mode: wait` call returns
-  within 50 seconds (agents drop silent MCP calls; Codex after 60 seconds), or
-  sooner if a child needs approval. A timeout cancels nothing: the task wakes
-  the parent when it ends.
+  after its requested timeout, or after the default 45-second polling interval
+  (capped at 50 seconds for silent MCP-call liveness), or sooner if a child
+  needs approval. A timeout only returns the current status; it cancels
+  nothing, and the task wakes the parent when it ends.
 - **Stopping and follow-ups.** The user stopping the parent cancels every
   running task. Results that arrived before the stop are held until the user's
   next turn ends. `task_send` starts a new task on the child of a finished
@@ -402,8 +404,8 @@ the same `nori-client` server: `agent_capabilities`, `delegate_task`,
 - **Nested delegation.** A child whose turn ends while its own delegations
   still run keeps its task open until they end and the turn that takes their
   results ends.
-- **Limits.** At most 8 tasks run at once across a tree of delegations.
-  Delegations nest at most 3 deep.
+- **Admission.** There is no default cap on concurrent tasks or nesting depth.
+  `agent_capabilities` reports current depth and running-task count as context.
 - **Models and settings.** A model is chosen by value or name from the agent's
   model option. An agent that takes its model at spawn may run one it does not
   list. Other select settings, such as reasoning effort, are set with
@@ -425,7 +427,9 @@ the same `nori-client` server: `agent_capabilities`, `delegate_task`,
 - **Progress.** While a task runs, its snapshot carries the child's latest tool
   call or line of text and its tool-call count. Once it ends, the snapshot
   lists the files the child's edit tools changed. Results that come in within
-  600 ms of each other share one wake.
+  600 ms of each other share one wake. Large results are not truncated: wakes
+  inline up to 16 KiB and name the task so the parent can read the full result
+  with `task_status`.
 - **Worktrees.** `isolation: worktree` adds a detached worktree under
   `<repo>/.worktrees/` and lists `/.worktrees/` in the repository's local
   exclude file. The worktree is kept afterwards: it holds the child's work.
@@ -594,7 +598,9 @@ undo result says so when the turn ran commands.
 `subagent_spawned`, `subagent_state_update` and `session_message[_chunk]`
 before the typed parser (`nori_protocol::parse_subagent_update`), routes a
 child's updates as `AcpEvent::ChildNotification`, and holds a bounded number
-of updates for a session until its announcement arrives. A child's file diffs
+of updates for a session until its announcement arrives. Native Codex child threads forward
+their activity on their own session IDs; their turn completion marks them idle, and a later
+turn marks the same session running again while preserving its history. A child's file diffs
 are recorded in the root turn's journal.
 
 Resuming with the local transcript at hand prefers `session/resume`, which

@@ -1,5 +1,5 @@
-//! The switcher and the focused view drawn from a real subagent tree: running, finished and
-//! failed children, one nested in another.
+//! The switcher drawn from a real subagent tree: running, finished and failed children,
+//! one nested in another.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,8 +24,6 @@ use super::SubagentOverlay;
 use super::Target;
 use super::Transition;
 use super::roster::Roster;
-use super::roster::Status;
-use super::roster::SubagentKey;
 use super::tests::ctrl_space;
 use super::tests::main_entry;
 use super::tests::press;
@@ -48,6 +46,7 @@ fn announce(
         SubagentUpdate {
             parent_session_id: parent.map_or_else(|| acp::SessionId::new("root"), child),
             session_id: child(index),
+            agent: Patch::Keep,
             title: Patch::Set(kind.into()),
             description: Patch::Set(task.into()),
             state: Patch::Set(SubagentState::Running),
@@ -61,6 +60,7 @@ fn end(tree: &mut SubagentTree, index: usize, outcome: SubagentOutcome, now: Ins
         SubagentUpdate {
             parent_session_id: acp::SessionId::new("root"),
             session_id: child(index),
+            agent: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Ended(outcome)),
@@ -321,77 +321,25 @@ fn with_no_subagents_the_switcher_still_opens_on_main() {
 }
 
 #[test]
-fn a_running_subagent_is_followed_live_and_its_end_is_shown_in_place() {
+fn an_idle_child_stays_available_in_the_switcher() {
     let base = Instant::now();
-    let mut tree = sample_tree(base);
-    let now = base + Duration::from_secs(160);
-    let roster = roster_from(&tree, now);
-    let mut overlay = SubagentOverlay::focused(&roster, SubagentKey(2), ctrl_space(), 100)
-        .expect("subagent 2 exists");
-    let area = Rect::new(0, 0, 100, 18);
-    let terminal = draw(&mut overlay, &tree, 100, 18, now);
-    insta::assert_snapshot!("focused_running", terminal.backend());
-
-    // More output arrives: the view follows it without being asked.
-    say(
-        &mut tree,
-        2,
-        "\n\nFound a missing expiry check in `refresh()`.",
-        now,
+    let mut tree = SubagentTree::new(PathBuf::from("/work"), false);
+    let root = acp::SessionId::new("root");
+    tree.set_root(root.clone());
+    announce(&mut tree, None, 1, "Research", "Explore the code", base);
+    tree.on_update(
+        SubagentUpdate {
+            parent_session_id: root,
+            session_id: acp::SessionId::new("c1"),
+            agent: Patch::Keep,
+            title: Patch::Keep,
+            description: Patch::Keep,
+            state: Patch::Set(SubagentState::Idle),
+        },
+        base,
     );
-    for line in 0..30 {
-        say(&mut tree, 2, &format!("\nnote {line}"), now);
-    }
-    feed(&mut overlay, &tree, area, now);
-    let mut terminal = Terminal::new(TestBackend::new(100, 18)).expect("terminal");
-    terminal
-        .draw(|frame| overlay.render(frame.area(), frame.buffer_mut()))
-        .expect("draw");
-    terminal
-        .draw(|frame| overlay.render(frame.area(), frame.buffer_mut()))
-        .expect("draw");
-    insta::assert_snapshot!("focused_following_new_output", terminal.backend());
-
-    // It finishes while being watched: the view stays and shows the final state.
-    end(
-        &mut tree,
-        2,
-        SubagentOutcome::Completed { stop_reason: None },
-        now + Duration::from_secs(5),
-    );
-    let later = now + Duration::from_secs(8);
-    let terminal = draw(&mut overlay, &tree, 100, 18, later);
-    insta::assert_snapshot!("focused_finished_while_watching", terminal.backend());
-    assert_eq!(
-        roster_from(&tree, later)
-            .entry(Target::Subagent(SubagentKey(2)))
-            .map(|e| e.status),
-        Some(Status::Completed)
-    );
-}
-
-#[test]
-fn the_focused_view_goes_back_and_to_the_list() {
-    let base = Instant::now();
-    let tree = sample_tree(base);
-    let roster = roster_from(&tree, base);
-    let mut overlay =
-        SubagentOverlay::focused(&roster, SubagentKey(3), ctrl_space(), 100).expect("subagent 3");
-    overlay.on_key(press(KeyCode::Char(' '), KeyModifiers::CONTROL));
-    assert_eq!(overlay.take_transition(), Some(Transition::OpenSwitcher));
-    overlay.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-    assert_eq!(overlay.take_transition(), Some(Transition::Close));
-    assert!(SubagentOverlay::focused(&roster, SubagentKey(99), ctrl_space(), 100).is_none());
-}
-
-#[test]
-fn a_failed_subagent_view_names_the_failure() {
-    let base = Instant::now();
-    let tree = sample_tree(base);
-    let now = base + Duration::from_secs(160);
-    let roster = roster_from(&tree, now);
-    let mut overlay =
-        SubagentOverlay::focused(&roster, SubagentKey(4), ctrl_space(), 90).expect("subagent 4");
-    let terminal = draw(&mut overlay, &tree, 90, 14, now);
-    insta::assert_snapshot!("focused_failed", terminal.backend());
+    let mut overlay = open(&tree, base);
+    down(&mut overlay, 1);
+    let terminal = draw(&mut overlay, &tree, 90, 16, base);
+    insta::assert_snapshot!("switcher_idle_child", terminal.backend());
 }

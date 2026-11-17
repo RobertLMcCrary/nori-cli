@@ -14,3 +14,4 @@ pub use error_category::AcpErrorCategory;
 pub use error_category::AcpErrorDetails;
 pub use error_category::categorize_acp_error;
 pub use error_category::categorize_acp_error_chain;
+pub use error_category::is_subscription_exhausted;

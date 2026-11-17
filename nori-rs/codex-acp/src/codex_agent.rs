@@ -110,7 +110,8 @@ pub struct CodexAgent {
     /// The underlying codex configuration
     config: Config,
     /// Thread manager for handling sessions
-    thread_manager: ThreadManager,
+    thread_manager: Arc<ThreadManager>,
+    child_prompts: crate::thread::ChildPrompts,
     /// Store for listing and updating persisted thread metadata
     thread_store: Arc<dyn ThreadStore>,
     /// SQLite-backed Codex state index, when initialization succeeds
@@ -189,7 +190,7 @@ impl CodexAgent {
             installation_id,
             Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
         );
-        let thread_manager = ThreadManager::new(
+        let thread_manager = Arc::new(ThreadManager::new(
             &config,
             startup,
             CodexAppsToolsCache::default(),
@@ -203,12 +204,13 @@ impl CodexAgent {
             local_agent_graph_store_from_state_db(state_db.as_ref()),
             /*attestation_provider*/ None,
             /*external_time_provider*/ None,
-        );
+        ));
         Ok(Self {
             auth_manager,
             client_capabilities,
             config,
             thread_manager,
+            child_prompts: Arc::default(),
             thread_store,
             state_db,
             host_tools,
@@ -711,6 +713,9 @@ impl CodexAgent {
         .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
+        if let Some(tools) = &host_tools {
+            tools.bind_session_id(&session_id.to_string());
+        }
         // Record the session root for filesystem sandboxing.
         self.session_roots
             .lock()
@@ -728,6 +733,8 @@ impl CodexAgent {
             config.clone(),
             host_tools,
             cx,
+            Arc::clone(&self.thread_manager),
+            Arc::clone(&self.child_prompts),
         ));
         let load = thread.load().await?;
 
@@ -842,6 +849,10 @@ impl CodexAgent {
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
+        if let Some(tools) = &host_tools {
+            tools.bind_session_id(&session_id.to_string());
+        }
+
         let thread = Arc::new(Thread::new(
             session_id.clone(),
             thread,
@@ -854,6 +865,8 @@ impl CodexAgent {
             config.clone(),
             host_tools,
             cx,
+            Arc::clone(&self.thread_manager),
+            Arc::clone(&self.child_prompts),
         ));
 
         if replay_history {
@@ -935,7 +948,22 @@ impl CodexAgent {
         &self,
         request: CloseSessionRequest,
     ) -> Result<CloseSessionResponse, Error> {
-        self.get_thread(&request.session_id)?.shutdown().await?;
+        if let Ok(thread) = self.get_thread(&request.session_id) {
+            thread.shutdown().await?;
+        } else {
+            let sender = self
+                .child_prompts
+                .lock()
+                .unwrap()
+                .get(&request.session_id)
+                .cloned()
+                .ok_or_else(Error::invalid_params)?;
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            sender
+                .send(crate::thread::ChildPrompt::Close(response_tx))
+                .map_err(|_| Error::internal_error())?;
+            response_rx.await.map_err(Error::into_internal_error)??;
+        }
         self.thread_manager
             .remove_thread(
                 &ThreadId::from_string(&request.session_id.0)
@@ -956,15 +984,44 @@ impl CodexAgent {
         self.check_auth().await?;
 
         // Get the session state
-        let thread = self.get_thread(&request.session_id)?;
-        let stop_reason = thread.prompt(request).await?;
+        let thread = self.get_thread(&request.session_id);
+        let stop_reason = if let Ok(thread) = thread {
+            thread.prompt(request).await?
+        } else {
+            let sender = self
+                .child_prompts
+                .lock()
+                .unwrap()
+                .get(&request.session_id)
+                .cloned()
+                .ok_or_else(Error::invalid_params)?;
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            sender
+                .send(crate::thread::ChildPrompt::Prompt(request, response_tx))
+                .map_err(|_| Error::internal_error())?;
+            response_rx.await.map_err(Error::into_internal_error)??
+        };
 
         Ok(PromptResponse::new(stop_reason))
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-        self.get_thread(&args.session_id)?.cancel().await?;
+        if let Ok(thread) = self.get_thread(&args.session_id) {
+            return thread.cancel().await;
+        }
+        let sender = self
+            .child_prompts
+            .lock()
+            .unwrap()
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(Error::invalid_params)?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(crate::thread::ChildPrompt::Cancel(response_tx))
+            .map_err(|_| Error::internal_error())?;
+        response_rx.await.map_err(Error::into_internal_error)??;
         Ok(())
     }
 

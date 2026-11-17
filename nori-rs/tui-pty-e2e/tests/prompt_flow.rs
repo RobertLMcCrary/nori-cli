@@ -1,7 +1,6 @@
 use insta::assert_snapshot;
-use tui_pty_e2e::SessionConfig;
+use tui_pty_e2e::Key;
 use tui_pty_e2e::TIMEOUT;
-use tui_pty_e2e::TIMEOUT_INPUT;
 use tui_pty_e2e::TIMEOUT_PRESNAPSHOT;
 use tui_pty_e2e::TuiSession;
 use tui_pty_e2e::normalize_for_input_snapshot;
@@ -62,8 +61,12 @@ fn test_multiline_input() {
     let mut session = TuiSession::spawn(30, 80).unwrap();
     session.wait_for_text("›", TIMEOUT).unwrap();
 
-    // Type multiline prompt
-    session.type_input("Line 1\nLine 2\nLine 3").unwrap();
+    // Alt+Enter inserts a newline; Shift+Enter steers instead.
+    session.type_input("Line 1").unwrap();
+    session.send_key(Key::AltEnter).unwrap();
+    session.type_input("Line 2").unwrap();
+    session.send_key(Key::AltEnter).unwrap();
+    session.type_input("Line 3").unwrap();
 
     // Verify all lines visible
     session.wait_for_text("Line 1", TIMEOUT).unwrap();

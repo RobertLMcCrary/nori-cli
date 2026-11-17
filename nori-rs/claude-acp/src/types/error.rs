@@ -154,6 +154,10 @@ pub enum AgentError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// Claude explicitly rejected a request for a subscription usage window.
+    #[error("Claude subscription usage limit reached")]
+    UsageLimitExceeded { data: serde_json::Value },
+
     /// Cancelled
     #[error("Operation cancelled")]
     Cancelled,
@@ -189,6 +193,7 @@ impl AgentError {
             AgentError::Io(_) => ErrorCode::InternalError,
             AgentError::Json(_) => ErrorCode::ParseError,
             AgentError::Internal(_) => ErrorCode::InternalError,
+            AgentError::UsageLimitExceeded { .. } => ErrorCode::InternalError,
             AgentError::Cancelled => ErrorCode::Cancelled,
         }
     }
@@ -222,6 +227,16 @@ impl AgentError {
     /// Create an internal error
     pub fn internal(msg: impl Into<String>) -> Self {
         AgentError::Internal(msg.into())
+    }
+
+    /// Convert this error to an ACP error, preserving structured provider metadata.
+    pub fn to_acp_error(&self) -> sacp::Error {
+        match self {
+            AgentError::UsageLimitExceeded { data } => {
+                sacp::Error::new(self.error_code().code(), self.to_string()).data(data.clone())
+            }
+            _ => sacp::util::internal_error(self.to_string()),
+        }
     }
 
     /// Create a session not found error

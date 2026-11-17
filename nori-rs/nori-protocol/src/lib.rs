@@ -12,6 +12,8 @@ pub use subagent::*;
 
 /// ACP `_meta` key correlating a prompt with user-message chunks that echo it.
 pub const PROMPT_ECHO_ID_META_KEY: &str = "nori.dev/promptEchoId";
+/// Internal marker for a user prompt retried after an engine handoff.
+pub const HANDOFF_RETRY_META_KEY: &str = "nori.dev/handoffRetry";
 
 /// Identity of one submitted prompt, carried in `_meta` under [`PROMPT_ECHO_ID_META_KEY`] on the
 /// prompt and on every user-message chunk that echoes it.

@@ -4,30 +4,14 @@ static RESUME_PICKER_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
 impl ChatWidget {
-    /// Open the agent picker popup for ACP mode.
-    pub(crate) fn open_agent_popup(&mut self) {
-        let current_model = self.config.active_agent.clone();
-        let recording_enabled = self.config.acp_proxy.enabled;
+    pub(crate) fn open_providers_popup(&mut self) {
         self.bottom_pane
-            .set_acp_wire_recording_enabled(recording_enabled);
-        let params = crate::nori::agent_picker::agent_picker_params(
-            &current_model,
-            self.app_event_tx.clone(),
-            recording_enabled,
-        );
-        self.bottom_pane.show_selection_view(params);
+            .show_selection_view(crate::nori::agent_picker::provider_picker_params());
     }
 
     pub(crate) fn open_agent_recovery_popup(&mut self, error: &str) {
-        let recording_enabled = self.config.acp_proxy.enabled;
-        self.bottom_pane
-            .set_acp_wire_recording_enabled(recording_enabled);
-        let params = crate::nori::agent_picker::agent_picker_params_with_subtitle(
-            &self.config.active_agent,
-            self.app_event_tx.clone(),
-            recording_enabled,
-            error.to_string(),
-        );
+        let mut params = crate::nori::agent_picker::provider_picker_params();
+        params.subtitle = Some(error.to_string());
         self.bottom_pane.show_selection_view(params);
     }
 
@@ -39,17 +23,81 @@ impl ChatWidget {
         if !self.bottom_pane.has_active_view() {
             return;
         }
-        let params = crate::nori::agent_picker::agent_picker_params(
-            &self.config.active_agent,
-            self.app_event_tx.clone(),
-            recording_enabled,
-        );
+        let _ = recording_enabled;
+        let params = crate::nori::agent_picker::provider_picker_params();
         self.bottom_pane.replace_selection_view(params);
+    }
+
+    pub(crate) fn show_reference_session_picker(
+        &mut self,
+        sessions: Vec<crate::nori::reference_session_picker::ReferenceSession>,
+        target: crate::subagent_switcher::Target,
+    ) {
+        self.bottom_pane
+            .show_component_picker(crate::nori::reference_session_picker::picker(
+                sessions, target,
+            ));
+    }
+
+    pub(crate) fn update_reference_session_preview(
+        &mut self,
+        project_id: &str,
+        session_id: &str,
+        agent: &str,
+        preview: &str,
+    ) {
+        self.bottom_pane.update_selection_item(
+            &format!("reference:{project_id}:{session_id}"),
+            session_id.to_owned(),
+            Some(preview.to_owned()),
+            format!("{agent} {project_id} {session_id} {preview}"),
+        );
     }
 
     /// Show a selection view in the bottom pane.
     pub(crate) fn show_selection_view(&mut self, params: SelectionViewParams) {
         self.bottom_pane.show_selection_view(params);
+    }
+
+    pub(crate) fn open_reference_session_picker(&mut self) {
+        let target = self
+            .focused_subagent
+            .map(crate::subagent_switcher::Target::Subagent)
+            .unwrap_or(crate::subagent_switcher::Target::Main);
+        let nori_home = self.config.nori_home.clone();
+        let cwd = self.config.cwd.clone();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            match crate::nori::reference_session_picker::load(&nori_home, &cwd).await {
+                Ok(sessions) => {
+                    tx.send(AppEvent::ShowReferenceSessionPicker {
+                        sessions: sessions.clone(),
+                        target,
+                    });
+                    let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
+                    for item in sessions {
+                        let session = item.session;
+                        let preview = loader
+                            .load_first_user_preview(&session.project_id, &session.session_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "First message unavailable".to_owned());
+                        tx.send(AppEvent::ReferenceSessionPreview {
+                            project_id: session.project_id,
+                            session_id: session.session_id,
+                            agent: item.agent.unwrap_or_else(|| "Unknown agent".to_owned()),
+                            preview,
+                        });
+                    }
+                }
+                Err(error) => tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    crate::history_cell::new_error_event(format!(
+                        "Failed to load sessions: {error}"
+                    )),
+                ))),
+            }
+        });
     }
 
     /// Open the viewonly session picker to select a previous session to view.
@@ -478,6 +526,10 @@ impl ChatWidget {
         self.bottom_pane.set_hotkey_config(config);
     }
 
+    pub(crate) fn set_kakoune_mode(&mut self, enabled: bool) {
+        self.bottom_pane.set_kakoune_mode(enabled);
+    }
+
     pub(crate) fn set_vim_mode(&mut self, value: nori_config::VimEnterBehavior) {
         self.bottom_pane.set_vim_mode(value);
     }
@@ -674,8 +726,24 @@ impl ChatWidget {
         if let Some(option) = advertised_model {
             self.open_acp_session_config_value_picker(
                 option,
-                crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
+                self.focused_subagent
+                    .map(crate::nori::session_config_picker::ConfigPickerOrigin::Child)
+                    .unwrap_or(crate::nori::session_config_picker::ConfigPickerOrigin::Direct),
             );
+            return;
+        }
+
+        if self.focused_subagent.is_some() {
+            let params = SelectionViewParams {
+                title: Some("Model controls unavailable for this child session".to_owned()),
+                items: vec![SelectionItem {
+                    name: "No advertised models".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .picker();
+            self.bottom_pane.show_selection_view(params);
             return;
         }
 
@@ -707,14 +775,26 @@ impl ChatWidget {
 
     /// Show that choosing a model needs a session, with no agent to read options from yet.
     pub(crate) fn open_model_without_session_popup(&mut self) {
-        let params = crate::nori::agent_picker::acp_model_picker_no_session_params();
+        let mut params = crate::nori::unified_model_picker::params(
+            &self.config.nori_home,
+            None,
+            None,
+            crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
+        );
+        let items = &mut params.items;
+        if items.is_empty() {
+            items.push(SelectionItem {
+                name: "No models available yet".to_string(),
+                description: Some("Connect a provider with /providers and try again.".to_string()),
+                ..Default::default()
+            });
+        }
         self.bottom_pane.show_selection_view(params);
     }
 
     /// Show the static "model switching not supported" picker.
     pub(crate) fn open_model_unsupported_popup(&mut self) {
-        let params = crate::nori::agent_picker::acp_model_picker_params();
-        self.bottom_pane.show_selection_view(params);
+        self.open_model_without_session_popup();
     }
 
     /// Open the generic ACP session-config picker.
@@ -764,12 +844,27 @@ impl ChatWidget {
         option: nori_protocol::acp::v1::SessionConfigOption,
         origin: crate::nori::session_config_picker::ConfigPickerOrigin,
     ) {
-        let other_models = nori_harness::AgentKind::from_slug(&self.config.active_agent)
-            .map(nori_harness::AgentKind::other_models)
-            .unwrap_or(&[]);
+        let is_model =
+            option.category == Some(nori_protocol::acp::v1::SessionConfigOptionCategory::Model);
+        if is_model
+            && matches!(
+                origin,
+                crate::nori::session_config_picker::ConfigPickerOrigin::Direct
+                    | crate::nori::session_config_picker::ConfigPickerOrigin::Child(_)
+            )
+        {
+            let params = crate::nori::unified_model_picker::params(
+                &self.config.nori_home,
+                Some(&self.config.active_agent),
+                Some(&option),
+                origin,
+            );
+            self.bottom_pane.show_selection_view(params);
+            return;
+        }
         let params = crate::nori::session_config_picker::acp_session_config_value_picker_params(
             &option,
-            other_models,
+            &[],
             origin,
         );
         self.bottom_pane.show_selection_view(params);
@@ -791,6 +886,7 @@ impl ChatWidget {
     }
 
     /// Set an ACP session config option via the agent handle.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_acp_session_config_option(
         &mut self,
         config_id: String,
@@ -799,6 +895,7 @@ impl ChatWidget {
         value_name: String,
         is_custom_model: bool,
         origin: crate::nori::session_config_picker::ConfigPickerOrigin,
+        route_token: Option<i64>,
     ) {
         if let Some(handle) = self.harness_handle.clone() {
             let app_event_tx = self.app_event_tx.clone();
@@ -828,6 +925,7 @@ impl ChatWidget {
                                 });
                             }
                             crate::nori::session_config_picker::ConfigPickerOrigin::Direct
+                            | crate::nori::session_config_picker::ConfigPickerOrigin::Child(_)
                             | crate::nori::session_config_picker::ConfigPickerOrigin::Cycle => {}
                         }
                         app_event_tx.send(AppEvent::AcpSessionConfigSetResult {
@@ -841,6 +939,8 @@ impl ChatWidget {
                             origin,
                             config_options: Some(config_options),
                             error: None,
+                            route_fallback_eligible: false,
+                            route_token,
                         });
                     }
                     Err(err) => {
@@ -855,6 +955,8 @@ impl ChatWidget {
                             origin,
                             config_options: None,
                             error: Some(err.to_string()),
+                            route_fallback_eligible: crate::app::model_routes::eligible_error(&err),
+                            route_token,
                         });
                     }
                 }

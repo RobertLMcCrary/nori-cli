@@ -502,16 +502,19 @@ mod tests {
     fn description_override_replaces_builtin_description() {
         let mut overrides = HashMap::new();
         overrides.insert(
-            SlashCommand::Agent,
-            Line::from("switch between available ACP agents (current: Claude Code)"),
+            SlashCommand::Providers,
+            Line::from("connect model providers (current: Claude Code)"),
         );
         let popup = CommandPopup::new_with_overrides(Vec::new(), overrides);
-        let rows =
-            popup.rows_from_matches(vec![(CommandItem::Builtin(SlashCommand::Agent), None, 0)]);
+        let rows = popup.rows_from_matches(vec![(
+            CommandItem::Builtin(SlashCommand::Providers),
+            None,
+            0,
+        )]);
         let description = rows.first().and_then(|row| row.description.as_deref());
         assert_eq!(
             description,
-            Some("switch between available ACP agents (current: Claude Code)")
+            Some("connect model providers (current: Claude Code)")
         );
     }
 
@@ -519,8 +522,8 @@ mod tests {
     fn description_override_does_not_affect_other_commands() {
         let mut overrides = HashMap::new();
         overrides.insert(
-            SlashCommand::Agent,
-            Line::from("switch between available ACP agents (current: Claude Code)"),
+            SlashCommand::Providers,
+            Line::from("connect model providers (current: Claude Code)"),
         );
         let popup = CommandPopup::new_with_overrides(Vec::new(), overrides);
         let rows =

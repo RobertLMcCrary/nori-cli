@@ -28,6 +28,10 @@ pub use crate::backend::prepared::PreparedAgent;
 pub use crate::backend::prepared::SessionCatalog;
 use crate::session_event_fanout::SessionEventFanout;
 use crate::transcript::Transcript;
+mod child_admission;
+mod child_control;
+pub(crate) mod program;
+mod prompt_queue;
 use nori_protocol::AcpEvent;
 use nori_protocol::NoriEvent;
 use nori_protocol::Notice;
@@ -38,6 +42,8 @@ use nori_protocol::SessionEnded;
 pub use nori_protocol::SessionEvent;
 use nori_protocol::acp;
 use nori_protocol::acp::v1::SessionConfigOption;
+pub use program::ConversationProgramResult;
+use prompt_queue::PromptQueue;
 
 /// Duration before showing a warning that connection is taking too long.
 const CONNECT_WARNING_SECS: u64 = 8;
@@ -74,12 +80,39 @@ fn forward_connect_event(
 
 /// Command for controlling ACP session state exposed by the agent.
 enum HarnessCommand {
+    CurrentSessionId {
+        response_tx: oneshot::Sender<anyhow::Result<acp::v1::SessionId>>,
+    },
+    ControlledSubagentHandle {
+        session_id: acp::v1::SessionId,
+        response_tx: oneshot::Sender<anyhow::Result<Option<HarnessHandle>>>,
+    },
+    ChildConfigOptions {
+        session_id: acp::v1::SessionId,
+        response_tx: oneshot::Sender<anyhow::Result<Vec<acp::v1::SessionConfigOption>>>,
+    },
+    SetChildConfigOption {
+        session_id: acp::v1::SessionId,
+        config_id: String,
+        value: String,
+        response_tx: oneshot::Sender<anyhow::Result<Vec<acp::v1::SessionConfigOption>>>,
+    },
+    /// Evaluate and execute an append-only Pkl conversation program.
+    ExecuteConversationProgram {
+        source: String,
+        path: Option<PathBuf>,
+        response_tx: oneshot::Sender<anyhow::Result<ConversationProgramResult>>,
+    },
     /// Submit one ACP prompt and return its transport request ID.
     Prompt {
         content: Vec<acp::v1::ContentBlock>,
         meta: Option<acp::v1::Meta>,
         admission: PromptAdmission,
         response_tx: oneshot::Sender<anyhow::Result<acp::v1::RequestId>>,
+    },
+    /// Prioritize the oldest queued prompt by interrupting the current turn.
+    PromoteQueued {
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
     },
     /// Shut down the active harness session.
     Shutdown {
@@ -119,6 +152,74 @@ enum HarnessCommand {
         response_tx: oneshot::Sender<anyhow::Result<()>>,
     },
     Branch {
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    SendSubagentMessage {
+        session_id: acp::v1::SessionId,
+        content: Vec<acp::v1::ContentBlock>,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    SteerSubagentContent {
+        session_id: acp::v1::SessionId,
+        content: Vec<acp::v1::ContentBlock>,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    PromoteSubagentQueue {
+        session_id: acp::v1::SessionId,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    CancelSubagent {
+        session_id: acp::v1::SessionId,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    ChildHistory {
+        session_id: acp::v1::SessionId,
+        response_tx: oneshot::Sender<anyhow::Result<Vec<SessionEvent>>>,
+    },
+    ForkChildHistory {
+        session_id: acp::v1::SessionId,
+        context: String,
+        source: (String, i64, i64),
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    RewindChildHistory {
+        session_id: acp::v1::SessionId,
+        source: (String, i64, i64),
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    RestoreSeededNativeChildren {
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    ForkHistory {
+        context: String,
+        source: Option<(String, i64, i64)>,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    RecordForkSource {
+        session_id: String,
+        start: i64,
+        end: i64,
+        context: String,
+        entries: Vec<crate::transcript::TranscriptLine>,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    RetireHandoff {
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    RecordHandoffAttempt {
+        payload: String,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    RecordBackendBound {
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    ConversationRecorder {
+        response_tx:
+            oneshot::Sender<anyhow::Result<Option<Arc<crate::transcript::TranscriptRecorder>>>>,
+    },
+    RewindAndRebind {
+        session_id: String,
+        head: Option<i64>,
         response_tx: oneshot::Sender<anyhow::Result<()>>,
     },
     Undo {
@@ -210,6 +311,34 @@ impl std::fmt::Debug for HarnessHandle {
 }
 
 impl HarnessHandle {
+    /// Evaluate and execute a Pkl conversation program through the harness
+    /// command pipeline. Commands are durably recorded before their effects.
+    pub async fn execute_conversation_program(
+        &self,
+        source: String,
+    ) -> anyhow::Result<ConversationProgramResult> {
+        self.request(|response_tx| HarnessCommand::ExecuteConversationProgram {
+            source,
+            path: None,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Read and execute a Pkl conversation program from a local file.
+    pub async fn execute_conversation_program_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<ConversationProgramResult> {
+        let path = tokio::fs::canonicalize(path).await?;
+        let source = tokio::fs::read_to_string(&path).await?;
+        self.request(|response_tx| HarnessCommand::ExecuteConversationProgram {
+            source,
+            path: Some(path),
+            response_tx,
+        })
+        .await
+    }
     /// Return the context observations captured at prompt boundaries.
     pub async fn context_timeline(
         &self,
@@ -262,6 +391,45 @@ impl HarnessHandle {
         echo: &nori_protocol::PromptEchoId,
     ) -> anyhow::Result<acp::v1::RequestId> {
         self.prompt_with_meta(content, Some(echo.to_meta())).await
+    }
+
+    /// Interrupt the active turn and start this content ahead of queued prompts.
+    pub async fn steer_echoed(
+        &self,
+        content: Vec<acp::v1::ContentBlock>,
+        echo: &nori_protocol::PromptEchoId,
+    ) -> anyhow::Result<acp::v1::RequestId> {
+        self.prompt_with_meta_and_admission(content, Some(echo.to_meta()), PromptAdmission::Steer)
+            .await
+    }
+
+    /// Interrupt the active turn and start the oldest queued prompt, if any.
+    pub async fn promote_next_queued(&self) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::PromoteQueued { response_tx })
+            .await
+    }
+
+    /// Steer this session with schema-native ACP content.
+    pub async fn steer_content(
+        &self,
+        content: Vec<acp::v1::ContentBlock>,
+    ) -> anyhow::Result<acp::v1::RequestId> {
+        self.prompt_with_meta_and_admission(content, None, PromptAdmission::Steer)
+            .await
+    }
+
+    /// Retry an already recorded prompt after a provider handoff.
+    pub async fn prompt_handoff(
+        &self,
+        content: Vec<acp::v1::ContentBlock>,
+        echo: &nori_protocol::PromptEchoId,
+    ) -> anyhow::Result<acp::v1::RequestId> {
+        let mut meta = echo.to_meta();
+        meta.insert(
+            nori_protocol::HANDOFF_RETRY_META_KEY.to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        self.prompt_with_meta(content, Some(meta)).await
     }
 
     pub(crate) async fn prompt_with_meta(
@@ -416,6 +584,191 @@ impl HarnessHandle {
     pub async fn branch(&self) -> anyhow::Result<()> {
         self.request(|response_tx| HarnessCommand::Branch { response_tx })
             .await
+    }
+
+    /// Submit a follow-up to a child session.
+    pub async fn send_subagent_message(
+        &self,
+        session_id: acp::v1::SessionId,
+        text: String,
+    ) -> anyhow::Result<()> {
+        self.send_subagent_content(
+            session_id,
+            vec![acp::v1::ContentBlock::Text(acp::v1::TextContent::new(text))],
+        )
+        .await
+    }
+
+    /// Submit ACP content to a child session while preserving the parent task's lifecycle.
+    pub async fn send_subagent_content(
+        &self,
+        session_id: acp::v1::SessionId,
+        content: Vec<acp::v1::ContentBlock>,
+    ) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::SendSubagentMessage {
+            session_id,
+            content,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Steer a controlled child while preserving the parent's task lifecycle.
+    pub async fn steer_subagent_content(
+        &self,
+        session_id: acp::v1::SessionId,
+        content: Vec<acp::v1::ContentBlock>,
+    ) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::SteerSubagentContent {
+            session_id,
+            content,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Promote the oldest queued prompt in a controlled child.
+    pub async fn promote_subagent_queue(
+        &self,
+        session_id: acp::v1::SessionId,
+    ) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::PromoteSubagentQueue {
+            session_id,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Cancel the current turn in a controlled child.
+    pub async fn cancel_subagent(&self, session_id: acp::v1::SessionId) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::CancelSubagent {
+            session_id,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Read the selected child's own recorded history.
+    pub async fn child_history(
+        &self,
+        session_id: acp::v1::SessionId,
+    ) -> anyhow::Result<Vec<SessionEvent>> {
+        self.request(|response_tx| HarnessCommand::ChildHistory {
+            session_id,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Fork a selected range of a child's history.
+    pub async fn fork_child_history(
+        &self,
+        session_id: acp::v1::SessionId,
+        context: String,
+        source: (String, i64, i64),
+    ) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::ForkChildHistory {
+            session_id,
+            context,
+            source,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Rewind a child to a selected range of its own history.
+    pub async fn rewind_child_history(
+        &self,
+        session_id: acp::v1::SessionId,
+        source: (String, i64, i64),
+    ) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::RewindChildHistory {
+            session_id,
+            source,
+            response_tx,
+        })
+        .await
+    }
+
+    pub(crate) async fn restore_seeded_native_children(&self) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::RestoreSeededNativeChildren { response_tx })
+            .await
+    }
+
+    /// Start a child from a selected history prefix without replacing this session.
+    pub async fn fork_history(
+        &self,
+        context: String,
+        source: Option<(String, i64, i64)>,
+    ) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::ForkHistory {
+            context,
+            source,
+            response_tx,
+        })
+        .await
+    }
+
+    pub(crate) async fn record_fork_source(
+        &self,
+        session_id: String,
+        start: i64,
+        end: i64,
+        context: String,
+        entries: Vec<crate::transcript::TranscriptLine>,
+    ) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::RecordForkSource {
+            session_id,
+            start,
+            end,
+            context,
+            entries,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Stop recording events from a superseded provider session.
+    pub async fn retire_handoff(&self) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::RetireHandoff { response_tx })
+            .await
+    }
+
+    /// Record a provider handoff attempt or outcome in the canonical journal.
+    pub async fn record_handoff_attempt(&self, payload: String) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::RecordHandoffAttempt {
+            payload,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Record the active provider binding after activation has succeeded.
+    pub async fn record_backend_bound(&self) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::RecordBackendBound { response_tx })
+            .await
+    }
+
+    /// Obtain the shared recorder for a provider handoff.
+    pub async fn conversation_recorder(
+        &self,
+    ) -> anyhow::Result<Option<Arc<crate::transcript::TranscriptRecorder>>> {
+        self.request(|response_tx| HarnessCommand::ConversationRecorder { response_tx })
+            .await
+    }
+
+    /// Rewind and bind a fresh ACP session to the resulting conversation.
+    pub async fn rewind_and_rebind(
+        &self,
+        session_id: String,
+        head: Option<i64>,
+    ) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::RewindAndRebind {
+            session_id,
+            head,
+            response_tx,
+        })
+        .await
     }
 
     pub async fn undo(&self) -> anyhow::Result<()> {
@@ -603,6 +956,8 @@ pub struct AgentPrepareSpec {
     pub session_context: Option<SessionContext>,
     /// Conversation history injected into the first prompt after activation.
     pub initial_context: Option<String>,
+    /// Shared canonical recorder retained across a provider handoff.
+    pub handoff: Option<Arc<crate::transcript::TranscriptRecorder>>,
 }
 
 /// Explicit session directive applied to a prepared ACP connection.
@@ -659,6 +1014,7 @@ fn build_backend_config(spec: AgentPrepareSpec) -> AcpBackendConfig {
         cli_version,
         session_context,
         initial_context,
+        handoff,
     } = spec;
 
     // Detect auto-worktree repo root from the cwd path.
@@ -686,6 +1042,7 @@ fn build_backend_config(spec: AgentPrepareSpec) -> AcpBackendConfig {
         crate::backend::orchestrator::Seed::root(Arc::clone(&config), cli_version.clone());
 
     AcpBackendConfig {
+        handoff,
         agent: agent.clone(),
         cwd: config.cwd.clone(),
         approval_policy: config.approval_policy,
@@ -812,15 +1169,18 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     }
                 }
             };
-            let start = agent
-                .automatic_session_id()
-                .map(|session_id| {
-                    SessionStart::Resume(SessionResume {
-                        acp_session_id: Some(session_id.to_string()),
-                        transcript: None,
+            let start = match start {
+                SessionStart::New => agent
+                    .automatic_session_id()
+                    .map(|session_id| {
+                        SessionStart::Resume(SessionResume {
+                            acp_session_id: Some(session_id.to_string()),
+                            transcript: None,
+                        })
                     })
-                })
-                .unwrap_or(start);
+                    .unwrap_or(SessionStart::New),
+                resume @ SessionStart::Resume(_) => resume,
+            };
             let failure_label = match &start {
                 SessionStart::New => "Failed to start ACP session",
                 SessionStart::Resume(_) => "Failed to resume ACP session",
@@ -893,6 +1253,31 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         )));
                         return;
                     }
+                    Some(HarnessCommand::GetSessionConfig { response_tx }) => {
+                        let _ = response_tx.send(Vec::new());
+                    }
+                    Some(HarnessCommand::CurrentSessionId { response_tx }) => {
+                        let _ = response_tx.send(Err(anyhow::anyhow!("session is still preparing")));
+                    }
+                    Some(HarnessCommand::ConversationRecorder { response_tx }) => {
+                        let _ = response_tx.send(Ok(None));
+                    }
+                    Some(HarnessCommand::RewindAndRebind { response_tx, .. }) => {
+                        let _ = response_tx.send(Err(anyhow::anyhow!("session is still preparing")));
+                    }
+                    Some(HarnessCommand::Cancel { response_tx }) => {
+                        let mut remaining = VecDeque::new();
+                        while let Some(command) = pending_commands.pop_front() {
+                            match command {
+                                HarnessCommand::Prompt { response_tx, .. } => {
+                                    let _ = response_tx.send(Err(anyhow::anyhow!("prompt cancelled during session preparation")));
+                                }
+                                other => remaining.push_back(other),
+                            }
+                        }
+                        pending_commands = remaining;
+                        let _ = response_tx.send(Ok(()));
+                    }
                     // Register immediately (not queued) so a subscriber
                     // attached right after launch cannot miss startup events
                     // such as `SessionStarted`.
@@ -932,14 +1317,22 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
         // fork swap redirects recording to the new transcript; otherwise post-fork
         // events would keep landing in the frozen parent transcript.
         let transcript_recorder_cell = backend.transcript_recorder_cell();
-        if let Some(recorder) = transcript_recorder_cell.read().await.clone() {
+        let recording_enabled = Arc::new(std::sync::atomic::AtomicBool::new(!backend.is_handoff()));
+        if recording_enabled.load(std::sync::atomic::Ordering::Acquire)
+            && let Some(recorder) = transcript_recorder_cell.read().await.clone()
+        {
             for evidence in startup_evidence {
                 if let Err(error) = recorder.record_session_event(&evidence).await {
                     tracing::warn!(%error, "failed to record startup context evidence");
                 }
             }
         }
+        let command_recorder_cell = Arc::clone(&transcript_recorder_cell);
+        let command_recording_enabled = Arc::clone(&recording_enabled);
+        backend.bind_program_runtime();
         let backend_for_agent = Arc::clone(&backend);
+        let mut prompt_queue = PromptQueue::start(Arc::clone(&backend));
+        let mut child_admissions = child_admission::ChildAdmissions::default();
         let event_fanout = event_tx.clone();
         tokio::spawn(async move {
             loop {
@@ -950,21 +1343,220 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         None => break,
                     },
                 };
+                let (command_name, command_payload) = match &cmd {
+                    HarnessCommand::CurrentSessionId { .. } => ("current-session-id", "{}".to_owned()),
+                    HarnessCommand::ControlledSubagentHandle { session_id, .. } => (
+                        "controlled-subagent-handle",
+                        serde_json::json!({"session_id": session_id}).to_string(),
+                    ),
+                    HarnessCommand::ChildConfigOptions { session_id, .. } => ("child-config-options", serde_json::json!({"session_id":session_id}).to_string()),
+                    HarnessCommand::SetChildConfigOption { session_id, config_id, value, .. } => ("set-child-config-option", serde_json::json!({"session_id":session_id, "config_id":config_id, "value":value}).to_string()),
+                    HarnessCommand::ExecuteConversationProgram { source, path, .. } => (
+                        "execute-conversation-program",
+                        serde_json::json!({"source": source, "path": path}).to_string(),
+                    ),
+                    HarnessCommand::Prompt { content, meta, .. } => (
+                        "prompt",
+                        serde_json::json!({"content": content, "meta": meta}).to_string(),
+                    ),
+                    HarnessCommand::PromoteQueued { .. } => ("promote-queued", "{}".to_owned()),
+                    HarnessCommand::Shutdown { child_grace, .. } => (
+                        "shutdown",
+                        serde_json::json!({"child_grace_ms": child_grace.as_millis()}).to_string(),
+                    ),
+                    HarnessCommand::RespondToAgent {
+                        request_id,
+                        response,
+                        ..
+                    } => (
+                        "respond-to-agent",
+                        serde_json::json!({"request_id": request_id, "response": response})
+                            .to_string(),
+                    ),
+                    HarnessCommand::Cancel { .. } => ("cancel", "{}".to_owned()),
+                    HarnessCommand::CancelRequest { request_id, .. } => (
+                        "cancel-request",
+                        serde_json::json!({"request_id": request_id}).to_string(),
+                    ),
+                    HarnessCommand::AddHistory { text, .. } => {
+                        ("add-history", serde_json::json!({"text": text}).to_string())
+                    }
+                    HarnessCommand::HistoryEntry { log_id, offset, .. } => (
+                        "history-entry",
+                        serde_json::json!({"log_id": log_id, "offset": offset}).to_string(),
+                    ),
+                    HarnessCommand::SearchHistory { max_results, .. } => (
+                        "search-history",
+                        serde_json::json!({"max_results": max_results}).to_string(),
+                    ),
+                    HarnessCommand::CustomPrompts { .. } => ("custom-prompts", "{}".to_owned()),
+                    HarnessCommand::Compact { .. } => ("compact", "{}".to_owned()),
+                    HarnessCommand::Branch { .. } => ("branch", "{}".to_owned()),
+                    HarnessCommand::SendSubagentMessage { session_id, content, .. } => ("send-subagent-message", serde_json::json!({"session_id": session_id, "content": content}).to_string()),
+                    HarnessCommand::SteerSubagentContent { session_id, content, .. } => ("steer-subagent", serde_json::json!({"session_id": session_id, "content": content}).to_string()),
+                    HarnessCommand::PromoteSubagentQueue { session_id, .. } => ("promote-subagent-queue", serde_json::json!({"session_id": session_id}).to_string()),
+                    HarnessCommand::CancelSubagent { session_id, .. } => ("cancel-subagent", serde_json::json!({"session_id": session_id}).to_string()),
+                    HarnessCommand::ChildHistory { session_id, .. } => ("child-history", serde_json::json!({"session_id": session_id}).to_string()),
+                    HarnessCommand::ForkChildHistory { session_id, context, source, .. } => ("fork-child-history", serde_json::json!({"session_id": session_id, "context": context, "source": source}).to_string()),
+                    HarnessCommand::RewindChildHistory { session_id, source, .. } => ("rewind-child-history", serde_json::json!({"session_id": session_id, "source": source}).to_string()),
+                    HarnessCommand::RestoreSeededNativeChildren { .. } => ("restore-seeded-native-children", "{}".to_owned()),
+                    HarnessCommand::ForkHistory {
+                        context, source, ..
+                    } => (
+                        "fork-history",
+                        serde_json::json!({"context": context, "source": source}).to_string(),
+                    ),
+                    HarnessCommand::RecordForkSource {
+                        session_id,
+                        start,
+                        end,
+                        ..
+                    } => (
+                        "record-fork-source",
+                        serde_json::json!({"session_id": session_id, "start": start, "end": end})
+                            .to_string(),
+                    ),
+                    HarnessCommand::RetireHandoff { .. } => ("retire-handoff", "{}".to_owned()),
+                    HarnessCommand::RecordHandoffAttempt { payload, .. } => {
+                        ("handoff-attempt", payload.clone())
+                    }
+                    HarnessCommand::RecordBackendBound { .. } => {
+                        ("record-backend-bound", "{}".to_owned())
+                    }
+                    HarnessCommand::ConversationRecorder { .. } => {
+                        ("conversation-recorder", "{}".to_owned())
+                    }
+                    HarnessCommand::RewindAndRebind {
+                        session_id, head, ..
+                    } => (
+                        "rewind-and-rebind",
+                        serde_json::json!({"session_id": session_id, "head": head}).to_string(),
+                    ),
+                    HarnessCommand::Undo { .. } => ("undo", "{}".to_owned()),
+                    HarnessCommand::UndoSnapshots { .. } => ("undo-snapshots", "{}".to_owned()),
+                    HarnessCommand::UndoTo { index, .. } => {
+                        ("undo-to", serde_json::json!({"index": index}).to_string())
+                    }
+                    HarnessCommand::RunUserShell { command, .. } => (
+                        "run-user-shell",
+                        serde_json::json!({"command": command}).to_string(),
+                    ),
+                    HarnessCommand::SetApprovalPolicy { policy, .. } => (
+                        "set-approval-policy",
+                        serde_json::json!({"policy": policy}).to_string(),
+                    ),
+                    HarnessCommand::Goal { .. } => ("goal", "{}".to_owned()),
+                    HarnessCommand::SetGoal {
+                        objective, status, ..
+                    } => (
+                        "set-goal",
+                        serde_json::json!({"objective": objective, "status": status}).to_string(),
+                    ),
+                    HarnessCommand::SetGoalStatus { status, .. } => (
+                        "set-goal-status",
+                        serde_json::json!({"status": status}).to_string(),
+                    ),
+                    HarnessCommand::ClearGoal { .. } => ("clear-goal", "{}".to_owned()),
+                    HarnessCommand::GetSessionConfig { .. } => {
+                        ("get-session-config", "{}".to_owned())
+                    }
+                    HarnessCommand::SetSessionConfigOption {
+                        config_id, value, ..
+                    } => (
+                        "set-session-config-option",
+                        serde_json::json!({"config_id": config_id, "value": value}).to_string(),
+                    ),
+                    HarnessCommand::ListSessions { cwd, .. } => {
+                        ("list-sessions", serde_json::json!({"cwd": cwd}).to_string())
+                    }
+                    HarnessCommand::CloseSession { .. } => ("close-session", "{}".to_owned()),
+                    HarnessCommand::SubscribeEvents { .. } => ("subscribe-events", "{}".to_owned()),
+                    HarnessCommand::FlushTranscript { .. } => ("flush-transcript", "{}".to_owned()),
+                };
+                if command_recording_enabled.load(std::sync::atomic::Ordering::Acquire)
+                    && !matches!(
+                        cmd,
+                        HarnessCommand::RetireHandoff { .. }
+                            | HarnessCommand::RecordHandoffAttempt { .. }
+                            | HarnessCommand::CurrentSessionId { .. }
+                    )
+                    && let Some(recorder) = command_recorder_cell.read().await.clone()
+                    && let Err(error) = recorder.record_command(command_name, command_payload).await
+                {
+                    tracing::error!(%error, "failed to record harness command");
+                    continue;
+                }
                 match cmd {
+                    HarnessCommand::CurrentSessionId { response_tx } => {
+                        let _ = response_tx.send(Ok(backend_for_agent.session_id().await));
+                    }
+                    HarnessCommand::ControlledSubagentHandle {
+                        session_id,
+                        response_tx,
+                    } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ = response_tx
+                                .send(Ok(backend.controlled_subagent_handle(&session_id).await));
+                        });
+                    }
+                    HarnessCommand::ChildConfigOptions {
+                        session_id,
+                        response_tx,
+                    } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ =
+                                response_tx.send(backend.child_config_options(session_id).await);
+                        });
+                    }
+                    HarnessCommand::SetChildConfigOption {
+                        session_id,
+                        config_id,
+                        value,
+                        response_tx,
+                    } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ = response_tx.send(
+                                backend
+                                    .set_child_config_option(session_id, config_id, value)
+                                    .await,
+                            );
+                        });
+                    }
+                    HarnessCommand::ExecuteConversationProgram {
+                        source,
+                        path,
+                        response_tx,
+                    } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        let recorder = Arc::clone(&command_recorder_cell);
+                        tokio::spawn(async move {
+                            let result =
+                                program::execute_source(&source, path, &backend, &recorder).await;
+                            let _ = response_tx.send(result);
+                        });
+                    }
                     HarnessCommand::Prompt {
                         content,
                         meta,
                         admission,
                         response_tx,
                     } => {
-                        backend_for_agent
-                            .submit_prompt(content, meta, admission, response_tx)
+                        prompt_queue
+                            .enqueue(content, meta, admission, response_tx)
                             .await;
+                    }
+                    HarnessCommand::PromoteQueued { response_tx } => {
+                        let result = backend_for_agent.promote_next_queued().await;
+                        let _ = response_tx.send(result);
                     }
                     HarnessCommand::Shutdown {
                         child_grace,
                         response_tx,
                     } => {
+                        prompt_queue.shutdown().await;
                         let result = backend_for_agent.shutdown(child_grace).await;
                         let shutdown_complete = result.is_ok();
                         let _ = response_tx.send(result);
@@ -983,6 +1575,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         let _ = response_tx.send(result);
                     }
                     HarnessCommand::Cancel { response_tx } => {
+                        prompt_queue.cancel_pending().await;
                         let _ = response_tx.send(backend_for_agent.cancel().await);
                     }
                     HarnessCommand::CancelRequest {
@@ -1018,6 +1611,170 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     }
                     HarnessCommand::Branch { response_tx } => {
                         let _ = response_tx.send(backend_for_agent.branch().await);
+                    }
+                    HarnessCommand::SendSubagentMessage {
+                        session_id,
+                        content,
+                        response_tx,
+                    } => {
+                        child_admissions.send(
+                            &backend_for_agent,
+                            session_id,
+                            child_admission::ChildCommand::Send(content, response_tx),
+                        );
+                    }
+                    HarnessCommand::SteerSubagentContent {
+                        session_id,
+                        content,
+                        response_tx,
+                    } => {
+                        child_admissions.send(
+                            &backend_for_agent,
+                            session_id,
+                            child_admission::ChildCommand::Steer(content, response_tx),
+                        );
+                    }
+                    HarnessCommand::PromoteSubagentQueue {
+                        session_id,
+                        response_tx,
+                    } => {
+                        child_admissions.send(
+                            &backend_for_agent,
+                            session_id,
+                            child_admission::ChildCommand::Promote(response_tx),
+                        );
+                    }
+                    HarnessCommand::CancelSubagent {
+                        session_id,
+                        response_tx,
+                    } => {
+                        child_admissions.send(
+                            &backend_for_agent,
+                            session_id,
+                            child_admission::ChildCommand::Cancel(response_tx),
+                        );
+                    }
+                    HarnessCommand::ChildHistory {
+                        session_id,
+                        response_tx,
+                    } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ = response_tx.send(backend.child_history(session_id).await);
+                        });
+                    }
+                    HarnessCommand::ForkChildHistory {
+                        session_id,
+                        context,
+                        source,
+                        response_tx,
+                    } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ = response_tx.send(
+                                backend
+                                    .fork_child_history(session_id, context, source)
+                                    .await,
+                            );
+                        });
+                    }
+                    HarnessCommand::RewindChildHistory {
+                        session_id,
+                        source,
+                        response_tx,
+                    } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ = response_tx
+                                .send(backend.rewind_child_history(session_id, source).await);
+                        });
+                    }
+                    HarnessCommand::RestoreSeededNativeChildren { response_tx } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ =
+                                response_tx.send(backend.restore_seeded_native_children().await);
+                        });
+                    }
+                    HarnessCommand::ForkHistory {
+                        context,
+                        source,
+                        response_tx,
+                    } => {
+                        let _ =
+                            response_tx.send(backend_for_agent.fork_history(context, source).await);
+                    }
+                    HarnessCommand::RecordForkSource {
+                        session_id,
+                        start,
+                        end,
+                        context,
+                        entries,
+                        response_tx,
+                    } => {
+                        let recorder = command_recorder_cell.read().await.clone();
+                        let result = match recorder {
+                            Some(recorder) => recorder
+                                .record_fork_source(session_id, start, end, context, entries)
+                                .await
+                                .map_err(anyhow::Error::from),
+                            None => Err(anyhow::anyhow!("session has no transcript recorder")),
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                    HarnessCommand::RetireHandoff { response_tx } => {
+                        command_recording_enabled
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        let _ = response_tx.send(Ok(()));
+                    }
+                    HarnessCommand::RecordHandoffAttempt {
+                        payload,
+                        response_tx,
+                    } => {
+                        let recorder = command_recorder_cell.read().await.clone();
+                        let result = match recorder {
+                            Some(recorder) => recorder
+                                .record_command("handoff-attempt", payload)
+                                .await
+                                .map_err(anyhow::Error::from),
+                            None => Err(anyhow::anyhow!("session has no transcript recorder")),
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                    HarnessCommand::RecordBackendBound { response_tx } => {
+                        let recorder = command_recorder_cell.read().await.clone();
+                        let result = match recorder {
+                            Some(recorder) => {
+                                let payload = serde_json::json!({"agent": backend_for_agent.agent_name(), "acp_session_id": backend_for_agent.session_id().await}).to_string();
+                                recorder
+                                    .record_backend_bound(payload)
+                                    .await
+                                    .map_err(anyhow::Error::from)
+                            }
+                            None => Err(anyhow::anyhow!("session has no transcript recorder")),
+                        };
+                        if result.is_ok() {
+                            command_recording_enabled
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        let _ = response_tx.send(result);
+                    }
+                    HarnessCommand::ConversationRecorder { response_tx } => {
+                        let _ = response_tx.send(Ok(command_recorder_cell.read().await.clone()));
+                    }
+                    HarnessCommand::RewindAndRebind {
+                        session_id,
+                        head,
+                        response_tx,
+                    } => {
+                        let result = if prompt_queue.is_busy().await {
+                            Err(anyhow::anyhow!(
+                                "Cannot rewind while a prompt is being admitted"
+                            ))
+                        } else {
+                            backend_for_agent.rewind_and_rebind(session_id, head).await
+                        };
+                        let _ = response_tx.send(result);
                     }
                     HarnessCommand::Undo { response_tx } => {
                         let _ = response_tx.send(backend_for_agent.undo().await);
@@ -1085,6 +1842,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         let close_complete = result.is_ok();
                         let _ = response_tx.send(result);
                         if close_complete {
+                            prompt_queue.shutdown().await;
                             break;
                         }
                     }
@@ -1096,12 +1854,14 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     }
                 }
             }
+            prompt_queue.shutdown().await;
         });
 
         // Drop our Arc reference; the typed command task owns the backend.
         drop(backend);
 
         let mut replaying = false;
+        let mut response_boundary: Option<(String, i64, i64)> = None;
         while let Some(BackendEvent::Public(event)) = backend_event_rx.recv().await {
             let session_ended = matches!(event, SessionEvent::Nori(NoriEvent::SessionEnded(_)));
             let in_replay = match &event {
@@ -1112,13 +1872,78 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                 SessionEvent::Nori(NoriEvent::ReplayFinished) => std::mem::take(&mut replaying),
                 _ => replaying,
             };
+            let is_assistant_chunk = matches!(
+                &event,
+                SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                    acp::v1::AgentNotification::SessionNotification(notification)
+                )) if matches!(notification.update, acp::v1::SessionUpdate::AgentMessageChunk(_))
+            );
+            let flush_response = matches!(
+                &event,
+                SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                    acp::v1::AgentNotification::SessionNotification(notification)
+                )) if matches!(notification.update,
+                    acp::v1::SessionUpdate::AgentThoughtChunk(_)
+                    | acp::v1::SessionUpdate::UserMessageChunk(_)
+                    | acp::v1::SessionUpdate::ToolCall(_))
+            ) || matches!(
+                &event,
+                SessionEvent::Acp(nori_protocol::AcpEvent::Request { .. })
+                    | SessionEvent::Acp(nori_protocol::AcpEvent::Response {
+                        response: Ok(acp::v1::AgentResponse::PromptResponse(_)),
+                        ..
+                    })
+                    | SessionEvent::Nori(NoriEvent::ContextCompacted(_))
+                    | SessionEvent::Nori(NoriEvent::SessionEnded(_))
+            );
+            if flush_response && let Some((transcript_id, start, end)) = response_boundary.take() {
+                let marker = nori_protocol::ConversationResponseBoundary {
+                    transcript_id,
+                    start,
+                    end,
+                };
+                if event_tx
+                    .send(SessionEvent::Nori(NoriEvent::ConversationResponseBoundary(
+                        marker,
+                    )))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            if recording_enabled.load(std::sync::atomic::Ordering::Acquire)
+                && let Some(recorder) = transcript_recorder_cell.read().await.clone()
+                && !(in_replay && recorder.continues_recorded_session())
+            {
+                match recorder.record_received_event(&event).await {
+                    Ok(Some((start, end))) if is_assistant_chunk && !in_replay => {
+                        response_boundary = Some((recorder.session_id().to_owned(), start, end));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "failed to record received session event");
+                        break;
+                    }
+                }
+            }
             let evidence = observe_context_event(&context_timeline, &event).await;
             // A transcript that already holds the history being replayed does not record it again.
-            if let Some(recorder) = transcript_recorder_cell.read().await.clone()
+            if recording_enabled.load(std::sync::atomic::Ordering::Acquire)
+                && let Some(recorder) = transcript_recorder_cell.read().await.clone()
                 && !(in_replay && recorder.continues_recorded_session())
-                && let Err(error) = recorder.record_session_event(&evidence).await
             {
-                tracing::warn!(%error, "failed to record public session event");
+                match recorder.record_session_event(&evidence).await {
+                    Ok(Some(id)) if is_assistant_chunk && !in_replay => {
+                        if let Some((_, _, end)) = &mut response_boundary {
+                            *end = id;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "failed to record public session event");
+                        break;
+                    }
+                }
             }
             if event_tx.send(event).is_err() {
                 break;
@@ -1127,10 +1952,15 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                 break;
             }
         }
-        if let Some(recorder) = transcript_recorder_cell.read().await.clone()
-            && let Err(error) = recorder.shutdown().await
-        {
-            tracing::warn!(%error, "failed to shut down transcript recorder");
+        if let Some(recorder) = transcript_recorder_cell.write().await.take() {
+            let result = if Arc::strong_count(&recorder) == 1 {
+                recorder.shutdown().await
+            } else {
+                recorder.flush().await
+            };
+            if let Err(error) = result {
+                tracing::warn!(%error, "failed to flush transcript recorder");
+            }
         }
     });
 

@@ -273,6 +273,10 @@ async fn handle_preparation_event(
             Ok(())
         }
         Some(ConnectionEvent::SessionUpdate(_) | ConnectionEvent::Subagent(_)) => Ok(()),
+        Some(ConnectionEvent::Barrier(reply)) => {
+            let _ = reply.send(());
+            Ok(())
+        }
         Some(ConnectionEvent::DelegatedRequest(request)) => {
             let _ = request
                 .response_tx

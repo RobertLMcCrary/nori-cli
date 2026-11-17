@@ -17,12 +17,32 @@ impl ChatComposer {
         if !self.input_enabled {
             return (InputResult::None, false);
         }
+        if key_event.code == KeyCode::Enter
+            && key_event.modifiers == KeyModifiers::SHIFT
+            && !self.popup_active()
+        {
+            if key_event.kind == KeyEventKind::Release {
+                return (InputResult::None, true);
+            }
+            let (result, redraw) = self.handle_key_event(KeyEvent {
+                modifiers: KeyModifiers::NONE,
+                ..key_event
+            });
+            return (
+                match result {
+                    InputResult::Submitted(text) => InputResult::Steer(text),
+                    InputResult::PromoteQueued => InputResult::None,
+                    other => other,
+                },
+                redraw,
+            );
+        }
         let is_newline_shortcut = !matches!(self.active_popup, ActivePopup::HistorySearch(_))
             && matches!(
                 key_event,
                 KeyEvent {
                     code: KeyCode::Enter,
-                    modifiers: KeyModifiers::SHIFT | KeyModifiers::ALT,
+                    modifiers: KeyModifiers::ALT,
                     ..
                 }
             );
@@ -61,6 +81,10 @@ impl ChatComposer {
             InputResult::Submitted(_) | InputResult::Command(_)
         ) {
             self.textarea.enter_vim_normal_mode();
+            if self.textarea.kakoune_mode_enabled() {
+                self.textarea.set_kakoune_mode_enabled(false);
+                self.textarea.set_kakoune_mode_enabled(true);
+            }
         }
 
         self.sync_selection_popups();
@@ -73,9 +97,6 @@ impl ChatComposer {
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
-            return (InputResult::None, true);
-        }
         let in_vim_normal = self.textarea.is_in_vim_normal_mode();
         if self.should_handle_vim_insert_escape(key_event) {
             return self.handle_input_basic(key_event);
@@ -310,9 +331,6 @@ impl ChatComposer {
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
-            return (InputResult::None, true);
-        }
         if self.should_handle_vim_insert_escape(key_event) {
             self.active_popup = ActivePopup::None;
             return self.handle_input_basic(key_event);
@@ -435,9 +453,6 @@ impl ChatComposer {
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
-            return (InputResult::None, true);
-        }
         if self.should_handle_vim_insert_escape(key_event) {
             self.active_popup = ActivePopup::None;
             return self.handle_input_basic(key_event);
@@ -679,9 +694,6 @@ impl ChatComposer {
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        if !self.is_shell_mode && self.handle_shortcut_overlay_key(&key_event) {
-            return (InputResult::None, true);
-        }
         if self.should_handle_vim_insert_escape(key_event) {
             return self.handle_input_basic(key_event);
         }
@@ -696,6 +708,7 @@ impl ChatComposer {
             return self.handle_input_basic(key_event);
         }
         if self.is_empty()
+            && !self.textarea.kakoune_mode_enabled()
             && self.textarea.is_in_vim_normal_mode()
             && key_event.kind == KeyEventKind::Press
             && key_event.modifiers == KeyModifiers::NONE
@@ -715,7 +728,7 @@ impl ChatComposer {
             }
         }
         if key_event.code == KeyCode::Esc {
-            if self.is_empty() {
+            if self.is_empty() && !self.textarea.kakoune_mode_enabled() {
                 let next_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
                 if next_mode != self.footer_mode {
                     self.footer_mode = next_mode;
@@ -811,6 +824,11 @@ impl ChatComposer {
                     crate::chatwidget::ModelStep::Previous,
                 ));
                 (InputResult::None, true)
+            }
+            key_event
+                if self.textarea.kakoune_mode_enabled() && key_event.code != KeyCode::Enter =>
+            {
+                self.handle_input_basic(key_event)
             }
             // -------------------------------------------------------------
             // History navigation (Up / Down) – only when the composer is not
@@ -1068,8 +1086,9 @@ impl ChatComposer {
 
         // In vim Normal mode, bypass paste burst detection and send input directly
         // to the textarea so vim navigation keys (h/j/k/l) work correctly.
-        if self.textarea.is_in_vim_normal_mode() {
+        if self.textarea.kakoune_mode_enabled() || self.textarea.is_in_vim_normal_mode() {
             self.textarea.input(input);
+            self.sync_placeholder_payloads();
             return (InputResult::None, true);
         }
 
@@ -1150,7 +1169,6 @@ impl ChatComposer {
 
         // Normal input handling
         self.textarea.input(input);
-        let text_after = self.textarea.text();
 
         // Update paste-burst heuristic for plain Char (no Ctrl/Alt) events.
         let crossterm::event::KeyEvent {
@@ -1171,6 +1189,13 @@ impl ChatComposer {
                 self.paste_burst.clear_window_after_non_char();
             }
         }
+
+        self.sync_placeholder_payloads();
+        (InputResult::None, true)
+    }
+
+    fn sync_placeholder_payloads(&mut self) {
+        let text_after = self.textarea.text();
 
         // Check if any placeholders were removed and remove their corresponding pending pastes
         self.pending_pastes
@@ -1198,8 +1223,6 @@ impl ChatComposer {
             }
             self.attached_images = kept;
         }
-
-        (InputResult::None, true)
     }
 
     /// Attempts to remove an image or paste placeholder if the cursor is at the end of one.
@@ -1353,29 +1376,5 @@ impl ChatComposer {
         }
         self.pending_pastes.clear();
         text
-    }
-
-    pub(super) fn handle_shortcut_overlay_key(&mut self, key_event: &KeyEvent) -> bool {
-        if key_event.kind != KeyEventKind::Press {
-            return false;
-        }
-
-        let toggles = matches!(
-            key_event,
-            KeyEvent {
-                code: KeyCode::Char('?'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if self.is_empty()
-        );
-
-        if !toggles {
-            return false;
-        }
-
-        let next = toggle_shortcut_mode(self.footer_mode, self.ctrl_c_quit_hint);
-        let changed = next != self.footer_mode;
-        self.footer_mode = next;
-        changed
     }
 }

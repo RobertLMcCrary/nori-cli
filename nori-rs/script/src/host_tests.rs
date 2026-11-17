@@ -5,6 +5,42 @@ use pretty_assertions::assert_eq;
 use super::*;
 use crate::model::Workflow;
 
+#[test]
+fn builtin_fallback_defaults_are_steel_and_can_be_overridden() {
+    let host = ScriptHost::spawn_with_defaults(None, None).expect("host");
+    let loaded = host.loaded().expect("defaults load");
+    let workflow = loaded.default_workflow().expect("default workflow");
+    assert_eq!(workflow.name, "nori-default");
+    assert!(workflow.fallback_ranked);
+    assert!(workflow.fallback_models.is_empty());
+
+    let inline = host
+        .apply_inline(",(fallback-models \"provider/model\")\nhello")
+        .expect("inline");
+    let workflow = inline.workflow.expect("workflow");
+    assert!(!workflow.fallback_ranked);
+    assert_eq!(workflow.fallback_models, vec!["provider/model"]);
+    let inline = host
+        .apply_inline(",(fallback-models)\nhello")
+        .expect("inline");
+    let workflow = inline.workflow.expect("workflow");
+    assert!(!workflow.fallback_ranked);
+    assert!(workflow.fallback_models.is_empty());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let global = script(
+        &dir,
+        "init.scm",
+        "(define-workflow custom (use 'nori-default) (fallback-models)) (default-workflow custom)",
+    );
+    let host = ScriptHost::spawn_with_defaults(Some(global), None).expect("host");
+    let loaded = host.loaded().expect("user policy loads");
+    let workflow = loaded.default_workflow().expect("custom default");
+    assert_eq!(workflow.name, "custom");
+    assert!(!workflow.fallback_ranked);
+    assert!(workflow.fallback_models.is_empty());
+}
+
 fn script(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, text).expect("write");

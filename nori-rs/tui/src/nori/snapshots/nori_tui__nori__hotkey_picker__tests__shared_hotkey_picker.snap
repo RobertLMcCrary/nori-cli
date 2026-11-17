@@ -18,15 +18,15 @@ expression: "text.lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
      Delete Backward Char            ctrl + h
      Delete Forward Char             ctrl + d
      Delete Backward Word            ctrl + w
-     Kill to Line End                ctrl + k
+     Kill to Line End                alt + k
      Kill to Line Start              ctrl + u
      Yank                            ctrl + y
      History Search                  ctrl + r
      Toggle Plan Drawer              ctrl + o
-     Clear Screen                    ctrl + l
+     Clear Screen                    ctrl + shift + l
      Next Model                      ctrl + n
      Previous Model                  ctrl + p
-     Next Effort Level               ctrl + shift + n
-     Previous Effort Level           ctrl + shift + p
+     Next Effort Level               ctrl + j
+     Previous Effort Level           ctrl + k
      Commit Changes                  alt + g
   ↑↓/j/k move  enter rebind  r reset  esc close

@@ -5,7 +5,6 @@
 //! last-connect-wins, replay ordering, and delegated-request round-trips.
 
 use std::net::SocketAddr;
-use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -234,14 +233,8 @@ async fn start_server_with_options(
 
 #[tokio::test]
 async fn one_server_listens_on_loopback_and_a_second_exact_address_on_one_port() {
-    let route_probe = UdpSocket::bind("0.0.0.0:0").expect("bind route probe");
-    route_probe
-        .connect("192.0.2.1:9")
-        .expect("select local route");
-    let exact_addr = SocketAddr::new(
-        route_probe.local_addr().expect("local route address").ip(),
-        0,
-    );
+    // Use both loopback families so the test does not depend on a LAN route or firewall policy.
+    let exact_addr = "[::1]:0".parse::<SocketAddr>().expect("IPv6 loopback");
     let hosted = Arc::new(FakeHosted::default());
     let server = RemoteAcpServer::bind_many(
         [
@@ -411,9 +404,11 @@ impl WsClient {
         Self,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ) {
-        let (ws, response) = connect_async(format!("ws://{addr}/acp"))
-            .await
-            .expect("websocket connect");
+        let (ws, response) =
+            tokio::time::timeout(RECV_TIMEOUT, connect_async(format!("ws://{addr}/acp")))
+                .await
+                .expect("timed out connecting websocket")
+                .expect("websocket connect");
         (Self { ws, next_id: 0 }, response)
     }
 

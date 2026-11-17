@@ -18,6 +18,7 @@ use ratatui::text::Line;
 use super::MessageAction;
 use super::MessageChoice;
 use super::TranscriptOverlay;
+use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::UserHistoryCell;
@@ -193,4 +194,101 @@ fn the_selected_prompt_and_its_actions() {
     click(&mut overlay, prompt, now);
     click(&mut overlay, prompt, now + Duration::from_millis(200));
     insta::assert_snapshot!(text(&render(&mut overlay)));
+}
+
+#[test]
+fn response_focus_navigates_answers_and_dispatches_actions() {
+    let mut overlay = conversation();
+    overlay.focus_responses();
+    assert_eq!(overlay.selected_cell(), Some(4));
+    let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+    overlay.on_key(ctrl('h'));
+    assert_eq!(overlay.selected_cell(), Some(1));
+    overlay.on_key(ctrl('h'));
+    assert_eq!(overlay.selected_cell(), Some(1));
+    overlay.on_key(ctrl('l'));
+    assert_eq!(overlay.selected_cell(), Some(4));
+    key(&mut overlay, KeyCode::Char(' '));
+    assert_eq!(
+        overlay.take_chosen(),
+        Some(MessageAction {
+            cell: 4,
+            choice: MessageChoice::ForkSubagent
+        })
+    );
+    overlay.on_key(ctrl('h'));
+    key(&mut overlay, KeyCode::Enter);
+    assert_eq!(
+        overlay.take_chosen(),
+        Some(MessageAction {
+            cell: 1,
+            choice: MessageChoice::RollbackThrough
+        })
+    );
+}
+
+#[test]
+fn response_focus_screen() {
+    let mut overlay = conversation();
+    overlay.focus_responses();
+    insta::assert_snapshot!(text(&render(&mut overlay)));
+}
+
+#[test]
+fn child_response_focus_screen() {
+    use nori_protocol::acp::v1 as acp;
+    let chunk = |value: &str| {
+        nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+            acp::AgentNotification::SessionNotification(acp::SessionNotification::new(
+                "child",
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new(value)),
+                )),
+            )),
+        ))
+    };
+    let boundary = |end| {
+        nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::ConversationResponseBoundary(
+            nori_protocol::ConversationResponseBoundary {
+                transcript_id: "child-journal".into(),
+                start: 1,
+                end,
+            },
+        ))
+    };
+    let (cells, sources) = crate::chatwidget::subagents::project_child_history(
+        &[
+            chunk("First child answer"),
+            boundary(3),
+            chunk("Second child answer"),
+            boundary(7),
+        ],
+        std::path::Path::new("."),
+    );
+    let mut overlay = TranscriptOverlay::new(cells);
+    overlay.focus_responses();
+    assert_eq!(
+        sources
+            .iter()
+            .map(|(index, source)| (*index, source.end))
+            .collect::<Vec<_>>(),
+        vec![(0, 3), (1, 7)]
+    );
+    insta::assert_snapshot!(text(&render(&mut overlay)));
+}
+
+#[test]
+fn response_navigation_includes_consolidated_markdown() {
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![
+        Arc::new(AgentMessageCell::new(vec![Line::from("first")], true)),
+        Arc::new(AgentMarkdownCell::new(
+            "second".into(),
+            std::path::Path::new("."),
+        )),
+    ];
+    let mut overlay = TranscriptOverlay::new(cells);
+    overlay.focus_responses();
+    assert_eq!(overlay.selected_cell(), Some(1));
+    overlay.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(overlay.selected_cell(), Some(0));
 }

@@ -485,6 +485,9 @@ fn safety_and_environment_settings_have_nori_defaults() {
     let config = NoriConfig::default();
 
     assert!(!config.has_explicit_approval_or_sandbox_policy);
+    assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
+    assert_eq!(config.sandbox_policy, SandboxPolicy::DangerFullAccess);
+    assert_eq!(config.approval_policy, AskForApproval::Never);
     assert!(!config.forced_auto_mode_downgraded_on_windows);
     assert!(!config.windows_sandbox_enabled);
     assert!(config.check_for_update_on_startup);
@@ -494,6 +497,20 @@ fn safety_and_environment_settings_have_nori_defaults() {
         nori_config::ShellEnvironmentPolicy::default()
     );
     assert_eq!(config.notices, nori_config::Notice::default());
+}
+
+#[test]
+fn loaded_config_defaults_to_full_access_without_permission_prompts() {
+    let home = TempDir::new().expect("create config home");
+    let config_path = home.path().join("config.toml");
+    std::fs::write(&config_path, "").expect("write empty config");
+
+    let config = NoriConfig::load_from_path(&config_path).expect("load config");
+
+    assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
+    assert_eq!(config.sandbox_policy, SandboxPolicy::DangerFullAccess);
+    assert_eq!(config.approval_policy, AskForApproval::Never);
+    assert!(!config.has_explicit_approval_or_sandbox_policy);
 }
 
 #[test]
@@ -523,7 +540,9 @@ fn windows_sandbox_setting_and_availability_resolve_the_runtime_policy() {
     let config_path = home.path().join("config.toml");
     std::fs::write(
         &config_path,
-        r#"[features]
+        r#"sandbox_mode = "workspace-write"
+
+[features]
 enable_experimental_windows_sandbox = true
 "#,
     )

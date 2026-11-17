@@ -3,7 +3,6 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
 use crate::chatwidget::ChatWidget;
-use crate::client_event_format;
 use crate::client_tool_cell;
 use crate::diff_render::DiffSummary;
 use crate::file_search::FileSearchManager;
@@ -35,6 +34,12 @@ use std::thread;
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
 
+pub(crate) mod child_navigation;
+mod native_history_output;
+mod native_history_queue;
+mod program_status;
+pub(crate) mod response_focus;
+
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
 
@@ -42,6 +47,7 @@ pub const RESUME_HINT_LEAD: &str = "To continue this session, run:";
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
+    pub immediate_exit: bool,
     pub token_usage: TokenUsage,
     pub conversation_id: Option<ConversationId>,
     pub conversation_has_activity: bool,
@@ -83,6 +89,7 @@ pub(crate) struct App {
     pub(crate) chat_widget: ChatWidget,
     pub(crate) auth_manager: Arc<AuthManager>,
     remote_control: crate::remote_control::RemoteControlManager,
+    program_status: program_status::ProgramStatus,
 
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: NoriConfig,
@@ -94,13 +101,25 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
+    native_history: native_history_queue::NativeHistoryQueue,
+    /// Canonical journal identity, independent of the provider session binding.
+    pub(crate) active_transcript_id: Option<String>,
+    pub(crate) response_boundaries: Vec<(
+        Arc<dyn HistoryCell>,
+        nori_protocol::ConversationResponseBoundary,
+    )>,
+    /// Number of transcript cells present when Ctrl+L last hid the transcript. A resize may
+    /// preserve that hidden view only while the transcript is unchanged.
+    pub(crate) hidden_transcript_len: Option<i64>,
 
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
+    pub(crate) session_view: session_view::SessionView,
+    tool_gesture: tool_gesture::ToolGesture,
     pub(crate) deferred_history_lines: Vec<Line<'static>>,
     has_emitted_history_lines: bool,
     /// Where the cells of the history being replayed start in `transcript_cells`, while it is.
-    replay_painted_from: Option<usize>,
+    replay_painted_from: Option<(usize, nori_protocol::ReplaySource)>,
     pub(crate) transcript_reflow: crate::transcript_reflow::TranscriptReflowState,
 
     pub(crate) enhanced_keys_supported: bool,
@@ -130,6 +149,22 @@ pub(crate) struct App {
     /// Live agent-switch candidate. The active widget remains usable until an
     /// activating candidate publishes `SessionStarted`.
     candidate_agent: Option<CandidateAgent>,
+    pending_candidate_model: Option<(String, String)>,
+    model_route_fallback: Option<model_routes::ModelRouteFallback>,
+    next_model_route_token: i64,
+    selected_model_routes: Vec<crate::nori::unified_model_picker::ModelRoute>,
+    native_preference_attempted: std::collections::HashSet<String>,
+    native_preference_waiting_for_prompt: bool,
+    native_preference_session: Option<(
+        crate::app_event::SessionGeneration,
+        nori_protocol::acp::v1::SessionId,
+    )>,
+    native_preference_session_ready: bool,
+    native_preference_in_progress: bool,
+    manual_model_handoff: Option<session_setup::ManualModelHandoff>,
+    fallback: Option<fallback::Fallback>,
+    exhausted_providers: std::collections::HashSet<String>,
+    suppressed_fallback_errors: std::collections::HashSet<nori_protocol::acp::v1::RequestId>,
     /// Model presses made before the agent listed its models; they apply when it does.
     waiting_model_presses: crate::chatwidget::WaitingModelPresses,
     /// The pause between the agent picker's cursor settling on a row and that agent warming.
@@ -163,9 +198,6 @@ pub(crate) struct App {
     commit_turn_pending: bool,
 
     system_info_tx: mpsc::Sender<SystemInfoRefreshRequest>,
-
-    /// Guard to prevent showing the worktree cleanup warning more than once per session.
-    worktree_warning_shown: bool,
 
     /// True when the initial agent spawn was deferred (waiting for a skillset
     /// switch). Cleared on the first successful skillset switch or picker
@@ -213,6 +245,7 @@ enum CandidateAgent {
         agent_name: String,
         widget: Box<ChatWidget>,
         activation_error: Option<String>,
+        activation_route_eligible: bool,
     },
 }
 
@@ -226,12 +259,19 @@ struct SystemInfoRefreshRequest {
 mod commit_changes;
 mod config_persistence;
 mod event_handling;
+mod fallback;
 mod frame;
 mod history_replay;
 mod message_actions;
+pub(crate) mod model_routes;
+mod reference_session;
 mod resize_reflow;
 mod session_setup;
+mod session_view;
 mod subagent_overlay;
+mod tool_gesture;
+mod tool_history;
+mod transcript_window;
 
 impl App {
     #[allow(clippy::too_many_arguments)]
@@ -330,7 +370,14 @@ impl App {
             file_search,
             enhanced_keys_supported,
             transcript_cells: Vec::new(),
+            native_history: Default::default(),
+            response_boundaries: Vec::new(),
+            active_transcript_id: None,
+            hidden_transcript_len: None,
             overlay: None,
+            session_view: Default::default(),
+            tool_gesture: Default::default(),
+            program_status: Default::default(),
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             replay_painted_from: None,
@@ -343,6 +390,19 @@ impl App {
             primary_agent_preparation: None,
             pending_session_activation,
             candidate_agent: None,
+            pending_candidate_model: None,
+            model_route_fallback: None,
+            next_model_route_token: 0,
+            selected_model_routes: Vec::new(),
+            native_preference_attempted: Default::default(),
+            native_preference_waiting_for_prompt: false,
+            native_preference_session: None,
+            native_preference_session_ready: false,
+            native_preference_in_progress: false,
+            manual_model_handoff: None,
+            fallback: None,
+            exhausted_providers: Default::default(),
+            suppressed_fallback_errors: Default::default(),
             warm_candidate_pause: None,
             waiting_model_presses: Default::default(),
             welcome_card_written: false,
@@ -355,7 +415,6 @@ impl App {
             plan_drawer_mode: crate::chatwidget::PlanDrawerMode::Off,
             commit_turn_pending: false,
             system_info_tx,
-            worktree_warning_shown: false,
             deferred_spawn_pending: skillset_per_session,
             mcp_oauth_cancel_tx: None,
         };
@@ -385,6 +444,7 @@ impl App {
         app.chat_widget.update_approval_mode_label();
         // Propagate initial vim mode setting.
         app.chat_widget.set_vim_mode(app.vim_mode);
+        app.chat_widget.set_kakoune_mode(app.config.kakoune_mode);
         // Propagate initial pinned plan drawer setting.
         let plan_mode = if app.config.pinned_plan_drawer {
             crate::chatwidget::PlanDrawerMode::Expanded
@@ -481,6 +541,7 @@ impl App {
             .await?;
         }
 
+        app.program_status.idle();
         crate::startup_trace::mark("app_ready");
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
@@ -509,18 +570,29 @@ impl App {
             }
         {}
 
+        app.program_status.clear();
         app.cancel_primary_agent_preparation();
-        if let Some(agent) = app.prepared_agent.take() {
-            agent.shutdown().await;
-        }
         app.prepared_agent_initial_context = None;
         app.discard_candidate();
-        app.remote_control.disable().await;
+        let immediate_exit = app.chat_widget.immediate_exit_requested();
+        let cleanup = async {
+            if let Some(agent) = app.prepared_agent.take() {
+                agent.shutdown().await;
+            }
+            app.remote_control.disable().await;
+        };
+        if immediate_exit {
+            // Terminal restoration must not wait for an unresponsive provider.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), cleanup).await;
+        } else {
+            cleanup.await;
+        }
 
         // Don't clear terminal to allow exit message to remain visible
         // tui.terminal.clear()?;
 
         Ok(AppExitInfo {
+            immediate_exit,
             token_usage: app.token_usage(),
             conversation_id: app.chat_widget.conversation_id(),
             conversation_has_activity: app.chat_widget.session_stats().has_activity(),
@@ -575,6 +647,7 @@ impl App {
         self.chat_widget
             .set_hotkey_config(self.hotkey_config.clone());
         self.chat_widget.set_vim_mode(self.vim_mode);
+        self.chat_widget.set_kakoune_mode(self.config.kakoune_mode);
         self.chat_widget.set_plan_drawer_mode(self.plan_drawer_mode);
         self.chat_widget
             .set_loop_count_override(self.loop_count_override);

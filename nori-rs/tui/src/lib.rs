@@ -59,6 +59,7 @@ mod login_handler;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
+mod native_history;
 mod nori;
 mod overlay_menu;
 mod pager_overlay;
@@ -147,15 +148,20 @@ pub async fn run_main(
     // Note: Rolling file tracing is initialized in nori-cli main.rs before run_main() is called.
     // This ensures a single point of file-based tracing initialization.
 
-    let (sandbox_mode, approval_policy): (Option<SandboxMode>, Option<AskForApproval>) =
-        if cli.dangerously_bypass_approvals_and_sandbox {
-            (
-                Some(SandboxMode::DangerFullAccess),
-                Some(AskForApproval::Never),
-            )
+    // Nori sessions run with full access and automatically approve agent requests.
+    let sandbox_mode = Some(SandboxMode::DangerFullAccess);
+    // PTY integration tests need to exercise the approval bridge, which the normal
+    // full-access policy intentionally bypasses.
+    #[cfg(debug_assertions)]
+    let approval_policy = Some(
+        if std::env::var_os("NORI_TEST_REQUIRE_APPROVAL").is_some() {
+            AskForApproval::OnRequest
         } else {
-            (None, None)
-        };
+            AskForApproval::Never
+        },
+    );
+    #[cfg(not(debug_assertions))]
+    let approval_policy = Some(AskForApproval::Never);
 
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
     let overrides_cli = codex_common::CliConfigOverrides { raw_overrides };
@@ -200,6 +206,14 @@ pub async fn run_main(
     if let Err(e) = nori_harness::initialize_registry(registry_agents) {
         tracing::warn!("Failed to initialize agent registry with custom agents: {e}");
     }
+
+    // Discover the models each installed agent advertises without delaying the first frame.
+    #[cfg(not(test))]
+    nori_harness::refresh_agent_catalog_except(
+        std::sync::Arc::new(config.clone()),
+        env!("CARGO_PKG_VERSION").to_string(),
+        config.active_agent.clone(),
+    );
 
     startup_trace::mark("registry_ready");
     let (pending_worktree_ask, worktree_blocked_reason) = {
@@ -346,13 +360,15 @@ async fn run_ratatui_app(
 
     #[cfg(not(debug_assertions))]
     {
-        let skip_update_prompt = cli.prompt.as_ref().is_some_and(|prompt| !prompt.is_empty());
+        let skip_update_prompt = crate::version::CODEX_CLI_VERSION == "0.0.0"
+            || cli.prompt.as_ref().is_some_and(|prompt| !prompt.is_empty());
         if !skip_update_prompt {
             match run_update_prompt_if_needed(&mut tui, &initial_config).await? {
                 UpdatePromptOutcome::Continue => {}
                 UpdatePromptOutcome::RunUpdate(action) => {
                     crate::tui::restore()?;
                     return Ok(AppExitInfo {
+                        immediate_exit: false,
                         token_usage: crate::ui_types::TokenUsage::default(),
                         conversation_id: None,
                         conversation_has_activity: false,
@@ -374,16 +390,15 @@ async fn run_ratatui_app(
     );
     startup_trace::mark("auth_manager");
     let should_show_trust_screen = should_show_trust_screen(&initial_config);
-    let should_show_onboarding = !cli.cloud_mode
-        && (should_show_trust_screen
-            || (!cli.skip_welcome && nori::onboarding::is_first_launch(&initial_config.nori_home)));
+    let should_show_onboarding = !cli.cloud_mode && should_show_trust_screen;
 
     let (config, overrides) = if should_show_onboarding {
         // Use Nori-branded onboarding flow
         let onboarding_result = run_nori_onboarding_app(
             NoriOnboardingScreenArgs {
                 show_trust_screen: should_show_trust_screen,
-                skip_welcome: cli.skip_welcome,
+                // The composer and ordinary header are the first-launch experience.
+                skip_welcome: true,
                 skip_trust_directory: cli.skip_trust_directory,
                 config: initial_config.clone(),
             },
@@ -395,6 +410,7 @@ async fn run_ratatui_app(
             session_log::log_session_end();
             let _ = tui.terminal.clear();
             return Ok(AppExitInfo {
+                immediate_exit: false,
                 token_usage: crate::ui_types::TokenUsage::default(),
                 conversation_id: None,
                 conversation_has_activity: false,
@@ -508,6 +524,7 @@ async fn run_ratatui_app(
                 restore();
                 session_log::log_session_end();
                 return Ok(AppExitInfo {
+                    immediate_exit: false,
                     token_usage: crate::ui_types::TokenUsage::default(),
                     conversation_id: None,
                     conversation_has_activity: false,
@@ -558,11 +575,13 @@ async fn run_ratatui_app(
     )
     .await;
 
-    if let Some(reporter) = analytics {
+    restore();
+    if let Some(reporter) = analytics
+        && !app_result.as_ref().is_ok_and(|info| info.immediate_exit)
+    {
         reporter.flush();
     }
 
-    restore();
     // Mark the end of the recorded session.
     session_log::log_session_end();
     // ignore error when collecting usage – report underlying error instead
@@ -601,6 +620,7 @@ fn resume_startup_error(tui: &mut Tui, message: String) -> color_eyre::Result<Ap
         error!("Failed to write resume error message: {err}");
     }
     Ok(AppExitInfo {
+        immediate_exit: false,
         token_usage: crate::ui_types::TokenUsage::default(),
         conversation_id: None,
         conversation_has_activity: false,

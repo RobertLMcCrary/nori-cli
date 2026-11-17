@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use nori_script::Hook;
-use nori_script::HookEvent;
-use nori_script::PrRules;
-use nori_script::Workflow;
+use nori_workflow::Hook;
+use nori_workflow::HookEvent;
+use nori_workflow::PrRules;
+use nori_workflow::Workflow;
 use pretty_assertions::assert_eq;
 use tokio::sync::Mutex;
 use wiremock::Mock;

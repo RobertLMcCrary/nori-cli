@@ -17,6 +17,7 @@ use super::block::RowCache;
 use crate::client_tool_cell::ClientToolCell;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::UserHistoryCell;
 use crate::presentation::ClientEvent;
 use crate::presentation::ClientEventNormalizer;
 use crate::subagent_switcher::Tail;
@@ -38,7 +39,11 @@ pub(super) struct NodeId(pub(super) i64);
 /// A part of a child's detail, in the order it happened.
 #[derive(Debug)]
 enum Detail {
-    Tool(Box<ClientToolCell>),
+    Tool {
+        cell: Box<ClientToolCell>,
+        revision: i64,
+    },
+    User(String),
     Text(String),
 }
 
@@ -59,16 +64,21 @@ struct ChildTranscript {
 pub(super) struct Node {
     /// Child session id, once known. A child known only through its launcher call has none.
     pub(super) session_id: Option<SessionId>,
+    pub(super) agent: Option<String>,
     /// The root tool call that launched this child, once known.
     pub(super) launcher_call_id: Option<String>,
     /// The running subagent that announced this one.
     pub(super) parent: Option<NodeId>,
+    /// Original hierarchy, retained after a parent finishes.
+    pub(super) history_parent: Option<NodeId>,
     /// Running subagents this one announced.
     pub(super) children: BTreeSet<NodeId>,
     pub(super) title: Option<String>,
     pub(super) description: Option<String>,
     /// Known only through a launcher that reported completion at once while its work continues.
     pub(super) async_launch: bool,
+    /// The session is available for follow-up work but has no running turn.
+    pub(super) idle: bool,
     pub(super) started_at: Instant,
     pub(super) tool_count: usize,
     /// The latest tool title or last line of streamed text.
@@ -77,31 +87,134 @@ pub(super) struct Node {
     pub(super) revision: i64,
     /// When the child last changed, for ordering the subagent switcher.
     pub(super) active_at: Instant,
+    /// The most recent message or tool work, excluding status-only updates.
+    pub(super) work_at: Instant,
     /// Rows built for the live block, reused until the node changes or the width does.
     pub(super) row_cache: RefCell<Option<RowCache>>,
     /// Summaries of this child's own finished children, for the detail view.
     pub(super) nested: Vec<Arc<dyn HistoryCell>>,
     transcript: ChildTranscript,
+    projection_epoch: i64,
 }
 
 impl Node {
+    pub(super) fn projection_len(&self) -> usize {
+        self.transcript.parts.len() + self.nested.len()
+    }
+
+    pub(super) fn projection_continuation(&self, index: usize) -> Option<bool> {
+        if index < self.transcript.parts.len() {
+            Some(false)
+        } else {
+            self.nested
+                .get(index.checked_sub(self.transcript.parts.len())?)
+                .map(|cell| cell.is_stream_continuation())
+        }
+    }
+
+    pub(super) fn projection_revision(&self, index: usize) -> Option<i64> {
+        let revision = match self.transcript.parts.get(index) {
+            Some(Detail::Tool { revision, .. }) => revision.wrapping_mul(3),
+            Some(Detail::User(text)) => i64::try_from(text.len())
+                .unwrap_or(i64::MAX)
+                .wrapping_mul(3)
+                .wrapping_add(1),
+            Some(Detail::Text(text)) => i64::try_from(text.len())
+                .unwrap_or(i64::MAX)
+                .wrapping_mul(3)
+                .wrapping_add(2),
+            None if index - self.transcript.parts.len() < self.nested.len() => {
+                self.revision.wrapping_mul(3).wrapping_add(1)
+            }
+            None => return None,
+        };
+        Some(
+            self.projection_epoch
+                .wrapping_mul(1_000_003)
+                .wrapping_add(revision),
+        )
+    }
+
+    pub(super) fn project_cell(
+        &self,
+        index: usize,
+        cwd: &Path,
+        width: u16,
+        expanded: &std::collections::HashSet<String>,
+    ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
+        let mut projection = crate::chatwidget::tool_projection::ToolProjection::default();
+        match self.transcript.parts.get(index) {
+            Some(Detail::Tool { cell, .. }) => projection.push(cell.as_ref(), width, expanded),
+            Some(Detail::User(message)) => projection.push(
+                &UserHistoryCell {
+                    message: message.clone(),
+                },
+                width,
+                expanded,
+            ),
+            Some(Detail::Text(text)) => {
+                projection.push(&AgentMarkdownCell::new(text.clone(), cwd), width, expanded)
+            }
+            None => projection.push(
+                self.nested
+                    .get(index.checked_sub(self.transcript.parts.len())?)?
+                    .as_ref(),
+                width,
+                expanded,
+            ),
+        }
+        Some(projection)
+    }
+
+    pub(super) fn tool_projection(
+        &self,
+        cwd: &Path,
+        width: u16,
+        expanded: &std::collections::HashSet<String>,
+    ) -> crate::chatwidget::tool_projection::ToolProjection {
+        let mut projection = crate::chatwidget::tool_projection::ToolProjection::default();
+        for part in &self.transcript.parts {
+            match part {
+                Detail::Tool { cell, .. } => projection.push(cell.as_ref(), width, expanded),
+                Detail::User(message) => projection.push(
+                    &UserHistoryCell {
+                        message: message.clone(),
+                    },
+                    width,
+                    expanded,
+                ),
+                Detail::Text(text) => {
+                    projection.push(&AgentMarkdownCell::new(text.clone(), cwd), width, expanded)
+                }
+            }
+        }
+        for cell in &self.nested {
+            projection.push(cell.as_ref(), width, expanded);
+        }
+        projection
+    }
     pub(super) fn new(now: Instant) -> Self {
         Self {
             session_id: None,
+            agent: None,
             launcher_call_id: None,
             parent: None,
+            history_parent: None,
             children: BTreeSet::new(),
             title: None,
             description: None,
             async_launch: false,
+            idle: false,
             started_at: now,
             tool_count: 0,
             activity: String::new(),
             revision: 0,
             active_at: now,
+            work_at: now,
             row_cache: RefCell::new(None),
             nested: Vec::new(),
             transcript: ChildTranscript::default(),
+            projection_epoch: 0,
         }
     }
 
@@ -126,11 +239,52 @@ impl Node {
         self.active_at = Instant::now();
     }
 
+    /// End a replayed response and return the detail cell it belongs to.
+    pub(super) fn replay_response_boundary(&mut self) -> Option<usize> {
+        self.transcript.text_open = false;
+        self.transcript
+            .parts
+            .iter()
+            .rposition(|part| matches!(part, Detail::Text(_)))
+    }
+
+    pub(super) fn replace_replay(
+        &mut self,
+        events: &[nori_protocol::SessionEvent],
+        cwd: &Path,
+        animations: bool,
+    ) {
+        self.projection_epoch = self.projection_epoch.wrapping_add(1);
+        self.transcript = ChildTranscript::default();
+        self.tool_count = 0;
+        for event in events {
+            match event {
+                nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                    acp::AgentNotification::SessionNotification(notification),
+                )) => self.apply(&notification.update, cwd, animations),
+                nori_protocol::SessionEvent::Nori(
+                    nori_protocol::NoriEvent::ConversationResponseBoundary(_),
+                ) => {
+                    self.replay_response_boundary();
+                }
+                _ => {}
+            }
+        }
+        self.touch();
+    }
+
     /// Absorb an update delivered on the child's session or tagged with its launcher.
     ///
     /// Costs the size of the update: text is appended, a tool call updates its own cell.
     pub(super) fn apply(&mut self, update: &acp::SessionUpdate, cwd: &Path, animations: bool) {
         match update {
+            acp::SessionUpdate::UserMessageChunk(chunk) => {
+                if let acp::ContentBlock::Text(text) = &chunk.content {
+                    self.transcript.text_open = false;
+                    self.transcript.parts.push(Detail::User(text.text.clone()));
+                    self.transcript.text_open = false;
+                }
+            }
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
                 if let acp::ContentBlock::Text(text) = &chunk.content {
                     self.push_text(&text.text);
@@ -149,10 +303,11 @@ impl Node {
                     }
                     match self.transcript.tools.get(&snapshot.call_id) {
                         Some(position) => {
-                            if let Some(Detail::Tool(cell)) =
+                            if let Some(Detail::Tool { cell, revision }) =
                                 self.transcript.parts.get_mut(*position)
                             {
                                 cell.apply_snapshot(snapshot);
+                                *revision = revision.wrapping_add(1);
                             }
                         }
                         None => {
@@ -160,9 +315,14 @@ impl Node {
                             self.transcript
                                 .tools
                                 .insert(snapshot.call_id.clone(), self.transcript.parts.len());
-                            self.transcript.parts.push(Detail::Tool(Box::new(
-                                ClientToolCell::new(snapshot, cwd.to_path_buf(), animations),
-                            )));
+                            self.transcript.parts.push(Detail::Tool {
+                                cell: Box::new(ClientToolCell::new(
+                                    snapshot,
+                                    cwd.to_path_buf(),
+                                    animations,
+                                )),
+                                revision: 1,
+                            });
                         }
                     }
                     self.touch();
@@ -216,7 +376,11 @@ impl Node {
                 break;
             }
             tail.push_front(match part {
-                Detail::Tool(cell) => cell_lines(cell.as_ref(), width),
+                Detail::Tool { cell, .. } => cell_lines(cell.as_ref(), width),
+                Detail::User(text) => UserHistoryCell {
+                    message: text.clone(),
+                }
+                .display_lines(width),
                 Detail::Text(text) => cell_lines(&AgentMarkdownCell::new(text.clone(), cwd), width),
             });
         }
@@ -235,13 +399,14 @@ impl Node {
                 }
                 text[..end].to_owned()
             }
-            Some(Detail::Text(_) | Detail::Tool(_)) | None => String::new(),
+            Some(Detail::Text(_) | Detail::Tool { .. } | Detail::User(_)) | None => String::new(),
         };
         let mut detail: Vec<Arc<dyn HistoryCell>> = parts
             .into_iter()
             .map(|part| -> Arc<dyn HistoryCell> {
                 match part {
-                    Detail::Tool(cell) => Arc::new(*cell),
+                    Detail::Tool { cell, .. } => Arc::new(*cell),
+                    Detail::User(message) => Arc::new(UserHistoryCell { message }),
                     Detail::Text(text) => Arc::new(AgentMarkdownCell::new(text, cwd)),
                 }
             })

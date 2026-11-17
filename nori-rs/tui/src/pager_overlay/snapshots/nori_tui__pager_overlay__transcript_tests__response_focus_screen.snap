@@ -1,0 +1,23 @@
+---
+source: tui/src/pager_overlay/transcript_tests.rs
+expression: text(&render(&mut overlay))
+---
+/ T R A N S C R I P T / / / / / / / / / / / / / / / / / / /
+
+› Why does the parser fail?
+
+
+• It reads past the end.
+  Here is why.
+  And the fix.
+
+
+› Fix it
+
+
+• Fixed.
+~
+~
+───────────────────────────────────────────────────── 100% ─
+ ctrl + h/ctrl + l responses   esc cancel
+ enter roll back   space fork subagent

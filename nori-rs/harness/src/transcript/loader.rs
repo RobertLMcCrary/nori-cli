@@ -78,6 +78,11 @@ pub struct Transcript {
     /// Kept private so transcript schema compatibility does not become part of
     /// the Harness API. Consumers should use [`Transcript::records`].
     pub(crate) entries: Vec<TranscriptLine>,
+    pub(crate) backend_binding: Option<String>,
+    /// A rewind was committed but no subsequent provider binding was recorded.
+    pub(crate) requires_fresh_binding: bool,
+    /// Canonical record IDs, aligned with entries for Pkl-backed sessions.
+    pub(crate) event_ids: Vec<i64>,
 }
 
 /// A schema-independent record exposed by a loaded transcript.
@@ -114,21 +119,26 @@ impl Transcript {
     /// goes on recording into the transcript it was resumed from, so a session started since
     /// (by a replay into a new session, or a compaction) can be newer than the metadata's.
     pub fn latest_acp_session_id(&self) -> Option<String> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|line| match &line.entry {
-                TranscriptEntry::SessionEvent(entry) if !entry.historical_evidence => {
-                    match &entry.event {
-                        nori_protocol::SessionEvent::Nori(
-                            nori_protocol::NoriEvent::SessionStarted(started),
-                        ) => Some(started.acp_session_id.to_string()),
-                        _ => None,
+        if self.requires_fresh_binding {
+            return None;
+        }
+        self.backend_binding.clone().or_else(|| {
+            self.entries
+                .iter()
+                .rev()
+                .find_map(|line| match &line.entry {
+                    TranscriptEntry::SessionEvent(entry) if !entry.historical_evidence => {
+                        match &entry.event {
+                            nori_protocol::SessionEvent::Nori(
+                                nori_protocol::NoriEvent::SessionStarted(started),
+                            ) => Some(started.acp_session_id.to_string()),
+                            _ => None,
+                        }
                     }
-                }
-                _ => None,
-            })
-            .or_else(|| self.meta.acp_session_id.clone())
+                    _ => None,
+                })
+                .or_else(|| self.meta.acp_session_id.clone())
+        })
     }
 
     /// Iterate over records without exposing the versioned storage schema.
@@ -663,6 +673,9 @@ async fn load_session_metadata(path: &Path, project_id: &str) -> io::Result<Sess
 
 /// Load session metadata from the first line of a transcript file.
 async fn load_session_meta_from_path(path: &Path) -> io::Result<SessionMetaEntry> {
+    if path.with_extension("pkl").exists() {
+        return Ok(load_transcript_from_path(path).await?.meta);
+    }
     let file = tokio::fs::File::open(path).await?;
     let reader = tokio::io::BufReader::new(file);
     let mut lines = reader.lines();
@@ -691,6 +704,16 @@ struct TranscriptLineKind {
 const FIRST_USER_PREVIEW_MAX_BYTES: usize = 1024 * 1024;
 
 async fn load_first_user_preview_from_path(path: &Path) -> io::Result<Option<String>> {
+    if path.with_extension("pkl").exists() {
+        let transcript = load_transcript_from_path(path).await?;
+        return Ok(transcript
+            .entries
+            .iter()
+            .find_map(|line| match &line.entry {
+                TranscriptEntry::User(user) => Some(truncate_preview(&user.content)),
+                _ => None,
+            }));
+    }
     let started = Instant::now();
     let file = tokio::fs::File::open(path).await?;
     let reader = tokio::io::BufReader::new(file);
@@ -736,6 +759,14 @@ async fn load_first_user_preview_from_path(path: &Path) -> io::Result<Option<Str
 }
 
 async fn count_user_turns_from_path(path: &Path) -> io::Result<usize> {
+    if path.with_extension("pkl").exists() {
+        let transcript = load_transcript_from_path(path).await?;
+        return Ok(transcript
+            .entries
+            .iter()
+            .filter(|line| matches!(line.entry, TranscriptEntry::User(_)))
+            .count());
+    }
     let started = Instant::now();
     let file = tokio::fs::File::open(path).await?;
     let reader = tokio::io::BufReader::new(file);
@@ -787,7 +818,88 @@ fn truncate_preview(content: &str) -> String {
 /// Lines that fail to deserialize (e.g. unknown entry types from older or newer
 /// versions) are silently skipped so that transcripts remain loadable across
 /// schema changes.
-async fn load_transcript_from_path(path: &Path) -> io::Result<Transcript> {
+pub(super) async fn load_transcript_from_path(path: &Path) -> io::Result<Transcript> {
+    let log_path = path.with_extension("pkl");
+    if log_path.exists() {
+        let log = nori_conversation::ConversationLog::open(log_path)?;
+        let parse_entry = |record: &nori_conversation::Record| match &record.event {
+            nori_conversation::Event::Operation { name, args } if name == "transcript-entry" => {
+                Some(
+                    serde_json::from_str::<super::types::TranscriptLine>(args)
+                        .map_err(io::Error::other),
+                )
+            }
+            _ => None,
+        };
+        let event_ids = log.projection().visible().iter().filter(|record| matches!(&record.event, nori_conversation::Event::Operation { name, .. } if name == "transcript-entry")).map(|record| record.id).collect();
+        let entries = log
+            .projection()
+            .visible()
+            .iter()
+            .filter_map(parse_entry)
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut meta = log
+            .records()
+            .iter()
+            .filter_map(parse_entry)
+            .find_map(|line| match line {
+                Ok(super::types::TranscriptLine {
+                    entry: TranscriptEntry::SessionMeta(meta),
+                    ..
+                }) => Some(Ok(meta)),
+                Err(error) => Some(Err(error)),
+                Ok(_) => None,
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                io::Error::other("conversation log does not contain session metadata")
+            })?;
+        let last_rewind = log.records().iter().rev().find_map(|record| {
+            matches!(&record.event, nori_conversation::Event::Rewind { .. }).then_some(record.id)
+        });
+        let visible_binding =
+            log.projection()
+                .visible()
+                .iter()
+                .rev()
+                .find_map(|record| match &record.event {
+                    nori_conversation::Event::Command { name, payload }
+                        if name == "backend-bound" =>
+                    {
+                        serde_json::from_str::<serde_json::Value>(payload)
+                            .ok()
+                            .map(|value| (record.id, value))
+                    }
+                    _ => None,
+                });
+        let backend_binding = visible_binding
+            .as_ref()
+            .filter(|(id, _)| last_rewind.is_none_or(|rewind| *id > rewind))
+            .and_then(|(_, value)| value.get("acp_session_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let requires_fresh_binding = last_rewind.is_some() && backend_binding.is_none();
+        if requires_fresh_binding {
+            meta.acp_session_id = None;
+        }
+        if let Some(agent) = visible_binding
+            .as_ref()
+            .and_then(|(_, value)| value.get("agent"))
+            .and_then(serde_json::Value::as_str)
+        {
+            meta.agent = Some(agent.to_owned());
+        }
+        if let Some(session_id) = &backend_binding {
+            meta.acp_session_id = Some(session_id.clone());
+        }
+        return Ok(Transcript {
+            meta,
+            entries,
+            backend_binding,
+            requires_fresh_binding,
+            event_ids,
+        });
+    }
     let started = Instant::now();
     let bytes = tokio::fs::read(path).await?;
     let transcript_bytes = bytes.len();
@@ -843,6 +955,9 @@ async fn load_transcript_from_path(path: &Path) -> io::Result<Transcript> {
     Ok(Transcript {
         meta: parsed.meta,
         entries: parsed.entries,
+        backend_binding: None,
+        requires_fresh_binding: false,
+        event_ids: Vec::new(),
     })
 }
 

@@ -16,13 +16,17 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-default = ["native-codex", "native-claude"]
+default = ["native-codex", "native-claude", "native-opencode"]
 # Run Codex inside Nori's own process instead of through an adapter. It links all of codex-core,
 # including V8, so a build without it is much smaller and faster to compile.
 native-codex = ["dep:codex-acp"]
 # Run Claude Code through the in-process Rust driver instead of the TypeScript adapter. It still
 # starts Claude Code's own CLI; there is no adapter process.
 native-claude = ["dep:claude-code-acp-rs"]
+# The ACP adapter is in-process; OpenCode's v2 engine runs as a local server.
+native-opencode = ["dep:nori-opencode-acp"]
+# Opt-in Gemini Core frontend; the official CLI remains the default.
+native-gemini = ["dep:nori-gemini-acp"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -43,6 +47,8 @@ nori-tui = { workspace = true }
 ctor = { workspace = true }
 codex-acp = { path = "../codex-acp", optional = true }
 claude-code-acp-rs = { path = "../claude-acp", optional = true }
+nori-opencode-acp = { path = "../opencode-acp", optional = true }
+nori-gemini-acp = { path = "../gemini-acp", optional = true }
 libc = { workspace = true }
 owo-colors = { workspace = true }
 regex-lite = { workspace = true}

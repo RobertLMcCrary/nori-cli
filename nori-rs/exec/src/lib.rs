@@ -13,7 +13,6 @@ use agent_client_protocol::ByteStreams;
 use agent_client_protocol::Client;
 use agent_client_protocol::ConnectionTo;
 use agent_client_protocol::Responder;
-use anyhow::Context;
 use futures::io::AsyncRead;
 use nori_config::NoriConfig;
 use nori_harness::runtime::AgentPrepareSpec;
@@ -34,7 +33,7 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 pub struct PlaintextOutcome {
     /// Complete assistant text emitted during the prompt turn.
     pub output: String,
-    /// Whether Nori automatically rejected a delegated permission request.
+    /// Whether a permission request could not be allowed because it offered no allow option.
     pub permission_denied: bool,
 }
 
@@ -47,6 +46,7 @@ pub async fn run_plaintext(
 ) -> anyhow::Result<PlaintextOutcome> {
     let mut launched = prepare_and_launch_session(
         AgentPrepareSpec {
+            handoff: None,
             config,
             cli_version,
             session_context: None,
@@ -61,14 +61,7 @@ pub async fn run_plaintext(
         .handle
         .prompt(vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))])
         .await?;
-    let result = collect_prompt(
-        &launched.handle,
-        &mut launched.events,
-        request_id,
-        PermissionMode::Reject,
-        None,
-    )
-    .await;
+    let result = collect_prompt(&launched.handle, &mut launched.events, request_id).await;
     let shutdown_result = launched.handle.shutdown().await;
     let outcome = match result {
         Ok(result) => {
@@ -86,12 +79,6 @@ pub async fn run_plaintext(
     outcome
 }
 
-#[derive(Clone, Copy)]
-enum PermissionMode {
-    Reject,
-    Forward,
-}
-
 struct PromptResult {
     output: String,
     response: acp::PromptResponse,
@@ -102,8 +89,6 @@ async fn collect_prompt(
     handle: &HarnessHandle,
     events: &mut UnboundedReceiver<SessionEvent>,
     prompt_request_id: acp::RequestId,
-    permission_mode: PermissionMode,
-    client: Option<&ConnectionTo<Client>>,
 ) -> anyhow::Result<PromptResult> {
     let mut output = String::new();
     let mut permission_denied = false;
@@ -122,32 +107,9 @@ async fn collect_prompt(
                 request_id,
                 request: acp::AgentRequest::RequestPermissionRequest(request),
             }) => {
-                let response = match permission_mode {
-                    PermissionMode::Reject => {
-                        permission_denied = true;
-                        reject_permission(&request)
-                    }
-                    PermissionMode::Forward => {
-                        let client = client.context("ACP client connection is unavailable")?;
-                        match client.send_request(request).block_task().await {
-                            Ok(response) => response,
-                            Err(error) => {
-                                handle
-                                    .respond_to_agent(
-                                        request_id,
-                                        Ok(acp::ClientResponse::RequestPermissionResponse(
-                                            acp::RequestPermissionResponse::new(
-                                                acp::RequestPermissionOutcome::Cancelled,
-                                            ),
-                                        )),
-                                    )
-                                    .await?;
-                                return Err(error)
-                                    .context("ACP caller did not answer the permission request");
-                            }
-                        }
-                    }
-                };
+                let response = allow_permission(&request);
+                permission_denied |=
+                    matches!(response.outcome, acp::RequestPermissionOutcome::Cancelled);
                 handle
                     .respond_to_agent(
                         request_id,
@@ -191,14 +153,14 @@ async fn collect_prompt(
     anyhow::bail!("ACP session ended before session/prompt completed")
 }
 
-fn reject_permission(request: &acp::RequestPermissionRequest) -> acp::RequestPermissionResponse {
-    let rejected = request.options.iter().find(|option| {
+fn allow_permission(request: &acp::RequestPermissionRequest) -> acp::RequestPermissionResponse {
+    let allowed = request.options.iter().find(|option| {
         matches!(
             option.kind,
-            acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways
+            acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
         )
     });
-    let outcome = rejected.map_or(acp::RequestPermissionOutcome::Cancelled, |option| {
+    let outcome = allowed.map_or(acp::RequestPermissionOutcome::Cancelled, |option| {
         acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
             option.option_id.clone(),
         ))
@@ -316,6 +278,7 @@ pub async fn run_acp(
                     config.cwd = request.cwd;
                     let mut launched = prepare_and_launch_session(
                         AgentPrepareSpec {
+                            handoff: None,
                             config: Arc::new(config),
                             cli_version,
                             session_context: None,
@@ -427,14 +390,7 @@ pub async fn run_acp(
                                 ));
                             }
                         };
-                        let result = collect_prompt(
-                            &handle,
-                            &mut events,
-                            request_id,
-                            PermissionMode::Forward,
-                            Some(&client),
-                        )
-                        .await;
+                        let result = collect_prompt(&handle, &mut events, request_id).await;
                         if let Err(error) = handle.shutdown().await {
                             return responder
                                 .respond_with_error(acp::Error::new(-32000, error.to_string()));

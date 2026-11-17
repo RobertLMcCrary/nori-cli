@@ -6,5 +6,5 @@ expression: terminal.backend()
 "  Approvals: Agent                                                              "
 "  Skillset: clifford                                                            "
 "  Skillsets v19.1.1                                                             "
-"  ⎇ feature/test                                                                "
+"  git feature/test                                                              "
 "  72%                                                                           "

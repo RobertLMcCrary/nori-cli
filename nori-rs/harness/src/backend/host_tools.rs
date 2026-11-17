@@ -21,6 +21,58 @@ use super::nori_client_mcp::NoriClientService;
 use super::nori_client_mcp::NoriClientShared;
 use crate::connection::acp_connection::AcpConnection;
 
+impl super::AcpBackend {
+    pub(crate) fn bind_program_runtime(self: &Arc<Self>) {
+        self.orchestrator
+            .install_program_backend(Arc::downgrade(self));
+    }
+
+    pub(crate) async fn execute_unsafe_program(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+    ) -> Result<Value, std::io::Error> {
+        use base64::Engine as _;
+        let output = tokio::process::Command::new(program)
+            .args(args)
+            .current_dir(cwd.map(std::path::Path::new).unwrap_or(&self.cwd))
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        Ok(serde_json::json!({
+            "success": output.status.success(),
+            "code": output.status.code(),
+            "status": output.status.to_string(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+            "stdout_base64": base64::engine::general_purpose::STANDARD.encode(&output.stdout),
+            "stderr_base64": base64::engine::general_purpose::STANDARD.encode(&output.stderr),
+        }))
+    }
+
+    pub(crate) async fn execute_host_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<HostToolOutput, String> {
+        let tools = {
+            let server = self.goal_mcp_http_server.lock().await;
+            match server.as_ref() {
+                Some(super::nori_client_mcp::NoriClient::Host { _registration }) => {
+                    nori_host_tools::from_session_meta(Some(&_registration.session_meta()))
+                }
+                Some(super::nori_client_mcp::NoriClient::Mcp(server)) => {
+                    Some(Arc::clone(&server.local_tools))
+                }
+                None => None,
+            }
+        }
+        .ok_or_else(|| "this session has no direct host tool registration".to_owned())?;
+        Ok(tools.call(name, arguments).await)
+    }
+}
+
 /// Whether `connection` is to a built-in agent that takes host tools. Only an agent in this
 /// process can resolve a registration token, so an agent elsewhere never gets one.
 pub(super) fn accepted_by(connection: &AcpConnection) -> bool {
@@ -47,44 +99,83 @@ pub(super) fn hand_to(
     connected: &AtomicBool,
 ) -> nori_host_tools::Registration {
     publish_catalog();
-    let registration = nori_host_tools::register(Arc::new(NoriHostTools {
-        service: NoriClientService::new(shared),
-    }));
+    let registration = nori_host_tools::register(from_shared(shared));
     connection.set_session_meta(Some(registration.session_meta()));
     connected.store(true, Ordering::Relaxed);
     registration
 }
 
+pub(super) fn from_shared(shared: NoriClientShared) -> Arc<dyn HostTools> {
+    let selection = shared.tool_selection.clone();
+    let tools: Arc<dyn HostTools> = Arc::new(NoriHostTools {
+        service: NoriClientService::new(shared),
+        owner_session: std::sync::Mutex::new(None),
+    });
+    match selection {
+        Some(selection) => Arc::new(nori_host_tools::SelectedTools::new(tools, &selection)),
+        None => tools,
+    }
+}
+
 struct NoriHostTools {
     service: NoriClientService,
+    owner_session: std::sync::Mutex<Option<String>>,
 }
 
 impl HostTools for NoriHostTools {
+    fn bind_session_id(&self, session_id: &str) {
+        let mut owner = self
+            .owner_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if owner.is_none() {
+            *owner = Some(session_id.to_owned());
+        }
+    }
+
     fn instructions(&self) -> String {
         super::nori_client_mcp::tool_instructions()
     }
 
     fn specs(&self) -> Vec<HostToolSpec> {
-        specs()
+        specs_from(self.service.session_tools())
     }
 
     fn call(&self, name: &str, arguments: Value) -> HostToolFuture {
         let service = self.service.clone();
+        let available = service.has_tool(name);
         let name = name.to_owned();
         Box::pin(async move {
+            if !available {
+                return HostToolOutput::error(format!("there is no Nori tool named {name}"));
+            }
             match dispatch(&service, &name, arguments).await {
-                Ok(result) => HostToolOutput {
-                    text: result
-                        .content
-                        .iter()
-                        .filter_map(|content| content.as_text())
-                        .map(|text| text.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    is_error: result.is_error.unwrap_or(false),
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(result) => HostToolOutput::from_mcp_result(result),
+                    Err(error) => {
+                        HostToolOutput::error(format!("could not serialize tool result: {error}"))
+                    }
                 },
                 Err(message) => HostToolOutput::error(message),
             }
+        })
+    }
+
+    fn call_scoped(&self, name: &str, arguments: Value, session_id: &str) -> HostToolFuture {
+        let owner = self
+            .owner_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let eligible = owner.as_deref() == Some(session_id) && self.service.has_tool(name);
+        drop(owner);
+        let call = self.call(name, arguments);
+        let service = self.service.clone();
+        Box::pin(async move {
+            let mut output = call.await;
+            if eligible && let Some(context) = service.take_goal_context().await {
+                output.model_context = Some(context);
+            }
+            output
         })
     }
 }
@@ -92,7 +183,10 @@ impl HostTools for NoriHostTools {
 /// Every tool as a host tool spec, in a stable order: that keeps the agent's tool list, and so
 /// its prompt cache, the same across sessions.
 fn specs() -> Vec<HostToolSpec> {
-    let mut tools = NoriClientService::all_tools();
+    specs_from(NoriClientService::all_tools())
+}
+
+fn specs_from(mut tools: Vec<rmcp::model::Tool>) -> Vec<HostToolSpec> {
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     tools
         .into_iter()
@@ -116,6 +210,7 @@ async fn dispatch(
     arguments: Value,
 ) -> Result<CallToolResult, String> {
     let result = match name {
+        "conversation" => service.conversation(parameters(arguments)?).await,
         "get_goal" => {
             no_arguments(name, &arguments)?;
             service.get_goal().await
@@ -184,6 +279,43 @@ mod tests {
     use crate::backend::thread_goal::ThreadGoalState;
 
     fn tools(cwd: Option<std::path::PathBuf>) -> NoriHostTools {
+        tools_with_selection(cwd, None)
+    }
+
+    #[tokio::test]
+    async fn goal_delta_on_host_results_is_root_scoped_and_once_per_revision() {
+        let tools = nori_host_tools::SelectedTools::new(Arc::new(tools(None)), &Default::default());
+        tools.bind_session_id("root");
+        tools
+            .call("create_goal", json!({"objective":"ship it"}))
+            .await;
+        let child = tools.call_scoped("task_list", json!({}), "child").await;
+        assert_eq!(child.model_context, None);
+        let root = tools.call_scoped("task_list", json!({}), "root").await;
+        assert!(
+            root.model_context
+                .as_deref()
+                .is_some_and(|text| text.contains("ship it"))
+        );
+        assert_eq!(root.as_mcp_result(), child.as_mcp_result());
+        let unchanged = tools.call_scoped("task_list", json!({}), "root").await;
+        assert_eq!(unchanged.model_context, None);
+        tools
+            .call("update_goal", json!({"status":"complete"}))
+            .await;
+        let updated = tools.call_scoped("task_list", json!({}), "root").await;
+        assert!(
+            updated
+                .model_context
+                .as_deref()
+                .is_some_and(|text| text.contains("Revision: 2"))
+        );
+    }
+
+    fn tools_with_selection(
+        cwd: Option<std::path::PathBuf>,
+        selection: Option<nori_host_tools::ToolSelection>,
+    ) -> NoriHostTools {
         let (events, _events_rx) = mpsc::channel(8);
         let (orchestrator, _signals) = Orchestrator::new(
             Seed::root(
@@ -208,15 +340,113 @@ mod tests {
             false,
             orchestrator,
         );
-        NoriHostTools {
-            service: NoriClientService::new(match cwd {
-                Some(cwd) => shared.with_workspace(Workspace {
-                    cwd,
-                    workflow: Arc::default(),
-                }),
-                None => shared,
+        let mut shared = match cwd {
+            Some(cwd) => shared.with_workspace(Workspace {
+                cwd,
+                workflow: Arc::default(),
             }),
+            None => shared,
+        };
+        shared.tool_selection = selection;
+        NoriHostTools {
+            service: NoriClientService::new(shared),
+            owner_session: std::sync::Mutex::new(None),
         }
+    }
+
+    #[tokio::test]
+    async fn selected_catalog_and_dispatch_share_the_same_session_policy() {
+        let selection = nori_host_tools::ToolSelection {
+            enabled: Some(["get_goal".to_owned()].into_iter().collect()),
+            descriptions: [("get_goal".to_owned(), "Read our chosen goal.".to_owned())]
+                .into_iter()
+                .collect(),
+            instructions: vec!["Use this policy.".to_owned()],
+            ..Default::default()
+        };
+        let native: Arc<dyn HostTools> =
+            Arc::new(tools_with_selection(None, Some(selection.clone())));
+        let selected = nori_host_tools::SelectedTools::new(native, &selection);
+        assert_eq!(
+            selected
+                .specs()
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["get_goal"]
+        );
+        assert_eq!(selected.specs()[0].description, "Read our chosen goal.");
+        assert!(selected.instructions().contains("Use this policy."));
+        assert!(
+            selected
+                .call("create_goal", json!({"objective": "must not run"}))
+                .await
+                .is_error
+        );
+        assert_eq!(
+            selected.call("get_goal", json!({})).await.text,
+            json!({"goal": null}).to_string()
+        );
+        let mcp = tools_with_selection(None, Some(selection));
+        assert_eq!(
+            mcp.service
+                .session_tools()
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["get_goal"]
+        );
+        assert!(!mcp.service.has_tool("create_goal"));
+    }
+
+    #[test]
+    fn selected_cross_provider_tools_include_discovery_guidance() {
+        let selection = nori_host_tools::ToolSelection {
+            enabled: Some(
+                ["agent_capabilities".to_owned(), "delegate_task".to_owned()]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let native: Arc<dyn HostTools> =
+            Arc::new(tools_with_selection(None, Some(selection.clone())));
+        let selected = nori_host_tools::SelectedTools::new(native, &selection);
+        assert!(
+            selected
+                .instructions()
+                .contains(nori_host_tools::DELEGATION_INSTRUCTIONS)
+        );
+        let limited = nori_host_tools::ToolSelection {
+            disabled: ["delegate_task".to_owned()].into_iter().collect(),
+            ..selection
+        };
+        let native: Arc<dyn HostTools> =
+            Arc::new(tools_with_selection(None, Some(limited.clone())));
+        let selected = nori_host_tools::SelectedTools::new(native, &limited);
+        assert!(
+            !selected
+                .instructions()
+                .contains(nori_host_tools::DELEGATION_INSTRUCTIONS)
+        );
+    }
+
+    #[test]
+    fn goal_continuations_require_both_selected_goal_tools() {
+        let all: Arc<dyn HostTools> = Arc::new(tools(None));
+        let full = super::super::nori_client_mcp::NoriClient::Host {
+            _registration: nori_host_tools::register(Arc::clone(&all)),
+        };
+        assert!(full.has_goal_tools());
+        let selection = nori_host_tools::ToolSelection {
+            disabled: ["update_goal".to_owned()].into_iter().collect(),
+            ..Default::default()
+        };
+        let selected = Arc::new(nori_host_tools::SelectedTools::new(all, &selection));
+        let limited = super::super::nori_client_mcp::NoriClient::Host {
+            _registration: nori_host_tools::register(selected),
+        };
+        assert!(!limited.has_goal_tools());
     }
 
     #[test]
@@ -231,6 +461,7 @@ mod tests {
             vec![
                 "agent_capabilities",
                 "ci_status",
+                "conversation",
                 "create_goal",
                 "delegate_task",
                 "get_goal",
@@ -295,13 +526,9 @@ mod tests {
     #[tokio::test]
     async fn a_goal_round_trips_through_direct_calls() {
         let tools = tools(None);
-        assert_eq!(
-            tools.call("get_goal", Value::Null).await,
-            HostToolOutput {
-                text: json!({"goal": null}).to_string(),
-                is_error: false,
-            }
-        );
+        let initial = tools.call("get_goal", Value::Null).await;
+        assert_eq!(initial.text, json!({"goal": null}).to_string());
+        assert!(!initial.is_error);
         let created = tools
             .call("create_goal", json!({"objective": "ship host tools"}))
             .await;
@@ -319,9 +546,8 @@ mod tests {
     #[tokio::test]
     async fn git_status_without_a_working_directory_is_an_error_not_a_panic() {
         let output = tools(None).call("git_status", json!({})).await;
-        assert_eq!(
-            output,
-            HostToolOutput::error("this session has no working directory")
-        );
+        assert_eq!(output.text, "this session has no working directory");
+        assert!(output.is_error);
+        assert_eq!(output.as_mcp_result()["isError"], true);
     }
 }

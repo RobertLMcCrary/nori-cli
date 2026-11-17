@@ -129,7 +129,7 @@ fn status_output_is_detached_from_later_configuration_changes() {
 }
 
 #[test]
-fn configuration_history_announces_the_initial_set_then_only_changes() {
+fn configuration_changes_update_the_footer_without_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
 
     chat.handle_acp_session_config_update(&claude_options("opus-5"));
@@ -146,10 +146,38 @@ fn configuration_history_announces_the_initial_set_then_only_changes() {
 
     chat.handle_acp_session_config_update(&claude_options("sonnet-5"));
     let changed = history_text(&mut rx);
+    assert_eq!(changed, "");
     assert_eq!(
-        changed.trim_end(),
-        "• Claude Code option updated: Model=Sonnet 5",
-        "later announcements report only what changed"
+        chat.bottom_pane.model_label(),
+        Some("Claude Code · Sonnet 5 · xhigh")
+    );
+}
+
+#[test]
+fn returned_model_and_effort_update_the_footer_quietly() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("! for shell commands");
+    let options = vec![
+        select(
+            "model",
+            "Model",
+            "openai/gpt-6-astra",
+            &[("openai/gpt-6-astra", "openai/GPT-6 Astra")],
+        )
+        .category(acp::SessionConfigOptionCategory::Model),
+        select("effort", "Effort", "high", &[("high", "High")])
+            .category(acp::SessionConfigOptionCategory::ThoughtLevel),
+    ];
+    chat.handle_acp_session_config_update(&options);
+    assert_eq!(history_text(&mut rx), "");
+    assert_eq!(
+        chat.bottom_pane.model_label(),
+        Some("Claude Code · GPT-6 Astra · High")
+    );
+    insta::assert_snapshot!(
+        "model_effort_footer",
+        super::part10::render_bottom_pane(&mut chat, 80)
     );
 }
 

@@ -54,7 +54,7 @@ const RESOURCE_SPECS: &[NoriResourceSpec] = &[
         uri: "nori://help/acp-wire-logs",
         name: "ACP wire logs reference",
         description: "Reference for enabling and reading ACP JSON-RPC wire logs.",
-        text: "ACP wire recording captures JSON-RPC messages between Nori and the underlying ACP agent. It is off by default because recordings can grow to many MB per log file and may contain sensitive environment variables or command output.\n\nEnable recording in `~/.nori/cli/config.toml`:\n\n```toml\n[acp_proxy]\nenabled = true\n```\n\nRecording can also be toggled for future agent subprocesses from the `/agent` picker with `Shift-Tab`. New ACP subprocesses write JSONL files under `$NORI_HOME/acp-wire` or `~/.nori/cli/acp-wire`. Filenames use `{timestamp_ms}-{child_pid}-{agent_slug}.jsonl`.\n\nEach record includes `ts_ms`, `direction`, `agent`, `child_pid`, and either parsed `message` or `raw_line` plus `parse_error`.",
+        text: "ACP wire recording captures JSON-RPC messages between Nori and the underlying ACP agent. It is off by default because recordings can grow to many MB per log file and may contain sensitive environment variables or command output.\n\nEnable recording in `~/.nori/cli/config.toml`:\n\n```toml\n[acp_proxy]\nenabled = true\n```\n\nNew ACP subprocesses write JSONL files under `$NORI_HOME/acp-wire` or `~/.nori/cli/acp-wire`. Filenames use `{timestamp_ms}-{child_pid}-{agent_slug}.jsonl`.\n\nEach record includes `ts_ms`, `direction`, `agent`, `child_pid`, and either parsed `message` or `raw_line` plus `parse_error`.",
     },
 ];
 

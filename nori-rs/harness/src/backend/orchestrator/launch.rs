@@ -12,8 +12,6 @@ use super::ChildKey;
 use super::ChildSlot;
 use super::DEFAULT_WAIT;
 use super::Inner;
-use super::MAX_DEPTH;
-use super::MAX_RUNNING_TASKS;
 use super::brief;
 use super::child;
 use super::task::Delivery;
@@ -67,6 +65,13 @@ pub(super) enum Mode {
     Wait,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FollowUp {
+    Tool,
+    User,
+    Steer,
+}
+
 /// A task to start on a new child.
 pub(super) struct Delegation {
     pub(super) task: String,
@@ -80,33 +85,32 @@ pub(super) struct Delegation {
     pub(super) client_request_id: Option<String>,
     /// Other settings of the child's agent, by setting and value.
     pub(super) options: Vec<(String, String)>,
+    pub(super) fork_context: Option<String>,
+    pub(super) fork_source: Option<(String, i64, i64)>,
+    pub(super) fork_entries: Vec<crate::transcript::TranscriptLine>,
+    pub(super) parent_view: Option<acp::SessionId>,
 }
 
 impl Inner {
-    pub(super) fn delegation_refusal(&self) -> Option<String> {
-        if self.seed.depth >= MAX_DEPTH {
-            return Some(format!(
-                "this session is a delegated task {} levels deep, the most there can be; do the \
-                 work yourself",
-                self.seed.depth
-            ));
-        }
-        let running = self.seed.tree.running.load(Ordering::Acquire);
-        (running >= MAX_RUNNING_TASKS).then(|| busy(running))
-    }
-
-    /// Take one of the tree's running-task slots; [`Inner::task_ended`] gives it back.
-    fn reserve(&self) -> Result<(), String> {
-        let running = self.seed.tree.running.fetch_add(1, Ordering::AcqRel);
-        if running >= MAX_RUNNING_TASKS {
-            self.seed.tree.running.fetch_sub(1, Ordering::AcqRel);
-            return Err(busy(running));
-        }
-        Ok(())
+    /// Count a running task for status reporting. This is not an admission limit.
+    pub(super) fn count_running_task(&self) {
+        self.seed.tree.running.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Start a task on a new child.
     pub(super) async fn delegate(
+        self: &Arc<Self>,
+        delegation: Delegation,
+    ) -> Result<TaskSnapshot, String> {
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let _admission = self.admission.lock().await;
+        if generation != self.generation.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("The conversation was rewound before delegation started".to_owned());
+        }
+        self.delegate_locked(delegation).await
+    }
+
+    pub(super) async fn delegate_locked(
         self: &Arc<Self>,
         delegation: Delegation,
     ) -> Result<TaskSnapshot, String> {
@@ -118,9 +122,6 @@ impl Inner {
             .await
         {
             return self.status(&existing, false).await;
-        }
-        if let Some(refusal) = self.delegation_refusal() {
-            return Err(refusal);
         }
         let agent = delegation
             .agent
@@ -190,12 +191,13 @@ impl Inner {
                 .insert(agent_info.agent_name.clone(), value);
         }
         let spec = crate::runtime::AgentPrepareSpec {
+            handoff: None,
             config: Arc::new(config),
             cli_version: self.seed.cli_version.clone(),
             session_context: None,
-            initial_context: None,
+            initial_context: delegation.fork_context.clone(),
         };
-        let (id, key) = {
+        let (id, key, view) = {
             let mut state = self.state.lock().await;
             if state.shut_down {
                 return Err("this session is ending".to_owned());
@@ -208,16 +210,19 @@ impl Inner {
                 drop(state);
                 return self.status(&existing, false).await;
             }
-            self.reserve()?;
+            self.count_running_task();
             state.next_task += 1;
             state.next_child += 1;
             let id = TaskId::numbered(state.next_task);
             let key = ChildKey(state.next_child);
             state.children.insert(key, ChildSlot::Starting);
+            let view = view_id();
             state.tasks.push(TaskRecord {
                 id: id.clone(),
+                adoption_anchor: false,
                 child: key,
-                view_id: view_id(),
+                view_id: view.clone(),
+                parent_view: delegation.parent_view.clone(),
                 agent: agent_info.agent_name.clone(),
                 agent_name: agent_info.display_name.clone(),
                 model: delegation.model.clone(),
@@ -225,7 +230,11 @@ impl Inner {
                 status: TaskStatus::Starting,
                 result: String::new(),
                 delivery: Delivery::Owed,
-                wake: wake_for(delegation.mode),
+                wake: if delegation.fork_context.is_some() {
+                    Wake::Never
+                } else {
+                    wake_for(delegation.mode)
+                },
                 awaiting_approval: false,
                 relayed_approvals: Vec::new(),
                 started_at: Instant::now(),
@@ -236,17 +245,124 @@ impl Inner {
             if let Some(request) = &delegation.client_request_id {
                 state.by_client_request.insert(request.clone(), id.clone());
             }
-            (id, key)
+            (id, key, view)
         };
-        self.announce_task(&id).await;
-        let prompt = brief::child_prompt(delegation.role, &delegation.task);
+        let is_fork = delegation.fork_context.is_some();
+        if !is_fork {
+            self.announce_task(&id).await;
+        }
+        let prompt = if delegation.fork_context.is_some() {
+            delegation.task.clone()
+        } else {
+            brief::child_prompt(delegation.role, &delegation.task)
+        };
         let orchestrator = Arc::clone(self);
         let task = id.clone();
         let model = delegation.model.clone();
         let options = delegation.options.clone();
+        let source = delegation.fork_source;
+        let fork_context = delegation.fork_context;
+        let fork_entries = delegation.fork_entries;
+        let parent_view = delegation.parent_view;
+        let child_agent = agent_info.agent_name.clone();
         tokio::spawn(async move {
-            match child::launch(&orchestrator, spec, model.as_deref(), &options).await {
-                Ok(launched) => orchestrator.child_ready(key, &task, launched, prompt).await,
+            match child::launch(
+                &orchestrator,
+                spec,
+                model.as_deref(),
+                &options,
+                is_fork,
+                view.clone(),
+            )
+            .await
+            {
+                Ok(launched) => {
+                    if let Some((session_id, start, end)) = source
+                        && let Err(error) = launched
+                            .child
+                            .harness
+                            .record_fork_source(
+                                session_id,
+                                start,
+                                end,
+                                fork_context.unwrap_or_default(),
+                                fork_entries,
+                            )
+                            .await
+                    {
+                        let _ = launched.child.harness.shutdown().await;
+                        orchestrator.state.lock().await.children.remove(&key);
+                        orchestrator
+                            .task_ended(
+                                &task,
+                                TaskEnd::Failed {
+                                    error: error.to_string(),
+                                },
+                                String::new(),
+                            )
+                            .await;
+                        return;
+                    }
+                    if is_fork {
+                        let result = orchestrator
+                            .persist_managed_fork(&launched.child, &view, parent_view, child_agent)
+                            .await
+                            .and_then(|()| launched.child.attach(view.clone()));
+                        if let Err(error) = result {
+                            let error = match orchestrator.remove_managed_fork_binding(&view).await
+                            {
+                                Ok(()) => error,
+                                Err(rollback) => format!(
+                                    "{error}; failed to remove managed child binding: {rollback}"
+                                ),
+                            };
+                            let _ = launched.child.harness.shutdown().await;
+                            orchestrator.state.lock().await.children.remove(&key);
+                            orchestrator
+                                .task_ended(&task, TaskEnd::Failed { error }, String::new())
+                                .await;
+                            return;
+                        }
+                        orchestrator.announce_task(&task).await;
+                        if let Err(error) = launched.child.activate() {
+                            let error = match orchestrator.remove_managed_fork_binding(&view).await
+                            {
+                                Ok(()) => error,
+                                Err(rollback) => format!(
+                                    "{error}; failed to remove managed child binding: {rollback}"
+                                ),
+                            };
+                            let _ = launched.child.harness.shutdown().await;
+                            orchestrator.state.lock().await.children.remove(&key);
+                            orchestrator
+                                .task_ended(&task, TaskEnd::Failed { error }, String::new())
+                                .await;
+                            return;
+                        }
+                    }
+                    if let Ok(Some(recorder)) = launched.child.harness.conversation_recorder().await
+                        && let Ok(events) = recorder.replay_session_events().await
+                    {
+                        for event in events {
+                            if let nori_protocol::SessionEvent::Acp(
+                                nori_protocol::AcpEvent::Notification(
+                                    nori_protocol::acp::v1::AgentNotification::SessionNotification(
+                                        mut notification,
+                                    ),
+                                ),
+                            ) = event
+                            {
+                                notification.session_id = view.clone();
+                                orchestrator
+                                    .emit(nori_protocol::SessionEvent::Acp(
+                                        nori_protocol::AcpEvent::ChildNotification(notification),
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+                    orchestrator.child_ready(key, &task, launched, prompt).await
+                }
                 Err(error) => {
                     orchestrator.state.lock().await.children.remove(&key);
                     orchestrator
@@ -288,11 +404,13 @@ impl Inner {
             }
             (task.view_id.clone(), std::sync::Arc::clone(&task.progress))
         };
+        self.touch();
         self.announce_task(id).await;
         if let Err(error) = launched.child.run(child::Turn {
             task: id.clone(),
             view_id,
             prompt,
+            content: None,
             progress,
         }) {
             self.task_ended(id, TaskEnd::Failed { error }, String::new())
@@ -307,25 +425,44 @@ impl Inner {
         message: String,
         mode: Mode,
         timeout: Option<Duration>,
+        origin: FollowUp,
+        content: Option<Vec<acp::ContentBlock>>,
     ) -> Result<TaskSnapshot, String> {
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let _admission = self.admission.lock().await;
+        if generation != self.generation.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("The conversation was rewound before the child message started".to_owned());
+        }
+        self.send_locked(previous, message, mode, timeout, origin, content)
+            .await
+    }
+
+    pub(super) async fn send_locked(
+        self: &Arc<Self>,
+        previous: &TaskId,
+        message: String,
+        mode: Mode,
+        timeout: Option<Duration>,
+        origin: FollowUp,
+        content: Option<Vec<acp::ContentBlock>>,
+    ) -> Result<TaskSnapshot, String> {
+        let user_message = origin != FollowUp::Tool;
         if message.trim().is_empty() {
             return Err("`message` is empty".to_owned());
-        }
-        if let Some(refusal) = self.delegation_refusal() {
-            return Err(refusal);
         }
         let (id, child, view_id, progress) = {
             let mut state = self.state.lock().await;
             let earlier = state
                 .tasks
                 .iter()
-                .find(|task| &task.id == previous)
+                .find(|task| &task.id == previous && (user_message || !task.adoption_anchor))
                 .ok_or_else(|| format!("there is no task `{previous}`"))?;
             let key = earlier.child;
-            if state
-                .tasks
-                .iter()
-                .any(|task| task.child == key && !task.status.is_ended())
+            if !user_message
+                && state
+                    .tasks
+                    .iter()
+                    .any(|task| task.child == key && !task.status.is_ended())
             {
                 return Err(format!(
                     "the child of `{previous}` is still working; wait for its task to finish or \
@@ -336,8 +473,12 @@ impl Inner {
                 return Err(format!("the child of `{previous}` is no longer running"));
             };
             let child = child.clone();
-            let template = earlier.follow_up(view_id());
-            self.reserve()?;
+            let template = earlier.follow_up(if user_message {
+                earlier.view_id.clone()
+            } else {
+                view_id()
+            });
+            self.count_running_task();
             state.next_task += 1;
             let id = TaskId::numbered(state.next_task);
             let view_id = template.view_id.clone();
@@ -345,18 +486,29 @@ impl Inner {
             state.tasks.push(TaskRecord {
                 id: id.clone(),
                 title: brief::task_title(None, &message),
-                wake: wake_for(mode),
+                wake: if user_message {
+                    Wake::Never
+                } else {
+                    wake_for(mode)
+                },
                 ..template
             });
             (id, child, view_id, progress)
         };
         self.announce_task(&id).await;
-        if let Err(error) = child.run(child::Turn {
+        let turn = child::Turn {
             task: id.clone(),
             view_id,
             prompt: message,
+            content,
             progress,
-        }) {
+        };
+        let started = if origin == FollowUp::Steer {
+            child.steer(turn).await
+        } else {
+            child.run(turn)
+        };
+        if let Err(error) = started {
             self.task_ended(&id, TaskEnd::Failed { error }, String::new())
                 .await;
         }
@@ -403,7 +555,7 @@ impl Inner {
         let task = state
             .tasks
             .iter_mut()
-            .find(|task| &task.id == id)
+            .find(|task| &task.id == id && !task.adoption_anchor)
             .ok_or_else(|| format!("there is no task `{id}`"))?;
         if deliver && task.status.is_ended() && task.delivery == Delivery::Owed {
             task.delivery = Delivery::Delivered;
@@ -418,6 +570,7 @@ impl Inner {
         state
             .tasks
             .iter()
+            .filter(|task| !task.adoption_anchor)
             .map(|task| TaskSnapshot {
                 result: None,
                 ..task.snapshot(now)
@@ -425,27 +578,31 @@ impl Inner {
             .collect()
     }
 
-    async fn announce_task(&self, id: &TaskId) {
+    pub(super) async fn announce_task(&self, id: &TaskId) {
         let announcement = {
             let state = self.state.lock().await;
-            state
-                .tasks
-                .iter()
-                .find(|task| &task.id == id)
-                .map(|task| (task.view_id.clone(), task.view_title(), task.title.clone()))
+            state.tasks.iter().find(|task| &task.id == id).map(|task| {
+                (
+                    task.view_id.clone(),
+                    task.parent_view.clone(),
+                    task.agent.clone(),
+                    task.view_title(),
+                    task.title.clone(),
+                )
+            })
         };
-        if let Some((view_id, title, label)) = announcement {
-            self.announce(&view_id, title, label, SubagentState::Running)
-                .await;
+        if let Some((view_id, parent_view, agent, title, label)) = announcement {
+            self.announce(
+                &view_id,
+                parent_view,
+                agent,
+                title,
+                label,
+                SubagentState::Running,
+            )
+            .await;
         }
     }
-}
-
-fn busy(running: i64) -> String {
-    format!(
-        "{running} delegated tasks are running, the most at once; wait for one to finish or \
-         cancel one"
-    )
 }
 
 fn snapshot_ended(snapshot: &TaskSnapshot) -> bool {

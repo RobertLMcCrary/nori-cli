@@ -1,4 +1,5 @@
 use super::*;
+use crossterm::event::KeyModifiers;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CandidateActivationEvent {
@@ -50,6 +51,32 @@ fn classify_candidate_activation_event(
     }
 }
 
+fn candidate_model_config(
+    options: &[nori_protocol::acp::v1::SessionConfigOption],
+    model: &str,
+) -> Option<String> {
+    use nori_protocol::acp::v1 as acp;
+    options.iter().find_map(|option| {
+        if option.category != Some(acp::SessionConfigOptionCategory::Model) {
+            return None;
+        }
+        let acp::SessionConfigKind::Select(select) = &option.kind else {
+            return None;
+        };
+        let offered = match &select.options {
+            acp::SessionConfigSelectOptions::Ungrouped(options) => options
+                .iter()
+                .any(|option| option.value.to_string() == model),
+            acp::SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| &group.options)
+                .any(|option| option.value.to_string() == model),
+            _ => false,
+        };
+        offered.then(|| option.id.to_string())
+    })
+}
+
 impl App {
     /// Clear and report a due deferred agent spawn.
     ///
@@ -95,8 +122,64 @@ impl App {
         event: TuiEvent,
     ) -> Result<bool> {
         if matches!(event, TuiEvent::Draw) {
-            self.handle_resize_reflow_draw(tui)?;
+            self.handle_resize_reflow_draw();
         }
+        if matches!(&event, TuiEvent::Key(key) if key.kind == KeyEventKind::Press)
+            || matches!(&event, TuiEvent::Paste(_))
+        {
+            self.program_status.acknowledge();
+        }
+        if let TuiEvent::Key(key) = &event {
+            match self.chat_widget.quit_key_action(*key) {
+                crate::chatwidget::QuitKeyAction::Exit => {
+                    // Do not synchronously format or drain in-flight output on
+                    // the immediate quit chord; the canonical journal retains it.
+                    if self.native_history.cells().is_empty()
+                        && !self.chat_widget.has_active_agent_stream()
+                        && !tui.has_pending_history()
+                    {
+                        let _ = self.finish_native_history(tui)?;
+                    }
+                    self.chat_widget.begin_immediate_exit();
+                    return Ok(false);
+                }
+                crate::chatwidget::QuitKeyAction::Interrupt => {
+                    if self.chat_widget.external_cli_login_active() {
+                        self.chat_widget.route_external_cli_login_key_event(*key);
+                    } else if matches!(
+                        self.session_view.focused(),
+                        crate::subagent_switcher::Target::Subagent(_)
+                    ) && !self.chat_widget.has_active_overlay_or_popup()
+                    {
+                        self.handle_key_event(
+                            tui,
+                            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        )
+                        .await;
+                    } else {
+                        self.chat_widget.interrupt_for_quit_key();
+                    }
+                    return Ok(true);
+                }
+                crate::chatwidget::QuitKeyAction::Continue => {}
+            }
+        }
+        let event = if self.chat_widget.external_cli_login_active() {
+            match event {
+                TuiEvent::Key(key_event) => {
+                    self.chat_widget
+                        .route_external_cli_login_key_event(key_event);
+                    return Ok(true);
+                }
+                TuiEvent::Paste(pasted) => {
+                    self.chat_widget.route_external_cli_login_paste(pasted);
+                    return Ok(true);
+                }
+                other => other,
+            }
+        } else {
+            event
+        };
         // Redraw works everywhere: with a popup open, with a pager overlay open, and while a turn
         // streams. It must not be left to a popup that would swallow the key.
         if let TuiEvent::Key(key_event) = &event
@@ -110,9 +193,78 @@ impl App {
             self.repaint_screen(tui);
             return Ok(true);
         }
+        if let TuiEvent::Key(key) = &event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            && (self.overlay.is_none() || matches!(self.overlay, Some(Overlay::Subagents(_))))
+            && !self.chat_widget.has_active_overlay_or_popup()
+        {
+            let reverse =
+                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+            self.cycle_subagent_session(tui, reverse);
+            return Ok(true);
+        }
+        if self.overlay.is_none()
+            && !self.chat_widget.has_active_overlay_or_popup()
+            && let TuiEvent::Key(key) = &event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+        {
+            if let crate::subagent_switcher::Target::Subagent(child) = self.session_view.focused() {
+                let roster = self.chat_widget.subagent_roster(std::time::Instant::now());
+                let target = self
+                    .chat_widget
+                    .subagent_parent(child)
+                    .map(crate::subagent_switcher::Target::Subagent)
+                    .map(|target| roster.resolve(target))
+                    .filter(|target| roster.entry(*target).is_some())
+                    .unwrap_or(crate::subagent_switcher::Target::Main);
+                self.focus_session_view(tui, target);
+            }
+            return Ok(true);
+        }
+        if self.overlay.is_none()
+            && !self.chat_widget.has_active_overlay_or_popup()
+            && self.backtrack.response_focus.is_none()
+            && let TuiEvent::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char('e')
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            let call_id = self.chat_widget.nearest_transcript_tool();
+            if let Some(call_id) = call_id {
+                self.toggle_tool(tui, call_id);
+            } else if self.session_view.focused() == crate::subagent_switcher::Target::Main {
+                self.open_latest_main_tool(tui);
+            }
+            return Ok(true);
+        }
+        if self.overlay.is_none()
+            && !self.chat_widget.has_active_overlay_or_popup()
+            && matches!(
+                self.session_view.focused(),
+                crate::subagent_switcher::Target::Subagent(_)
+            )
+            && let TuiEvent::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+        {
+            let amount = isize::try_from(tui.terminal.size()?.height / 2).unwrap_or(isize::MAX);
+            self.session_view.scroll(if key.code == KeyCode::PageUp {
+                amount
+            } else {
+                -amount
+            });
+            tui.frame_requester().schedule_frame();
+            return Ok(true);
+        }
         if matches!(self.overlay, Some(Overlay::Subagents(_))) {
+            tui.set_cursor_style(crossterm::cursor::SetCursorStyle::DefaultUserShape)?;
             self.handle_subagent_overlay_event(tui, event)?;
         } else if self.overlay.is_some() {
+            tui.set_cursor_style(crossterm::cursor::SetCursorStyle::DefaultUserShape)?;
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
         } else {
             match event {
@@ -122,10 +274,225 @@ impl App {
                 TuiEvent::Paste(pasted) => {
                     self.chat_widget.handle_paste(pasted);
                 }
-                // The mouse is captured only while the transcript overlay is open.
-                TuiEvent::Mouse(_) => {}
+                TuiEvent::Mouse(mouse) => {
+                    if mouse.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                    {
+                        self.tool_gesture.cancel();
+                    }
+                    if self.chat_widget.has_active_overlay_or_popup() {
+                        self.chat_widget.handle_popup_mouse(mouse);
+                        return Ok(true);
+                    }
+                    if mouse.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                        && let Some(key) = self
+                            .chat_widget
+                            .response_focus_action_at(mouse.column, mouse.row)
+                    {
+                        self.handle_response_focus(tui, key);
+                        return Ok(true);
+                    }
+                    if mouse.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                        && let Some(call_id) =
+                            self.chat_widget.transcript_tool_at(mouse.column, mouse.row)
+                    {
+                        self.tool_gesture.press(
+                            self.session_view.focused(),
+                            call_id,
+                            mouse.column,
+                            mouse.row,
+                        );
+                        self.session_view.start_drag(mouse.row);
+                        return Ok(true);
+                    }
+                    if mouse.kind
+                        == crossterm::event::MouseEventKind::Drag(
+                            crossterm::event::MouseButton::Left,
+                        )
+                    {
+                        self.tool_gesture.drag(
+                            self.session_view.focused(),
+                            mouse.column,
+                            mouse.row,
+                        );
+                    } else if mouse.kind
+                        == crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                    {
+                        let hit = self.chat_widget.transcript_tool_at(mouse.column, mouse.row);
+                        if let Some(call_id) = self
+                            .tool_gesture
+                            .release(self.session_view.focused(), hit.as_deref())
+                        {
+                            self.session_view.end_drag();
+                            self.toggle_tool(tui, call_id);
+                            return Ok(true);
+                        }
+                    }
+                    if self
+                        .chat_widget
+                        .subagent_strip_contains(mouse.column, mouse.row)
+                        && matches!(
+                            mouse.kind,
+                            crossterm::event::MouseEventKind::ScrollLeft
+                                | crossterm::event::MouseEventKind::ScrollRight
+                        )
+                    {
+                        self.chat_widget.scroll_subagent_strip(
+                            if mouse.kind == crossterm::event::MouseEventKind::ScrollLeft {
+                                -1
+                            } else {
+                                1
+                            },
+                        );
+                        return Ok(true);
+                    }
+                    if mouse.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                        && let Some(action) = self
+                            .chat_widget
+                            .subagent_strip_action(mouse.column, mouse.row)
+                    {
+                        use crate::chatwidget::subagents::StripAction;
+                        match action {
+                            StripAction::Focus(key) => {
+                                self.session_view.start_strip_drag(mouse.column, Some(key))
+                            }
+                            StripAction::Previous => self.chat_widget.scroll_subagent_strip(-1),
+                            StripAction::Next => self.chat_widget.scroll_subagent_strip(1),
+                        }
+                        return Ok(true);
+                    }
+                    if self.session_view.is_strip_dragging() {
+                        match mouse.kind {
+                            crossterm::event::MouseEventKind::Drag(
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                let delta = self.session_view.strip_drag(mouse.column);
+                                if delta != 0 {
+                                    self.chat_widget.scroll_subagent_strip(delta);
+                                }
+                                return Ok(true);
+                            }
+                            crossterm::event::MouseEventKind::Up(
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                if let Some(key) = self.session_view.end_strip_drag()
+                                    && self
+                                        .chat_widget
+                                        .subagent_strip_action(mouse.column, mouse.row)
+                                        == Some(crate::chatwidget::subagents::StripAction::Focus(
+                                            key,
+                                        ))
+                                {
+                                    self.focus_subagent_from_mouse(tui, key);
+                                }
+                                return Ok(true);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(
+                        self.session_view.focused(),
+                        crate::subagent_switcher::Target::Subagent(_)
+                    ) && matches!(
+                        mouse.kind,
+                        crossterm::event::MouseEventKind::ScrollUp
+                            | crossterm::event::MouseEventKind::ScrollDown
+                    ) {
+                        self.session_view.scroll(
+                            if mouse.kind == crossterm::event::MouseEventKind::ScrollUp {
+                                3
+                            } else {
+                                -3
+                            },
+                        );
+                        tui.frame_requester().schedule_frame();
+                    } else if self.session_view.focused() == crate::subagent_switcher::Target::Main
+                        && matches!(
+                            mouse.kind,
+                            crossterm::event::MouseEventKind::ScrollUp
+                                | crossterm::event::MouseEventKind::ScrollDown
+                        )
+                    {
+                        self.scroll_main_session(
+                            tui,
+                            if mouse.kind == crossterm::event::MouseEventKind::ScrollUp {
+                                3
+                            } else {
+                                -3
+                            },
+                        );
+                    } else if mouse.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                        && self
+                            .chat_widget
+                            .place_composer_cursor(mouse.column, mouse.row)
+                    {
+                        self.session_view.end_drag();
+                    } else if mouse.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                        && self.chat_widget.is_chat_content_row(mouse.row)
+                    {
+                        self.session_view.start_drag(mouse.row);
+                    } else if mouse.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                    {
+                        self.session_view.end_drag();
+                    } else if mouse.kind
+                        == crossterm::event::MouseEventKind::Drag(
+                            crossterm::event::MouseButton::Left,
+                        )
+                    {
+                        let delta = self.session_view.drag(mouse.row);
+                        if delta != 0 {
+                            if self.session_view.focused() == crate::subagent_switcher::Target::Main
+                            {
+                                self.scroll_main_session(tui, delta);
+                            } else {
+                                self.session_view.scroll(delta);
+                                tui.frame_requester().schedule_frame();
+                            }
+                        }
+                    } else if mouse.kind
+                        == crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                    {
+                        self.session_view.end_drag();
+                    }
+                }
                 TuiEvent::Draw => {
+                    // The main conversation belongs to native terminal scrollback. Mouse
+                    // reporting also captures wheel events, so reserve it for projected views.
+                    let projected = self.backtrack.response_focus.is_some()
+                        || self.session_view.main_scrolling()
+                        || self.session_view.focused() != crate::subagent_switcher::Target::Main;
+                    if !projected
+                        && !self.chat_widget.has_active_overlay_or_popup()
+                        && !self.deferred_history_lines.is_empty()
+                    {
+                        tui.insert_history_lines(std::mem::take(&mut self.deferred_history_lines));
+                    }
+                    let _ = tui.set_mouse_capture(
+                        projected || self.chat_widget.has_active_overlay_or_popup(),
+                    );
+                    tui.set_cursor_style(self.chat_widget.composer_cursor_style())?;
                     self.chat_widget.pre_draw_tick();
+                    self.update_focused_session_view(tui)?;
                     self.chat_widget.maybe_post_pending_notification(tui);
                     if self
                         .chat_widget
@@ -137,11 +504,18 @@ impl App {
                     self.chat_widget.set_screen_rows(screen.height);
                     // Two rows above the viewport must stay free: history is flushed by
                     // scrolling them, and a taller viewport would leave it nowhere to go.
-                    let viewport_rows = self
-                        .chat_widget
-                        .desired_height(screen.width)
-                        .min(screen.height.saturating_sub(2).max(1));
-                    let popup_rows = self.chat_widget.popup_rows(screen.width);
+                    let maximum = screen.height.saturating_sub(2).max(1);
+                    let viewport_rows = if projected {
+                        maximum
+                    } else {
+                        self.chat_widget.desired_height(screen.width).min(maximum)
+                    };
+                    let popup_rows = if projected {
+                        viewport_rows
+                            .saturating_sub(self.chat_widget.primary_composer_height(screen.width))
+                    } else {
+                        self.chat_widget.popup_rows(screen.width)
+                    };
                     tui.draw(viewport_rows, popup_rows, |frame| {
                         self.chat_widget.render(frame.area(), frame.buffer);
                         if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
@@ -177,6 +551,7 @@ impl App {
         event: AppEvent,
     ) -> Result<bool> {
         if self.waiting_model_presses.is_waiting()
+            && self.session_view.focused() == crate::subagent_switcher::Target::Main
             && !self.chat_widget.agent_config().is_empty()
             && let Some((step, count)) = self.waiting_model_presses.take(std::time::Instant::now())
         {
@@ -185,6 +560,135 @@ impl App {
             }
         }
         match event {
+            AppEvent::ChildHistoryReady {
+                request_id,
+                key,
+                focus_responses,
+                result,
+            } => {
+                let keys = if focus_responses {
+                    let Some(pending) = self.backtrack.pending_child_focus.take() else {
+                        return Ok(true);
+                    };
+                    if pending.request_id != request_id {
+                        self.backtrack.pending_child_focus = Some(pending);
+                        return Ok(true);
+                    }
+                    if pending.key != key
+                        || self.session_view.focused()
+                            != crate::subagent_switcher::Target::Subagent(key)
+                        || pending.generation != self.chat_widget.session_generation()
+                        || self.chat_widget.subagent_session(key).as_ref()
+                            != Some(&pending.session_id)
+                    {
+                        return Ok(true);
+                    }
+                    pending.keys
+                } else {
+                    Vec::new()
+                };
+                match result {
+                    Ok(events) => {
+                        self.show_child_history(tui, key, focus_responses, events);
+                        for key in keys {
+                            if !self.handle_response_focus(tui, key) {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => self.show_child_history_error(tui, key, error),
+                }
+            }
+            AppEvent::ChildHistoryActionFinished {
+                key,
+                rewound,
+                result,
+            } => match result {
+                Ok(events) if rewound => {
+                    self.chat_widget.replace_subagent_history(key, &events);
+                    tui.frame_requester().schedule_frame();
+                }
+                Ok(_) => {}
+                Err(error) => self.show_child_history_error(tui, key, error),
+            },
+            AppEvent::SubagentControlsReady {
+                key,
+                revision,
+                handle,
+                config_options,
+                error,
+            } => {
+                if self.session_view.controls_revision(key) != revision {
+                    return Ok(true);
+                }
+                if let Some(error) = error {
+                    tracing::warn!(%error, "failed to load child session controls");
+                    return Ok(true);
+                }
+                self.session_view.set_controls(key, handle, &config_options);
+                if self.session_view.focused() == crate::subagent_switcher::Target::Subagent(key) {
+                    let roster = self.chat_widget.subagent_roster(std::time::Instant::now());
+                    let name = roster
+                        .entry(crate::subagent_switcher::Target::Subagent(key))
+                        .and_then(|entry| entry.agent.as_deref());
+                    self.chat_widget.set_focused_session_config(
+                        Some(
+                            self.session_view
+                                .controlled_config(key)
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                        name,
+                    );
+                }
+            }
+            AppEvent::SubagentConfigSetResult {
+                key,
+                result,
+                config_id,
+                value,
+                route_fallback_eligible,
+                route_token,
+            } => {
+                if self.stale_model_route_token(route_token) {
+                    return Ok(true);
+                }
+                if self.is_model_child_route(route_token, key, &config_id, &value) {
+                    if result.is_err()
+                        && route_fallback_eligible
+                        && self.advance_model_route().await
+                    {
+                        return Ok(true);
+                    }
+                    self.model_route_fallback = None;
+                }
+                let roster = self.chat_widget.subagent_roster(std::time::Instant::now());
+                let crate::subagent_switcher::Target::Subagent(key) =
+                    roster.resolve(crate::subagent_switcher::Target::Subagent(key))
+                else {
+                    return Ok(true);
+                };
+                match result {
+                    Ok(config_options) => {
+                        let handle = self.session_view.controlled_handle(key);
+                        self.session_view.set_controls(key, handle, &config_options);
+                        if self.session_view.focused()
+                            == crate::subagent_switcher::Target::Subagent(key)
+                        {
+                            let roster =
+                                self.chat_widget.subagent_roster(std::time::Instant::now());
+                            let name = roster
+                                .entry(crate::subagent_switcher::Target::Subagent(key))
+                                .and_then(|entry| entry.agent.as_deref());
+                            self.chat_widget.set_focused_session_config(
+                                self.session_view.controlled_config(key).cloned(),
+                                name,
+                            );
+                        }
+                    }
+                    Err(error) => tui.show_toast(error),
+                }
+            }
             AppEvent::ContextTimelineReady {
                 generation,
                 conversation_id,
@@ -205,11 +709,44 @@ impl App {
                         unreachable!("candidate variant checked above")
                     };
                     let config = self.config_for_agent(&agent_name);
-                    if let Err(error) = nori_harness::runtime::refresh_prepared_agent(
-                        &mut agent,
-                        crate::chatwidget::agent::agent_prepare_spec(config.clone(), None),
-                    ) {
+                    let mut prepare_spec = crate::chatwidget::agent::agent_prepare_spec(
+                        config.clone(),
+                        self.fallback
+                            .as_ref()
+                            .and_then(|fallback| fallback.context.clone())
+                            .or_else(|| {
+                                self.manual_model_handoff
+                                    .as_ref()
+                                    .map(|handoff| handoff.context.clone())
+                            }),
+                    );
+                    prepare_spec.handoff = self
+                        .fallback
+                        .as_ref()
+                        .and_then(|fallback| fallback.recorder.clone())
+                        .or_else(|| {
+                            self.manual_model_handoff
+                                .as_ref()
+                                .map(|handoff| handoff.recorder.clone())
+                        });
+                    if let Err(error) =
+                        nori_harness::runtime::refresh_prepared_agent(&mut agent, prepare_spec)
+                    {
                         tokio::spawn((*agent).shutdown());
+                        self.pending_candidate_model = None;
+                        if self.fallback.is_some() {
+                            self.advance_fallback().await;
+                            return Ok(true);
+                        }
+                        if self.manual_model_handoff.is_some() {
+                            if self.advance_model_route().await {
+                                return Ok(true);
+                            }
+                            self.manual_model_handoff = None;
+                            tui.show_toast(format!("Couldn't activate model: {error}"));
+                            return Ok(true);
+                        }
+                        self.manual_model_handoff = None;
                         self.chat_widget.set_login_agent_override(Some(agent_name));
                         self.chat_widget.add_error_message(format!(
                             "Couldn't activate {display_name}: {error}"
@@ -234,11 +771,14 @@ impl App {
                         agent_name,
                         widget: Box::new(widget),
                         activation_error: None,
+                        activation_route_eligible: false,
                     });
                     tui.frame_requester().schedule_frame();
                     return Ok(true);
                 }
 
+                self.fallback = None;
+                self.exhausted_providers.clear();
                 self.discard_candidate();
                 if let Some(preparation) = &mut self.primary_agent_preparation {
                     preparation.intent = crate::app_event::AgentPrepareIntent::Idle;
@@ -325,6 +865,8 @@ impl App {
                 self.chat_widget.on_session_close_failed(message);
             }
             AppEvent::SessionClosed => {
+                self.program_status.clear();
+                self.program_status.idle();
                 // The session was released; land back on the session picker
                 // with a fresh deferred widget — never auto-claim a new
                 // session (on a cloud agent that would boot a new VM).
@@ -449,7 +991,11 @@ impl App {
                             });
                             // A warmed agent waits to be chosen; it starts nothing on its own.
                             if !speculative {
-                                self.follow_up_prepared_candidate();
+                                if self.pending_candidate_model.is_some() {
+                                    self.app_event_tx.send(AppEvent::NewSession);
+                                } else {
+                                    self.follow_up_prepared_candidate();
+                                }
                             }
                         }
                         // Warming that failed says nothing yet: choosing the agent tries again
@@ -467,6 +1013,23 @@ impl App {
                         }
                         Err(error) => {
                             self.candidate_agent = None;
+                            self.pending_candidate_model = None;
+                            let model_selection = self.model_route_fallback.is_some();
+                            if crate::app::model_routes::eligible_error(&error)
+                                && self.advance_model_route().await
+                            {
+                                return Ok(true);
+                            }
+                            self.model_route_fallback = None;
+                            if self.fallback.is_some() {
+                                self.advance_fallback().await;
+                                return Ok(true);
+                            }
+                            if model_selection {
+                                self.manual_model_handoff = None;
+                                tui.show_toast(format!("Couldn't select model: {error}"));
+                                return Ok(true);
+                            }
                             self.chat_widget.set_login_agent_override(Some(agent_name));
                             self.chat_widget.add_error_message(format!(
                                 "Couldn't prepare {display_name}: {error}"
@@ -622,7 +1185,8 @@ impl App {
                             None,
                         );
                         if !self.cloud_mode && self.candidate_agent.is_none() {
-                            self.chat_widget.open_agent_recovery_popup(&error);
+                            self.chat_widget
+                                .open_agent_recovery_popup(&format!("{error:#}"));
                         }
                     }
                 }
@@ -705,6 +1269,75 @@ impl App {
                 self.discard_candidate();
                 self.chat_widget.begin_exit();
             }
+            AppEvent::RevealUserQuestion => {
+                self.overlay = None;
+                self.backtrack.response_focus = None;
+                self.chat_widget.set_response_focus(false);
+                self.end_response_view(tui);
+                tui.request_full_repaint();
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::UpdateHistoryToolSnapshot {
+                generation,
+                snapshot,
+            } => {
+                let call_id = snapshot.call_id.clone();
+                if generation == self.chat_widget.session_generation()
+                    && let Some(index) =
+                        super::tool_history::update(&mut self.transcript_cells, *snapshot)
+                {
+                    let hidden = self
+                        .hidden_transcript_len
+                        .and_then(|length| usize::try_from(length).ok())
+                        .unwrap_or(0);
+                    let visible_index = if self.native_history.cells().is_empty() {
+                        index.checked_sub(hidden)
+                    } else {
+                        self.native_history.tool_index(&call_id)
+                    };
+                    if let Some(visible_index) = visible_index {
+                        self.session_view
+                            .invalidate_main_transcript_cell(visible_index);
+                    }
+                    let ready = self
+                        .native_history
+                        .replace_tool(&call_id, self.transcript_cells[index].clone());
+                    self.emit_native_history_cells(tui, ready);
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            AppEvent::FinalizeHistoryTools {
+                generation,
+                call_ids,
+            } => {
+                if generation != self.chat_widget.session_generation() {
+                    return Ok(true);
+                }
+                for call_id in call_ids {
+                    if let Some(index) =
+                        super::tool_history::fail_active(&mut self.transcript_cells, &call_id)
+                    {
+                        let hidden = self
+                            .hidden_transcript_len
+                            .and_then(|length| usize::try_from(length).ok())
+                            .unwrap_or(0);
+                        let visible_index = if self.native_history.cells().is_empty() {
+                            index.checked_sub(hidden)
+                        } else {
+                            self.native_history.tool_index(&call_id)
+                        };
+                        if let Some(visible_index) = visible_index {
+                            self.session_view
+                                .invalidate_main_transcript_cell(visible_index);
+                        }
+                        let ready = self
+                            .native_history
+                            .replace_tool(&call_id, self.transcript_cells[index].clone());
+                        self.emit_native_history_cells(tui, ready);
+                    }
+                }
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::InsertHistoryCell(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();
                 if let Some(Overlay::Transcript(t)) = &mut self.overlay {
@@ -712,32 +1345,58 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
                 self.transcript_cells.push(cell.clone());
-                // A replayed history is painted all at once when the replay ends.
-                let mut display = if self.replay_painted_from.is_some() {
-                    Vec::new()
-                } else {
-                    cell.display_lines(tui.terminal.last_known_screen_size.width)
-                };
-                if !display.is_empty() {
-                    // Only insert a separating blank line for new cells that are not
-                    // part of an ongoing stream. Streaming continuations should not
-                    // accrue extra blank lines between chunks.
-                    if !cell.is_stream_continuation() {
-                        if self.has_emitted_history_lines {
-                            display.insert(0, Line::from(""));
-                        } else {
-                            self.has_emitted_history_lines = true;
+                if self.replay_painted_from.is_none() {
+                    let ready = self.native_history.push(cell);
+                    self.emit_native_history_cells(tui, ready);
+                }
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ResponseRewindFinished {
+                generation,
+                cell,
+                result,
+            } => {
+                if self.chat_widget.session_generation() == generation {
+                    match result {
+                        Ok(()) => {
+                            if let Some(index) = self
+                                .transcript_cells
+                                .iter()
+                                .position(|candidate| Arc::ptr_eq(candidate, &cell))
+                            {
+                                self.transcript_cells.truncate(index + 1);
+                                let ready = self
+                                    .native_history
+                                    .retain_transcript(&self.transcript_cells);
+                                self.emit_native_history_cells(tui, ready);
+                                self.response_boundaries.retain(|(candidate, _)| {
+                                    self.transcript_cells
+                                        .iter()
+                                        .any(|cell| Arc::ptr_eq(candidate, cell))
+                                });
+                                self.hidden_transcript_len = None;
+                                // Existing primary-screen scrollback is terminal history. Keep it
+                                // intact; subsequent responses continue from the rewound head.
+                                tui.frame_requester().schedule_frame();
+                            }
                         }
-                    }
-                    if self.overlay.is_some() {
-                        self.deferred_history_lines.extend(display);
-                    } else {
-                        tui.insert_history_lines(display);
+                        Err(error) => self
+                            .chat_widget
+                            .add_error_message(format!("Could not rewind conversation: {error}")),
                     }
                 }
             }
-            AppEvent::HistoryReplay(crate::app_event::HistoryReplay::Started) => {
-                self.replay_painted_from = Some(self.transcript_cells.len());
+            AppEvent::ResponseBoundary(boundary) => {
+                if let Some(cell) = self.transcript_cells.iter().rev().find(|cell| {
+                    (cell.as_any().is::<crate::history_cell::AgentMessageCell>()
+                        && !cell.is_stream_continuation())
+                        || cell.as_any().is::<crate::history_cell::AgentMarkdownCell>()
+                }) {
+                    self.response_boundaries.push((cell.clone(), boundary));
+                }
+            }
+            AppEvent::HistoryReplay(crate::app_event::HistoryReplay::Started(source)) => {
+                self.replay_painted_from = Some((self.transcript_cells.len(), source));
             }
             AppEvent::HistoryReplay(crate::app_event::HistoryReplay::Finished) => {
                 self.paint_replayed_history(tui);
@@ -748,6 +1407,12 @@ impl App {
                     source,
                     &cwd,
                 );
+                if consolidation.is_some() {
+                    let ready = self
+                        .native_history
+                        .retain_transcript(&self.transcript_cells);
+                    self.emit_native_history_cells(tui, ready);
+                }
                 if let Some((range, replacement)) = consolidation
                     && let Some(Overlay::Transcript(transcript)) = &mut self.overlay
                 {
@@ -760,6 +1425,80 @@ impl App {
                 }
             }
             AppEvent::SessionEvent { generation, event } => {
+                if self.chat_widget.session_generation() == generation {
+                    self.program_status.event(&event);
+                }
+                if self.chat_widget.session_generation() == generation
+                    && let nori_protocol::SessionEvent::Acp(
+                        nori_protocol::AcpEvent::ChildNotification(notification),
+                    ) = &event
+                    && matches!(
+                        &notification.update,
+                        nori_protocol::acp::v1::SessionUpdate::ConfigOptionUpdate(_)
+                    )
+                    && let crate::subagent_switcher::Target::Subagent(key) =
+                        self.session_view.focused()
+                    && self.chat_widget.subagent_session(key).as_ref()
+                        == Some(&notification.session_id)
+                {
+                    self.refresh_subagent_controls(key);
+                }
+                if self.chat_widget.session_generation() == generation
+                    && let nori_protocol::SessionEvent::Nori(
+                        nori_protocol::NoriEvent::SessionStarted(started),
+                    ) = &event
+                {
+                    self.active_transcript_id = started.transcript_id.clone();
+                }
+                if self.chat_widget.session_generation() == generation
+                    && let nori_protocol::SessionEvent::Nori(
+                        nori_protocol::NoriEvent::SubscriptionExhausted(exhausted),
+                    ) = &event
+                {
+                    let already_retrying = self.fallback.is_some();
+                    let recorder = if let Some(handle) = self.chat_widget.harness_handle() {
+                        handle.conversation_recorder().await.ok().flatten()
+                    } else {
+                        None
+                    };
+                    let mut handoff = exhausted.clone();
+                    if let Some(recorder) = &recorder {
+                        match recorder.visible_context().await {
+                            Ok(context) => handoff.context = Some(context),
+                            Err(error) => {
+                                tracing::warn!(%error, "Cannot project fallback conversation context");
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    if recorder.is_some() || already_retrying {
+                        self.start_fallback(handoff, recorder).await;
+                    }
+                    if self.fallback.is_some() || already_retrying {
+                        self.suppressed_fallback_errors
+                            .insert(exhausted.request_id.clone());
+                    }
+                    return Ok(true);
+                }
+                if let nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::RequestFailed(
+                    failure,
+                )) = &event
+                    && let Some(id) = &failure.request_id
+                    && self.suppressed_fallback_errors.remove(id)
+                {
+                    return Ok(true);
+                }
+                if self.chat_widget.session_generation() == generation
+                    && matches!(
+                        &event,
+                        nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::RequestFailed(
+                            _
+                        ))
+                    )
+                    && let Some(fallback) = self.fallback.take()
+                {
+                    self.chat_widget.add_error_message(fallback.original_error);
+                }
                 let candidate_matches = matches!(
                     &self.candidate_agent,
                     Some(CandidateAgent::Activating { widget, .. })
@@ -775,9 +1514,20 @@ impl App {
                     let ended_message = if let Some(CandidateAgent::Activating {
                         widget,
                         activation_error,
+                        activation_route_eligible,
                         ..
                     }) = self.candidate_agent.as_mut()
                     {
+                        if let nori_protocol::SessionEvent::Acp(
+                            nori_protocol::AcpEvent::Response {
+                                response: Err(error),
+                                ..
+                            },
+                        ) = &event
+                        {
+                            *activation_route_eligible |=
+                                crate::app::model_routes::eligible_acp_error(error);
+                        }
                         match classify_candidate_activation_event(&event, activation_error) {
                             CandidateActivationEvent::Forward => {
                                 widget.handle_session_event(generation, event);
@@ -794,17 +1544,201 @@ impl App {
                     };
 
                     if let Some(started) = started {
+                        if let Some(handoff) = &self.manual_model_handoff {
+                            let still_current = self.chat_widget.session_generation()
+                                == handoff.source_generation
+                                && !self.chat_widget.is_task_running();
+                            let context = handoff.recorder.visible_context().await;
+                            if !still_current
+                                || context.as_deref().ok() != Some(handoff.context.as_str())
+                            {
+                                self.discard_candidate();
+                                self.manual_model_handoff = None;
+                                self.model_route_fallback = None;
+                                if self.native_preference_in_progress {
+                                    self.native_preference_in_progress = false;
+                                    if let Some(journal) = &self.active_transcript_id {
+                                        self.native_preference_attempted.remove(journal);
+                                    }
+                                    self.prefer_native_current_model().await;
+                                } else {
+                                    tui.show_toast(
+                                        "Conversation changed; choose the model again".to_owned(),
+                                    );
+                                }
+                                return Ok(true);
+                            }
+                        }
+                        if let Some((agent, model)) = self.pending_candidate_model.take() {
+                            let candidate = match &self.candidate_agent {
+                                Some(CandidateAgent::Activating {
+                                    agent_name, widget, ..
+                                }) if *agent_name == agent => widget.harness_handle(),
+                                _ => None,
+                            };
+                            let config_id = candidate_model_config(&started.config_options, &model);
+                            let result = match (candidate.as_ref(), config_id) {
+                                (Some(handle), Some(config_id)) => handle
+                                    .set_session_config_option(config_id, model.clone())
+                                    .await
+                                    .map_err(|error| {
+                                        (
+                                            crate::app::model_routes::eligible_error(&error),
+                                            error.to_string(),
+                                        )
+                                    }),
+                                _ => Err((
+                                    true,
+                                    format!("{agent} no longer advertises model {model}"),
+                                )),
+                            };
+                            match result {
+                                Ok(options) => {
+                                    if let Some(effort) = self
+                                        .manual_model_handoff
+                                        .as_ref()
+                                        .and_then(|handoff| handoff.effort.clone())
+                                    {
+                                        let effort_option = options.iter().find(|option| {
+                                            crate::nori::agent_config_state::is_effort_option(
+                                                option,
+                                            )
+                                        });
+                                        let result = match (candidate.as_ref(), effort_option) {
+                                            (Some(handle), Some(option)) => {
+                                                handle
+                                                    .set_session_config_option(
+                                                        option.id.to_string(),
+                                                        effort,
+                                                    )
+                                                    .await
+                                            }
+                                            _ => Err(anyhow::anyhow!(
+                                                "The selected model does not expose the current effort setting"
+                                            )),
+                                        };
+                                        match result {
+                                            Ok(options) => {
+                                                if let Some(CandidateAgent::Activating {
+                                                    widget,
+                                                    ..
+                                                }) = self.candidate_agent.as_mut()
+                                                {
+                                                    widget
+                                                        .sync_acp_session_config_snapshot(&options);
+                                                }
+                                            }
+                                            Err(error) => {
+                                                self.discard_candidate();
+                                                if self.advance_model_route().await {
+                                                    return Ok(true);
+                                                }
+                                                self.manual_model_handoff = None;
+                                                tui.show_toast(format!(
+                                                    "Couldn't retain effort setting: {error}"
+                                                ));
+                                                return Ok(true);
+                                            }
+                                        }
+                                    } else if let Some(CandidateAgent::Activating {
+                                        widget, ..
+                                    }) = self.candidate_agent.as_mut()
+                                    {
+                                        widget.sync_acp_session_config_snapshot(&options);
+                                    }
+                                }
+                                Err((eligible, error)) => {
+                                    self.discard_candidate();
+                                    let model_selection = self.model_route_fallback.is_some();
+                                    if eligible && self.advance_model_route().await {
+                                        return Ok(true);
+                                    }
+                                    self.model_route_fallback = None;
+                                    if self.fallback.is_some() {
+                                        self.advance_fallback().await;
+                                        return Ok(true);
+                                    }
+                                    if model_selection {
+                                        self.manual_model_handoff = None;
+                                        tui.show_toast(format!("Couldn't select model: {error}"));
+                                        return Ok(true);
+                                    }
+                                    self.chat_widget.add_error_message(format!(
+                                        "Couldn't select model {model} for {agent}: {error}"
+                                    ));
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                        if self.fallback.is_some() || self.manual_model_handoff.is_some() {
+                            self.note_fallback("prepared").await;
+                            let handle = match &self.candidate_agent {
+                                Some(CandidateAgent::Activating { widget, .. }) => {
+                                    widget.harness_handle()
+                                }
+                                _ => None,
+                            };
+                            let result = match handle {
+                                Some(handle) => handle.record_backend_bound().await,
+                                None => {
+                                    Err(anyhow::anyhow!("Fallback candidate has no active session"))
+                                }
+                            };
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "Failed to record fallback backend binding");
+                                self.discard_candidate();
+                                if self.fallback.is_some() {
+                                    self.advance_fallback().await;
+                                } else {
+                                    self.manual_model_handoff = None;
+                                    self.model_route_fallback = None;
+                                    tui.show_toast("Couldn't save the model switch".to_owned());
+                                }
+                                return Ok(true);
+                            }
+                            if let Some(handle) = self.chat_widget.harness_handle()
+                                && let Err(error) = handle.retire_handoff().await
+                            {
+                                tracing::warn!(%error, "Failed to retire previous backend recorder");
+                                if self.manual_model_handoff.is_some() {
+                                    if let Err(error) = handle.record_backend_bound().await {
+                                        tracing::error!(%error, "Failed to restore the original backend binding");
+                                    }
+                                    self.discard_candidate();
+                                    self.manual_model_handoff = None;
+                                    self.model_route_fallback = None;
+                                    tui.show_toast("Couldn't finish the model switch".to_owned());
+                                    return Ok(true);
+                                }
+                            }
+                        }
                         let Some(CandidateAgent::Activating {
                             agent_name, widget, ..
                         }) = self.candidate_agent.take()
                         else {
                             unreachable!("candidate generation checked above")
                         };
+                        self.model_route_fallback = None;
+                        let manual_handoff = self.manual_model_handoff.take().is_some();
+                        self.native_preference_session_ready = false;
+                        self.native_preference_session = None;
+                        self.native_preference_in_progress = false;
+                        if self.fallback.is_some() || manual_handoff {
+                            self.chat_widget.flush_active_cell();
+                        }
                         let mut old_widget = std::mem::replace(&mut self.chat_widget, *widget);
+                        let draft = manual_handoff.then(|| old_widget.take_composer_draft());
                         self.session_card_shown = true;
                         self.config.active_agent = agent_name.clone();
                         self.config.agent = agent_name;
                         self.configure_new_chat_widget();
+                        if let Some(draft) = draft {
+                            self.chat_widget.restore_composer_draft(draft);
+                        }
+                        self.program_status
+                            .event(&nori_protocol::SessionEvent::Nori(
+                                nori_protocol::NoriEvent::SessionStarted(started.clone()),
+                            ));
                         if let Some(handle) = self.chat_widget.harness_handle()
                             && let Err(error) = self
                                 .remote_control
@@ -813,35 +1747,123 @@ impl App {
                         {
                             tracing::warn!(%error, "failed to attach committed candidate to remote ACP host");
                         }
-                        let (initial_prompt, initial_images) = old_widget.take_initial_input();
-                        self.chat_widget
-                            .submit_launch_input(initial_prompt, initial_images);
+                        if !manual_handoff {
+                            let (initial_prompt, initial_images) = old_widget.take_initial_input();
+                            self.chat_widget
+                                .submit_launch_input(initial_prompt, initial_images);
+                        }
                         self.cancel_primary_agent_preparation();
                         if let Some(agent) = self.prepared_agent.take() {
                             tokio::spawn(agent.shutdown());
                         }
                         self.prepared_agent_initial_context = None;
                         old_widget.shutdown_harness_session();
-                        if let Err(error) = ConfigEditsBuilder::new(&self.config.nori_home)
-                            .set_agent(&self.config.active_agent)
-                            .apply()
-                            .await
+                        if let Some(fallback) = &self.fallback {
+                            self.chat_widget.retry_echoed_prompt(
+                                fallback.content.clone(),
+                                fallback.echo_id.clone(),
+                            );
+                        }
+                        if self.fallback.is_none()
+                            && let Err(error) = ConfigEditsBuilder::new(&self.config.nori_home)
+                                .set_agent(&self.config.active_agent)
+                                .apply()
+                                .await
                         {
                             tracing::error!(%error, "failed to persist activated agent selection");
                         }
                         self.chat_widget.show_agent_in_footer();
                     } else if let Some(message) = ended_message {
+                        self.pending_candidate_model = None;
+                        let model_selection = self.model_route_fallback.is_some();
                         let candidate = self.candidate_agent.take();
                         if let Some(CandidateAgent::Activating {
-                            agent_name, widget, ..
+                            agent_name,
+                            widget,
+                            activation_route_eligible,
+                            ..
                         }) = candidate
                         {
                             widget.shutdown_harness_session();
+                            if activation_route_eligible && self.advance_model_route().await {
+                                return Ok(true);
+                            }
+                            self.model_route_fallback = None;
                             self.chat_widget.set_login_agent_override(Some(agent_name));
+                        }
+                        if self.fallback.is_some() {
+                            self.advance_fallback().await;
+                            return Ok(true);
+                        }
+                        if model_selection {
+                            self.manual_model_handoff = None;
+                            tui.show_toast(format!("Couldn't select model: {message}"));
+                            return Ok(true);
                         }
                         self.chat_widget.add_error_message(message);
                     }
                 } else {
+                    let current_session = self.chat_widget.session_generation() == generation;
+                    let session_started = current_session
+                        && matches!(
+                            &event,
+                            nori_protocol::SessionEvent::Nori(
+                                nori_protocol::NoriEvent::SessionStarted(_)
+                            )
+                        );
+                    if session_started {
+                        self.native_preference_waiting_for_prompt =
+                            self.chat_widget.has_initial_input();
+                        if let nori_protocol::SessionEvent::Nori(
+                            nori_protocol::NoriEvent::SessionStarted(started),
+                        ) = &event
+                        {
+                            self.native_preference_session =
+                                Some((generation, started.acp_session_id.clone()));
+                        }
+                        self.native_preference_session_ready = false;
+                    }
+                    let session_ready = current_session
+                        && matches!(&event,
+                        nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::SessionReady(id))
+                            if self.native_preference_session.as_ref() == Some(&(generation, id.clone())));
+                    if session_ready {
+                        self.native_preference_session_ready = true;
+                    }
+                    let prompt_finished = current_session
+                        && matches!(
+                            &event,
+                            nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response {
+                                response: Ok(
+                                    nori_protocol::acp::v1::AgentResponse::PromptResponse(_)
+                                ),
+                                ..
+                            }) | nori_protocol::SessionEvent::Nori(
+                                nori_protocol::NoriEvent::RequestFailed(_)
+                            )
+                        );
+                    if prompt_finished {
+                        self.native_preference_waiting_for_prompt = false;
+                    }
+                    let check_native_preference = session_ready
+                        || prompt_finished
+                        || current_session
+                            && matches!(&event,
+                        nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(nori_protocol::acp::v1::AgentNotification::SessionNotification(notification)))
+                            if matches!(&notification.update, nori_protocol::acp::v1::SessionUpdate::ConfigOptionUpdate(_)));
+                    if self.chat_widget.session_generation() == generation
+                        && matches!(
+                            &event,
+                            nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response {
+                                response: Ok(
+                                    nori_protocol::acp::v1::AgentResponse::PromptResponse(_)
+                                ),
+                                ..
+                            })
+                        )
+                    {
+                        self.fallback = None;
+                    }
                     let started = match &event {
                         nori_protocol::SessionEvent::Nori(
                             nori_protocol::NoriEvent::SessionStarted(started),
@@ -853,6 +1875,9 @@ impl App {
                     self.chat_widget.handle_session_event(generation, event);
                     // That session has written its card, if it was to; later ones do not repeat it.
                     self.session_card_shown |= started.is_some();
+                    if check_native_preference {
+                        self.prefer_native_current_model().await;
+                    }
                     if let Some(started) = started
                         && let Some(handle) = self.chat_widget.harness_handle()
                         && let Err(error) = self
@@ -868,6 +1893,9 @@ impl App {
                 self.on_conversation_history_for_backtrack(tui, ev)?;
             }
             AppEvent::ExitRequest => {
+                let history_complete = self.finish_native_history(tui)?;
+                self.overlay = None;
+                self.chat_widget.clear_main_history_view();
                 self.cancel_primary_agent_preparation();
                 if let Some(agent) = self.prepared_agent.take() {
                     agent.shutdown().await;
@@ -883,7 +1911,11 @@ impl App {
                     t.insert_cell(cell.clone());
                 }
                 self.transcript_cells.push(cell.clone());
-                let mut display = cell.display_lines(tui.terminal.last_known_screen_size.width);
+                let mut display = if history_complete {
+                    cell.native_lines(tui.terminal.last_known_screen_size.width)
+                } else {
+                    Vec::new()
+                };
                 if !display.is_empty() {
                     if !cell.is_stream_continuation() {
                         if self.has_emitted_history_lines {
@@ -919,6 +1951,10 @@ impl App {
                 return Ok(false);
             }
             AppEvent::HarnessAction(action) => {
+                if let crate::app_event::HarnessAction::RespondToAgent { request_id, .. } = &action
+                {
+                    self.program_status.answered(request_id);
+                }
                 self.chat_widget.submit_harness_action(action);
             }
             AppEvent::HistoryEntryLoaded {
@@ -941,13 +1977,15 @@ impl App {
             AppEvent::GoalLoaded(None) => self.chat_widget.handle_thread_goal_cleared(),
             AppEvent::HarnessActionFailed(message) => self.chat_widget.add_error_message(message),
             AppEvent::PromptSubmitFailed(message) => {
+                if let Some(fallback) = self.fallback.take() {
+                    self.chat_widget.add_error_message(fallback.original_error);
+                }
                 self.chat_widget.on_prompt_submit_failed(message);
             }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane
                 self.chat_widget.on_diff_complete();
-                // Enter alternate screen using TUI helper and build pager lines
-                let _ = tui.enter_alt_screen();
+                // Build the pager lines on the primary screen.
                 let pager_lines: Vec<ratatui::text::Line<'static>> = if text.trim().is_empty() {
                     vec!["No changes detected.".italic().into()]
                 } else {
@@ -968,18 +2006,6 @@ impl App {
                 self.chat_widget.apply_file_search_result(query, matches);
             }
             AppEvent::SystemInfoRefreshed(info) => {
-                if !self.worktree_warning_shown
-                    && let Some(warning) = &info.worktree_cleanup_warning
-                {
-                    let free = warning.free_percent;
-                    let count = warning.worktree_count;
-                    let message = format!(
-                        "Low disk space: {free}% free. You have {count} git worktree(s) that may be consuming disk space. \
-                         Consider running `git worktree remove <path>` to clean up unused worktrees.",
-                    );
-                    self.chat_widget.add_warning_message(message);
-                    self.worktree_warning_shown = true;
-                }
                 self.chat_widget.apply_system_info_refresh(info);
             }
             AppEvent::RefreshSystemInfoForDirectory { dir, agent } => {
@@ -1139,14 +2165,11 @@ impl App {
             }
             AppEvent::FullScreenApprovalRequest(request) => {
                 let ApprovalRequest {
-                    title,
                     kind,
                     cwd,
                     snapshot,
                     ..
                 } = request;
-                let _ = tui.enter_alt_screen();
-
                 let edit_changes = if matches!(
                     kind,
                     crate::presentation::ToolKind::Create
@@ -1176,26 +2199,23 @@ impl App {
                         "P A T C H".to_string(),
                     ));
                 } else {
-                    let rel_title = client_event_format::relativize_paths_in_text(&title, &cwd);
-                    let mut lines = vec![Line::from(rel_title.clone())];
-                    if let Some(inv_text) =
-                        client_event_format::format_invocation(&snapshot.invocation)
-                    {
-                        let rel_inv =
-                            client_event_format::relativize_paths_in_text(&inv_text, &cwd);
-                        if !client_event_format::is_invocation_redundant(&rel_inv, &rel_title) {
-                            lines.push(Line::from(rel_inv));
-                        }
-                    }
-                    for text in client_event_format::format_artifacts(&snapshot.artifacts) {
-                        lines.push(Line::from(text));
-                    }
+                    let cell = client_tool_cell::ClientToolCell::new(*snapshot, cwd, false);
+                    let lines = cell
+                        .expanded_lines(tui.terminal.size().map(|size| size.width).unwrap_or(80));
                     self.overlay =
                         Some(Overlay::new_static_with_lines(lines, "T O O L".to_string()));
                 }
             }
-            AppEvent::PrepareAgentCandidate { agent_name } => {
-                self.switch_agent(tui, agent_name).await;
+            AppEvent::LoginProvider { agent_name } => {
+                self.chat_widget
+                    .handle_login_command_with_agent(&agent_name);
+            }
+            AppEvent::SelectModelRoutes {
+                routes,
+                value_name,
+                origin,
+            } => {
+                self.select_model_routes(routes, value_name, origin).await;
             }
             AppEvent::HighlightAgentCandidate {
                 agent_name,
@@ -1208,6 +2228,8 @@ impl App {
             AppEvent::DiscardWarmAgentCandidate => self.discard_warm_candidate(),
             AppEvent::CancelAgentCandidate => {
                 self.discard_candidate();
+                self.manual_model_handoff = None;
+                self.model_route_fallback = None;
                 self.chat_widget
                     .add_info_message("Agent switch cancelled.".to_string(), None);
             }
@@ -1256,18 +2278,69 @@ impl App {
                 value_name,
                 is_custom_model,
                 origin,
+                route_token,
             } => {
-                self.chat_widget.set_acp_session_config_option(
-                    config_id,
-                    value,
-                    option_name,
-                    value_name,
-                    is_custom_model,
-                    origin,
-                );
+                if self.stale_model_route_token(route_token) {
+                    return Ok(true);
+                }
+                if let crate::nori::session_config_picker::ConfigPickerOrigin::Child(key) = origin {
+                    let roster = self.chat_widget.subagent_roster(std::time::Instant::now());
+                    let target = roster.resolve(crate::subagent_switcher::Target::Subagent(key));
+                    let crate::subagent_switcher::Target::Subagent(resolved_key) = target else {
+                        return Ok(true);
+                    };
+                    if let (Some(parent), Some(session_id)) = (
+                        self.chat_widget.harness_handle(),
+                        self.chat_widget.subagent_session(resolved_key),
+                    ) {
+                        self.session_view.advance_controls_revision(resolved_key);
+                        let tx = self.app_event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = parent
+                                .set_child_config_option(
+                                    session_id,
+                                    config_id.clone(),
+                                    value.clone(),
+                                )
+                                .await;
+                            let route_fallback_eligible = result
+                                .as_ref()
+                                .err()
+                                .is_some_and(crate::app::model_routes::eligible_error);
+                            let result = result.map_err(|error| error.to_string());
+                            tx.send(AppEvent::SubagentConfigSetResult {
+                                key,
+                                result,
+                                config_id,
+                                value,
+                                route_fallback_eligible,
+                                route_token,
+                            });
+                        });
+                    } else {
+                        self.model_route_fallback = None;
+                        tui.show_toast(
+                            "Model controls are unavailable for this child session.".to_owned(),
+                        );
+                    }
+                } else {
+                    self.chat_widget.set_acp_session_config_option(
+                        config_id,
+                        value,
+                        option_name,
+                        value_name,
+                        is_custom_model,
+                        origin,
+                        route_token,
+                    );
+                }
             }
             AppEvent::CycleModel(step) => {
-                if !self.chat_widget.cycle_model(step)
+                if self.session_view.focused() != crate::subagent_switcher::Target::Main {
+                    tui.show_toast(
+                        "Model controls are unavailable for this child session.".to_owned(),
+                    );
+                } else if !self.chat_widget.cycle_model(step)
                     && self
                         .waiting_model_presses
                         .press(step, std::time::Instant::now())
@@ -1280,7 +2353,11 @@ impl App {
                 }
             }
             AppEvent::CycleEffort(step) => {
-                if !self.chat_widget.cycle_effort(step) {
+                if self.session_view.focused() != crate::subagent_switcher::Target::Main {
+                    tui.show_toast(
+                        "Effort controls are unavailable for this child session.".to_owned(),
+                    );
+                } else if !self.chat_widget.cycle_effort(step) {
                     self.chat_widget.add_info_message(
                         "The agent hasn't listed its options yet.".to_owned(),
                         None,
@@ -1293,16 +2370,39 @@ impl App {
                 config_id,
                 value,
                 option_name,
-                value_name,
+                value_name: _,
                 is_custom_model,
                 origin,
                 config_options,
                 error,
+                route_fallback_eligible,
+                route_token,
             } => {
+                if self.stale_model_route_token(route_token) {
+                    return Ok(true);
+                }
+                if self.is_model_session_route(route_token, &config_id, &value) {
+                    if !success && route_fallback_eligible && self.advance_model_route().await {
+                        return Ok(true);
+                    }
+                    self.model_route_fallback = None;
+                    self.manual_model_handoff = None;
+                    self.native_preference_in_progress = false;
+                }
                 let cycled =
                     origin == crate::nori::session_config_picker::ConfigPickerOrigin::Cycle;
                 if cycled {
-                    // The footer already shows the model; only a refusal is worth a line.
+                    if !success {
+                        tui.show_toast(format!(
+                            "Couldn't update {option_name}: {}",
+                            error.as_deref().unwrap_or("Unknown error")
+                        ));
+                    }
+                    self.chat_widget.on_model_cycle_result(if success {
+                        Ok(config_options.clone())
+                    } else {
+                        Err(error.unwrap_or_else(|| "Unknown error".to_string()))
+                    });
                     if success
                         && let Err(err) = self
                             .persist_default_model_selection(
@@ -1315,13 +2415,12 @@ impl App {
                     {
                         tracing::error!(error = %err, "failed to persist default model selection");
                     }
-                    self.chat_widget.on_model_cycle_result(if success {
-                        Ok(config_options)
-                    } else {
-                        Err(error.unwrap_or_else(|| "Unknown error".to_string()))
-                    });
                 } else if success {
-                    let saved_as_default = match self
+                    if let Some(config_options) = &config_options {
+                        self.chat_widget
+                            .sync_acp_session_config_snapshot(config_options);
+                    }
+                    if let Err(err) = self
                         .persist_default_model_selection(
                             &agent,
                             &config_id,
@@ -1330,23 +2429,7 @@ impl App {
                         )
                         .await
                     {
-                        Ok(persisted) => persisted,
-                        Err(err) => {
-                            tracing::error!(
-                                error = %err,
-                                "failed to persist default model selection"
-                            );
-                            false
-                        }
-                    };
-                    self.chat_widget.add_acp_session_config_set_message(
-                        &option_name,
-                        &value_name,
-                        saved_as_default,
-                    );
-                    if let Some(config_options) = config_options {
-                        self.chat_widget
-                            .sync_acp_session_config_snapshot(&config_options);
+                        tracing::error!(error = %err, "failed to persist default model selection");
                     }
                 } else if is_custom_model
                     && nori_harness::get_agent_config(&agent)
@@ -1357,20 +2440,13 @@ impl App {
                     // can still run it: persist it as the default and restart so
                     // it is forced through the agent's spawn-time channel.
                     if self.persist_custom_default_model(&agent, &value).await {
-                        self.chat_widget.add_info_message(
-                            format!(
-                                "Saved '{value}' as the default model for {agent} - restarting the session to apply it."
-                            ),
-                            None,
-                        );
                         self.app_event_tx.send(AppEvent::NewSession);
+                    } else {
+                        tui.show_toast("Couldn't save the model selection".to_owned());
                     }
                 } else {
                     let error_msg = error.unwrap_or_else(|| "Unknown error".to_string());
-                    self.chat_widget.add_info_message(
-                        format!("Failed to set {option_name}: {error_msg}"),
-                        None,
-                    );
+                    tui.show_toast(format!("Couldn't update {option_name}: {error_msg}"));
                 }
             }
             AppEvent::AcpSessionConfigSnapshot {
@@ -1384,7 +2460,17 @@ impl App {
                 self.chat_widget
                     .apply_acp_mode_config_snapshot(generation, mode);
             }
+            AppEvent::LoginStarted { target } => match target {
+                Some(key) => {
+                    if let Some(session) = self.chat_widget.subagent_session(key) {
+                        self.program_status.auth(Some(&session));
+                    }
+                }
+                None => self.program_status.auth(None),
+            },
+            AppEvent::LoginCancelled => self.program_status.finish_auth(),
             AppEvent::LoginComplete { success } => {
+                self.program_status.finish_auth();
                 self.chat_widget.handle_login_complete(success);
             }
             AppEvent::ExternalCliLoginOutput { data } => {
@@ -1394,6 +2480,7 @@ impl App {
                 success,
                 agent_name,
             } => {
+                self.program_status.finish_auth();
                 self.chat_widget
                     .handle_external_cli_login_complete(success, agent_name);
             }
@@ -1597,6 +2684,49 @@ impl App {
                     self.chat_widget.queue_text_as_user_message(error_context);
                 }
             },
+            AppEvent::ShowReferenceSessionPicker { sessions, target } => {
+                self.chat_widget
+                    .show_reference_session_picker(sessions, target);
+            }
+            AppEvent::ReferenceSessionPreview {
+                project_id,
+                session_id,
+                agent,
+                preview,
+            } => {
+                self.chat_widget.update_reference_session_preview(
+                    &project_id,
+                    &session_id,
+                    &agent,
+                    &preview,
+                );
+            }
+            AppEvent::LoadSessionReference {
+                project_id,
+                session_id,
+                agent,
+                target,
+            } => {
+                self.load_session_reference(project_id, session_id, agent, target);
+            }
+            AppEvent::InsertSessionReference { text, target } => {
+                let current = self.session_view.focused();
+                if target != current {
+                    self.session_view
+                        .save_draft(current, self.chat_widget.take_composer_draft());
+                    if let Some(draft) = self.session_view.take_draft(target) {
+                        self.chat_widget.restore_composer_draft(draft);
+                    }
+                }
+                self.chat_widget.insert_str(&text);
+                if target != current {
+                    self.session_view
+                        .save_draft(target, self.chat_widget.take_composer_draft());
+                    if let Some(draft) = self.session_view.take_draft(current) {
+                        self.chat_widget.restore_composer_draft(draft);
+                    }
+                }
+            }
             AppEvent::ShowViewonlySessionPicker {
                 sessions,
                 nori_home,
@@ -1833,6 +2963,7 @@ impl App {
                         agent_name,
                         widget: Box::new(widget),
                         activation_error: None,
+                        activation_route_eligible: false,
                     });
                     tui.frame_requester().schedule_frame();
                     return Ok(true);
@@ -1951,6 +3082,54 @@ impl App {
                 }
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::SendSubagentMessage {
+                key,
+                text,
+                image_paths,
+                steer,
+            } => {
+                if let Some(session_id) = self.chat_widget.subagent_session(key) {
+                    self.chat_widget.submit_harness_action(
+                        crate::app_event::HarnessAction::SendSubagentMessage {
+                            key,
+                            session_id,
+                            text,
+                            image_paths,
+                            steer,
+                        },
+                    );
+                } else {
+                    self.restore_subagent_draft(tui, key, &text, image_paths);
+                    tui.show_toast(
+                        "This subagent has no session available for follow-up.".to_owned(),
+                    );
+                }
+            }
+            AppEvent::SubagentMessageFailed {
+                key,
+                text,
+                image_paths,
+                error,
+            } => {
+                self.restore_subagent_draft(tui, key, &text, image_paths);
+                tui.show_toast(error);
+            }
+            AppEvent::TransientNotice(message) => tui.show_toast(message),
+            AppEvent::ChildSessionOutput { key, text } => {
+                let roster = self.chat_widget.subagent_roster(std::time::Instant::now());
+                let crate::subagent_switcher::Target::Subagent(key) =
+                    roster.resolve(crate::subagent_switcher::Target::Subagent(key))
+                else {
+                    unreachable!("child target remains a child")
+                };
+                self.session_view.append_child_output(key, &text);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ForkResponseSubagent { context, source } => {
+                self.chat_widget.submit_harness_action(
+                    crate::app_event::HarnessAction::ForkHistory { context, source },
+                );
+            }
             AppEvent::BranchFromCurrent => {
                 self.chat_widget
                     .submit_harness_action(crate::app_event::HarnessAction::Branch);
@@ -2005,6 +3184,7 @@ impl App {
                 client_id,
                 client_secret_env_var,
             } => {
+                self.program_status.auth(None);
                 self.perform_mcp_oauth_login(
                     tui,
                     server_name,
@@ -2017,6 +3197,7 @@ impl App {
                 .await;
             }
             AppEvent::McpOAuthLoginCancel { server_name } => {
+                self.program_status.finish_auth();
                 tracing::info!("MCP OAuth login cancelled for {server_name}");
                 self.cancel_mcp_oauth_login();
                 self.chat_widget.add_info_message(
@@ -2029,6 +3210,7 @@ impl App {
                 success,
                 error,
             } => {
+                self.program_status.finish_auth();
                 if success {
                     self.chat_widget.add_info_message(
                         format!(
@@ -2097,12 +3279,46 @@ impl App {
         use crate::nori::hotkey_match::matches_binding;
         use nori_config::HotkeyAction;
 
+        if let Some(pending) = self.backtrack.pending_child_focus.as_mut() {
+            if self.session_view.focused()
+                != crate::subagent_switcher::Target::Subagent(pending.key)
+                || pending.generation != self.chat_widget.session_generation()
+                || self.chat_widget.subagent_session(pending.key).as_ref()
+                    != Some(&pending.session_id)
+            {
+                self.backtrack.pending_child_focus = None;
+            } else if key_event.kind == KeyEventKind::Press {
+                match (key_event.code, key_event.modifiers) {
+                    (KeyCode::Esc, _) => {
+                        self.backtrack.pending_child_focus = None;
+                        return;
+                    }
+                    (KeyCode::Char('h' | 'l'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char(' '), KeyModifiers::NONE)
+                    | (KeyCode::Enter, KeyModifiers::NONE) => {
+                        pending.keys.push(key_event);
+                        return;
+                    }
+                    _ => self.backtrack.pending_child_focus = None,
+                }
+            }
+        }
+        if !self.chat_widget.has_active_overlay_or_popup()
+            && self.handle_response_focus(tui, key_event)
+        {
+            return;
+        }
         // Check configurable hotkeys first (before the structural match),
         // but only when no popup/view is active — otherwise the popup should
         // capture the key (e.g. the hotkey picker in rebinding mode).
         if key_event.kind == KeyEventKind::Press && !self.chat_widget.has_active_popup() {
             let transcript_binding = self.hotkey_config.binding_for(HotkeyAction::OpenTranscript);
             if matches_binding(transcript_binding, &key_event) {
+                if let crate::subagent_switcher::Target::Subagent(key) = self.session_view.focused()
+                {
+                    self.request_child_history(tui, key, false);
+                    return;
+                }
                 self.open_transcript_overlay(tui);
                 return;
             }
@@ -2137,6 +3353,22 @@ impl App {
             }
         }
 
+        if key_event.kind == KeyEventKind::Press
+            && key_event.modifiers == KeyModifiers::CONTROL
+            && matches!(key_event.code, KeyCode::Char('h' | 'l'))
+            && !self.chat_widget.has_active_overlay_or_popup()
+        {
+            if key_event.code == KeyCode::Char('l') {
+                return;
+            }
+            if let crate::subagent_switcher::Target::Subagent(key) = self.session_view.focused() {
+                self.request_child_history(tui, key, true);
+                return;
+            }
+            self.begin_response_focus(tui, self.transcript_cells.clone());
+            return;
+        }
+
         match key_event {
             // Esc primes/advances backtracking only in normal (not working) mode
             // with the composer focused and empty. In any other state, forward
@@ -2147,16 +3379,66 @@ impl App {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             } => {
-                if self.should_handle_backtrack_esc(key_event)
-                    && self.chat_widget.subagents_stoppable()
-                {
-                    // Work still running comes before editing what was said.
-                    self.reset_backtrack_state();
-                    self.chat_widget.stop_background_subagents();
-                } else if self.should_handle_backtrack_esc(key_event) {
-                    self.handle_backtrack_esc_key(tui);
-                } else {
+                if self.chat_widget.has_active_overlay_or_popup() {
                     self.chat_widget.handle_key_event(key_event);
+                } else if self.session_view.tool_detail() {
+                    self.session_view.close_tool_detail();
+                    if !self.deferred_history_lines.is_empty() {
+                        tui.insert_history_lines(std::mem::take(&mut self.deferred_history_lines));
+                    }
+                    tui.frame_requester().schedule_frame();
+                } else {
+                    match self.session_view.focused() {
+                        crate::subagent_switcher::Target::Main
+                            if self.chat_widget.is_task_running() =>
+                        {
+                            self.chat_widget
+                                .submit_harness_action(crate::app_event::HarnessAction::Cancel);
+                        }
+                        crate::subagent_switcher::Target::Subagent(key) => {
+                            let roster =
+                                self.chat_widget.subagent_roster(std::time::Instant::now());
+                            let running = roster
+                                .entry(crate::subagent_switcher::Target::Subagent(key))
+                                .is_some_and(|entry| {
+                                    entry.status == crate::subagent_switcher::Status::Running
+                                });
+                            if running {
+                                if let (Some(handle), Some(session_id)) = (
+                                    self.chat_widget.harness_handle(),
+                                    self.chat_widget.subagent_session(key),
+                                ) {
+                                    let tx = self.app_event_tx.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(error) = handle.cancel_subagent(session_id).await
+                                        {
+                                            tx.send(AppEvent::TransientNotice(error.to_string()));
+                                        }
+                                    });
+                                } else {
+                                    tui.show_toast(
+                                        "This child has no session available to stop.".to_owned(),
+                                    );
+                                }
+                            } else if self.chat_widget.composer_cursor_style()
+                                == crossterm::cursor::SetCursorStyle::SteadyBar
+                            {
+                                self.chat_widget.handle_key_event(key_event);
+                            } else {
+                                let target = self
+                                    .chat_widget
+                                    .subagent_parent(key)
+                                    .map(crate::subagent_switcher::Target::Subagent)
+                                    .map(|target| roster.resolve(target))
+                                    .filter(|target| roster.entry(*target).is_some())
+                                    .unwrap_or(crate::subagent_switcher::Target::Main);
+                                self.focus_session_view(tui, target);
+                            }
+                        }
+                        crate::subagent_switcher::Target::Main => {
+                            self.chat_widget.handle_key_event(key_event)
+                        }
+                    }
                 }
             }
             // Enter confirms backtrack when primed + count > 0. Otherwise pass to widget.
@@ -2237,6 +3519,24 @@ mod tests {
     use super::CandidateActivationEvent;
     use super::classify_candidate_activation_event;
     use super::reattach_info_message;
+
+    #[test]
+    fn candidate_model_must_still_be_advertised_by_the_activated_agent() {
+        use nori_protocol::acp::v1 as acp;
+        use pretty_assertions::assert_eq;
+        let option = acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            "first",
+            vec![acp::SessionConfigSelectOption::new("first", "First")],
+        )
+        .category(acp::SessionConfigOptionCategory::Model);
+        assert_eq!(
+            super::candidate_model_config(std::slice::from_ref(&option), "first"),
+            Some("model".to_string())
+        );
+        assert_eq!(super::candidate_model_config(&[option], "stale"), None);
+    }
 
     #[test]
     fn cloud_reattach_info_message_snapshot() {

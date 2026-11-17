@@ -2,11 +2,12 @@
 //!
 //! This module handles authentication flows for ACP agents:
 //! - OAuth browser flow (Codex)
-//! - External CLI passthrough (Gemini, Claude Code)
+//! - External CLI passthrough (Gemini, Claude Code, OpenCode)
 
 use codex_login::ShutdownHandle;
 use nori_harness::AgentKind;
 use nori_harness::list_available_agents;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// Method used for authentication
@@ -50,8 +51,6 @@ pub enum AgentLoginSupport {
         is_installed: bool,
         login_method: LoginMethod,
     },
-    /// Agent doesn't support in-app login yet
-    NotSupported { agent_name: String },
     /// Unknown agent
     Unknown { agent_name: String },
 }
@@ -67,6 +66,8 @@ pub struct LoginHandler {
     shutdown_handle: Option<ShutdownHandle>,
     /// Task handle for cancelling external CLI PTY process
     pty_task_handle: Option<JoinHandle<()>>,
+    /// Input channel for the active external CLI PTY process
+    pty_input_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl LoginHandler {
@@ -76,6 +77,7 @@ impl LoginHandler {
             state: LoginFlowState::Idle,
             shutdown_handle: None,
             pty_task_handle: None,
+            pty_input_tx: None,
         }
     }
 
@@ -107,9 +109,25 @@ impl LoginHandler {
                             args: vec!["login".to_string()],
                         },
                     },
-                    // Other agents don't support in-app login yet
-                    other => AgentLoginSupport::NotSupported {
-                        agent_name: other.display_name().to_string(),
+                    AgentKind::ClaudeCode => AgentLoginSupport::Supported {
+                        agent: AgentKind::ClaudeCode,
+                        is_installed: info.is_installed,
+                        login_method: LoginMethod::ExternalCli {
+                            command: "claude".to_string(),
+                            args: vec![
+                                "auth".to_string(),
+                                "login".to_string(),
+                                "--claudeai".to_string(),
+                            ],
+                        },
+                    },
+                    AgentKind::OpenCode => AgentLoginSupport::Supported {
+                        agent: AgentKind::OpenCode,
+                        is_installed: info.is_installed,
+                        login_method: LoginMethod::ExternalCli {
+                            command: "opencode".to_string(),
+                            args: vec!["auth".to_string(), "login".to_string()],
+                        },
                     },
                 }
             }
@@ -139,6 +157,31 @@ impl LoginHandler {
         self.pty_task_handle = Some(handle);
     }
 
+    /// Set the input channel for the external CLI PTY process.
+    pub fn set_pty_input_sender(&mut self, sender: mpsc::Sender<Vec<u8>>) {
+        self.pty_input_tx = Some(sender);
+    }
+
+    /// Whether this handler currently owns an external CLI login process.
+    pub fn has_external_cli_task(&self) -> bool {
+        self.pty_task_handle.is_some()
+    }
+
+    /// Forward terminal input to the external CLI when a login process is active.
+    pub fn send_pty_input(&self, bytes: Vec<u8>) -> bool {
+        let Some(sender) = &self.pty_input_tx else {
+            return false;
+        };
+        match sender.try_send(bytes) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("external CLI login input queue is full; dropping input");
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
     /// OAuth login completed successfully
     pub fn oauth_complete(&mut self) {
         self.state = LoginFlowState::Success;
@@ -154,6 +197,7 @@ impl LoginHandler {
         if let Some(handle) = self.pty_task_handle.take() {
             handle.abort();
         }
+        self.pty_input_tx = None;
         self.state = LoginFlowState::Cancelled;
     }
 }
@@ -186,16 +230,30 @@ mod tests {
     }
 
     #[test]
-    fn check_agent_support_returns_not_supported_for_claude() {
-        // Claude Code login support will be added later
+    fn check_agent_support_returns_supported_for_claude_cli_login() {
         let support = LoginHandler::check_agent_support("claude-code");
 
-        match support {
-            AgentLoginSupport::NotSupported { agent_name } => {
-                assert_eq!(agent_name, "Claude Code");
+        let AgentLoginSupport::Supported {
+            agent,
+            login_method,
+            ..
+        } = support
+        else {
+            panic!("Expected in-app CLI login support for claude-code");
+        };
+
+        assert_eq!(agent, AgentKind::ClaudeCode);
+        assert_eq!(
+            login_method,
+            LoginMethod::ExternalCli {
+                command: "claude".to_string(),
+                args: vec![
+                    "auth".to_string(),
+                    "login".to_string(),
+                    "--claudeai".to_string()
+                ],
             }
-            _ => panic!("Expected NotSupported variant for claude-code"),
-        }
+        );
     }
 
     #[test]

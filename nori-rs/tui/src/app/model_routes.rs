@@ -1,0 +1,243 @@
+//! Try equivalent model routes in order when authentication or quota rejects one.
+use std::collections::VecDeque;
+
+use super::App;
+use crate::app_event::AppEvent;
+use crate::nori::session_config_picker::ConfigPickerOrigin;
+use crate::nori::unified_model_picker::ModelRoute;
+
+pub(super) struct ModelRouteFallback {
+    remaining: VecDeque<ModelRoute>,
+    current: ModelRoute,
+    name: String,
+    origin: ConfigPickerOrigin,
+    token: i64,
+}
+
+impl ModelRouteFallback {
+    fn advance(&mut self) -> bool {
+        let Some(next) = self.remaining.pop_front() else {
+            return false;
+        };
+        self.current = next;
+        true
+    }
+}
+
+pub(crate) fn eligible_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<nori_protocol::acp::v1::Error>()
+            .is_some_and(|error| matches!(i32::from(error.code), -32000 | -32010))
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            || cause.is::<super::session_setup::AgentPreparationTimeout>()
+    }) || nori_acp_host::is_subscription_exhausted(error)
+}
+
+pub(super) fn eligible_acp_error(error: &nori_protocol::acp::v1::Error) -> bool {
+    serde_json::to_value(error)
+        .ok()
+        .and_then(|value| serde_json::from_value::<nori_protocol::acp::v1::Error>(value).ok())
+        .is_some_and(|error| eligible_error(&anyhow::Error::new(error)))
+}
+
+impl App {
+    pub(super) async fn prefer_native_current_model(&mut self) {
+        if !self.native_preference_session_ready
+            || self.native_preference_waiting_for_prompt
+            || self.chat_widget.is_task_running()
+            || self.fallback.is_some()
+            || self.manual_model_handoff.is_some()
+            || self.model_route_fallback.is_some()
+            || self.candidate_agent.is_some()
+        {
+            return;
+        }
+        let Some(journal) = self.active_transcript_id.clone() else {
+            return;
+        };
+        if self.native_preference_attempted.contains(&journal) {
+            return;
+        }
+        let options = self.chat_widget.agent_config().raw_options();
+        let Some(option) = options.iter().find(|option| {
+            option.category == Some(nori_protocol::acp::v1::SessionConfigOptionCategory::Model)
+        }) else {
+            return;
+        };
+        let Some((name, routes)) = crate::nori::unified_model_picker::preferred_current_routes(
+            &self.config.nori_home,
+            &self.config.active_agent,
+            option,
+        ) else {
+            return;
+        };
+        self.native_preference_attempted.insert(journal);
+        self.select_model_routes(routes, name, ConfigPickerOrigin::Direct)
+            .await;
+        self.native_preference_in_progress = self.model_route_fallback.is_some();
+    }
+
+    pub(super) fn stale_model_route_token(&self, token: Option<i64>) -> bool {
+        token.is_some_and(|token| {
+            self.model_route_fallback
+                .as_ref()
+                .is_none_or(|route| route.token != token)
+        })
+    }
+
+    pub(super) async fn select_model_routes(
+        &mut self,
+        mut routes: Vec<ModelRoute>,
+        name: String,
+        origin: ConfigPickerOrigin,
+    ) {
+        self.native_preference_in_progress = false;
+        if self.model_route_fallback.is_some() || self.manual_model_handoff.is_some() {
+            self.discard_candidate();
+        }
+        self.manual_model_handoff = None;
+        if origin == ConfigPickerOrigin::Direct {
+            routes.retain(|route| {
+                let agent = match route {
+                    ModelRoute::Session { agent_name, .. }
+                    | ModelRoute::Agent { agent_name, .. } => agent_name,
+                };
+                !self.exhausted_providers.contains(agent)
+                    || matches!(route, ModelRoute::Session { .. }) && agent == "opencode"
+            });
+            if routes.is_empty() {
+                self.model_route_fallback = None;
+                self.app_event_tx.send(AppEvent::ShowToast(
+                    "No available route for this model".to_owned(),
+                ));
+                return;
+            }
+        }
+        if origin == ConfigPickerOrigin::Direct {
+            self.selected_model_routes = routes.clone();
+        }
+        let mut remaining = VecDeque::from(routes);
+        let Some(current) = remaining.pop_front() else {
+            return;
+        };
+        self.next_model_route_token = self.next_model_route_token.saturating_add(1);
+        self.model_route_fallback = Some(ModelRouteFallback {
+            remaining,
+            current,
+            name,
+            origin,
+            token: self.next_model_route_token,
+        });
+        self.apply_model_route().await;
+    }
+
+    async fn apply_model_route(&mut self) {
+        let Some(fallback) = self.model_route_fallback.as_ref() else {
+            return;
+        };
+        match &fallback.current {
+            ModelRoute::Session {
+                config_id,
+                value,
+                option_name,
+                ..
+            } => {
+                self.app_event_tx.send(AppEvent::SetAcpSessionConfigOption {
+                    config_id: config_id.clone(),
+                    value: value.clone(),
+                    option_name: option_name.clone(),
+                    value_name: fallback.name.clone(),
+                    is_custom_model: false,
+                    origin: fallback.origin,
+                    route_token: Some(fallback.token),
+                });
+            }
+            ModelRoute::Agent {
+                agent_name,
+                display_name,
+                model,
+            } => {
+                let (agent, display, model) =
+                    (agent_name.clone(), display_name.clone(), model.clone());
+                self.select_agent_model(agent, display, model).await;
+            }
+        }
+    }
+
+    pub(super) async fn advance_model_route(&mut self) -> bool {
+        let Some(fallback) = self.model_route_fallback.as_mut() else {
+            return false;
+        };
+        if !fallback.advance() {
+            self.model_route_fallback = None;
+            return false;
+        }
+        self.apply_model_route().await;
+        true
+    }
+
+    pub(super) fn is_model_session_route(
+        &self,
+        token: Option<i64>,
+        config_id: &str,
+        value: &str,
+    ) -> bool {
+        self.model_route_fallback.as_ref().is_some_and(|route| token == Some(route.token) && route.origin == ConfigPickerOrigin::Direct && matches!(&route.current, ModelRoute::Session { config_id: id, value: selected, .. } if id == config_id && selected == value))
+    }
+
+    pub(super) fn is_model_child_route(
+        &self,
+        token: Option<i64>,
+        key: crate::subagent_switcher::SubagentKey,
+        config_id: &str,
+        value: &str,
+    ) -> bool {
+        self.model_route_fallback.as_ref().is_some_and(|route| token == Some(route.token) && route.origin == ConfigPickerOrigin::Child(key) && matches!(&route.current, ModelRoute::Session { config_id: id, value: selected, .. } if id == config_id && selected == value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn route_retry_preserves_same_model_choice() {
+        let first = ModelRoute::Agent {
+            agent_name: "a".into(),
+            display_name: "A".into(),
+            model: "gpt-6.1-terra".into(),
+        };
+        let second = ModelRoute::Agent {
+            agent_name: "b".into(),
+            display_name: "B".into(),
+            model: "gateway/gpt-6.1-terra".into(),
+        };
+        let mut fallback = ModelRouteFallback {
+            remaining: VecDeque::from([second.clone()]),
+            current: first,
+            name: "GPT 6.1 Terra".into(),
+            origin: ConfigPickerOrigin::Direct,
+            token: 1,
+        };
+        assert!(fallback.advance());
+        assert_eq!(fallback.current, second);
+        assert_eq!(fallback.name, "GPT 6.1 Terra");
+        assert!(!fallback.advance());
+    }
+
+    #[test]
+    fn only_structured_auth_and_exhaustion_errors_trigger_route_retry() {
+        let auth = anyhow::Error::new(nori_protocol::acp::v1::Error::auth_required());
+        assert!(eligible_error(&auth));
+        let quota = anyhow::Error::new(
+            nori_protocol::acp::v1::Error::internal_error()
+                .data(serde_json::json!({"code":"insufficient_quota"})),
+        );
+        assert!(eligible_error(&quota));
+        assert!(!eligible_error(&anyhow::anyhow!("quota or auth failed")));
+    }
+}

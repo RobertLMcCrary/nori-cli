@@ -28,6 +28,7 @@ use sacp::schema::PromptCapabilities;
 use sacp::schema::PromptRequest;
 use sacp::schema::PromptResponse;
 use sacp::schema::SessionId;
+use sacp::schema::SessionInfoUpdate;
 use sacp::schema::SessionMode;
 use sacp::schema::SessionModeId;
 use sacp::schema::SessionModeState;
@@ -185,7 +186,11 @@ pub async fn handle_new_session(
     // A plain new session takes one whose CLI is already running, if one fits; then the next is
     // started for whoever comes after.
     let key = warm::WarmKey::new(&cwd, config, &tools);
-    let plain = meta.as_ref().is_none_or(NewSessionMeta::is_plain);
+    let plain = meta.as_ref().is_none_or(NewSessionMeta::is_plain)
+        && tools
+            .host_tools
+            .as_ref()
+            .is_none_or(|tools| tools.matches_prewarm_catalog());
     let session = match plain.then(|| warm::claim(&key)).flatten() {
         Some(session) => {
             session.adopt_tools(&tools);
@@ -712,6 +717,7 @@ pub async fn handle_prompt(
 
     // Track last ResultMessage for determining stop reason
     let mut last_result: Option<claude_code_agent_sdk::ResultMessage> = None;
+    let mut usage_limit_error: Option<serde_json::Value> = None;
 
     // Process streaming responses
     let stream_start = Instant::now();
@@ -772,6 +778,18 @@ pub async fn handle_prompt(
                 elapsed_ms = elapsed.as_millis(),
                 "Prompt cancelled by user"
             );
+
+            // A replacement prompt cancels this token. Stop the in-flight CLI
+            // query and drain its response stream before allowing the next
+            // prompt to use this session.
+            interrupt_drain_and_flush(
+                session_id,
+                &request_id,
+                &mut stream,
+                || client.interrupt(),
+                || flush::ensure_notifications_flushed(&connection_cx, notification_count),
+            )
+            .await;
             session.clear_converter_request_id().await;
             session.clear_converter_cache().await;
             return Ok(PromptResponse::new(StopReason::Cancelled));
@@ -808,6 +826,11 @@ pub async fn handle_prompt(
                     last_result = Some(result.clone());
                 }
 
+                if let claude_code_agent_sdk::Message::RateLimitEvent(ref event) = message {
+                    usage_limit_error =
+                        usage_limit_error.or_else(|| subscription_usage_limit_error_data(event));
+                }
+
                 // Convert SDK message to ACP notifications. A cancelled turn
                 // ends with an error result that the user already knows about,
                 // so it must not surface as an error message in the transcript.
@@ -815,6 +838,13 @@ pub async fn handle_prompt(
                     && matches!(&message, claude_code_agent_sdk::Message::Result(r) if r.is_error);
                 let notifications = if cancelled_result {
                     Vec::new()
+                } else if let claude_code_agent_sdk::Message::RateLimitEvent(ref event) = message {
+                    vec![SessionNotification::new(
+                        SessionId::new(session_id.to_string()),
+                        SessionUpdate::SessionInfoUpdate(
+                            SessionInfoUpdate::new().meta(claude_rate_limit_meta(event)),
+                        ),
+                    )]
                 } else {
                     let converter = session.converter().await;
                     converter.convert_message(&message, session_id)
@@ -851,8 +881,27 @@ pub async fn handle_prompt(
                 break;
             }
             Ok(Some(Err(e))) if e.to_string().contains("unknown variant") => {
-                // The CLI added a message type this SDK does not know yet (for
-                // example `rate_limit_event`). Skipping it is safe.
+                // Preserve the raw payload even when a future CLI message type
+                // is not known to this SDK version.
+                if let claude_code_agent_sdk::ClaudeError::MessageParse(parse_error) = &e
+                    && let Some(raw_event) = parse_error.data.clone()
+                {
+                    let meta =
+                        serde_json::Map::from_iter([("_claude/rawEvent".to_string(), raw_event)]);
+                    let notification = SessionNotification::new(
+                        SessionId::new(session_id.to_string()),
+                        SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(meta)),
+                    );
+                    notification_count += 1;
+                    if let Err(error) = send_notification(&connection_cx, notification) {
+                        error_count += 1;
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %error,
+                            "Failed to preserve unknown Claude event metadata"
+                        );
+                    }
+                }
                 tracing::warn!(
                     session_id = %session_id,
                     error = %e,
@@ -929,6 +978,12 @@ pub async fn handle_prompt(
     if cancel_token.is_cancelled() {
         tracing::info!(session_id = %session_id, "Returning Cancelled stop reason");
         return Ok(PromptResponse::new(StopReason::Cancelled));
+    }
+
+    if !session.is_user_cancelled()
+        && let Some(data) = usage_limit_error
+    {
+        return Err(AgentError::UsageLimitExceeded { data });
     }
 
     tracing::debug!(session_id = %session_id, "Determining stop reason");
@@ -1017,6 +1072,41 @@ pub async fn handle_prompt(
     Err(AgentError::Internal(
         "Session did not end in result".to_string(),
     ))
+}
+
+/// Build structured quota metadata only for an explicit rejection of a known
+/// subscription usage window. Generic `rate_limit_error` events remain transient.
+fn subscription_usage_limit_error_data(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let info = event.get("rate_limit_info")?;
+    let status = info.get("status")?.as_str()?;
+    let window = info.get("rateLimitType")?.as_str()?;
+    if status != "rejected"
+        || !matches!(
+            window,
+            "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet"
+        )
+    {
+        return None;
+    }
+
+    Some(serde_json::json!({
+        "error": {"code": "usage_limit_exceeded"},
+        "provider": "anthropic",
+        "rate_limit_info": info,
+    }))
+}
+
+/// Preserve the raw Claude rate-limit event in ACP session metadata so clients
+/// and session journals can retain fields this adapter does not interpret.
+fn claude_rate_limit_meta(event: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut event = event.clone();
+    if let serde_json::Value::Object(fields) = &mut event {
+        fields.insert(
+            "type".to_string(),
+            serde_json::Value::String("rate_limit_event".into()),
+        );
+    }
+    serde_json::Map::from_iter([("_claude/rateLimit".to_string(), event)])
 }
 
 /// Send a notification via the connection context
@@ -1399,6 +1489,41 @@ async fn drain_messages_synchronously(
             }
         }
     }
+}
+
+async fn interrupt_drain_and_flush<F, Fut, E, Q, QFut>(
+    session_id: &str,
+    request_id: &str,
+    stream: &mut Pin<
+        Box<
+            dyn Stream<
+                    Item = Result<
+                        claude_code_agent_sdk::Message,
+                        claude_code_agent_sdk::ClaudeError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    >,
+    interrupt: F,
+    flush_notifications: Q,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+    Q: FnOnce() -> QFut,
+    QFut: std::future::Future<Output = ()>,
+{
+    if let Err(error) = interrupt().await {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %error,
+            "Failed to interrupt Claude CLI after prompt cancellation"
+        );
+    }
+
+    drain_messages_synchronously(session_id, request_id, stream).await;
+    flush_notifications().await;
 }
 
 // ============================================================================
@@ -1878,6 +2003,63 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn rejected_subscription_window_preserves_explicit_quota_error_data() {
+        let event = serde_json::json!({
+            "rate_limit_info": {
+                "status": "rejected",
+                "rateLimitType": "five_hour",
+                "resetsAt": 1_800_000_000
+            },
+            "uuid": "evt-1"
+        });
+
+        let data = subscription_usage_limit_error_data(&event).unwrap();
+        let error = AgentError::UsageLimitExceeded { data };
+        let acp_error = error.to_acp_error();
+
+        assert_eq!(
+            acp_error.data,
+            Some(serde_json::json!({
+                "error": {"code": "usage_limit_exceeded"},
+                "provider": "anthropic",
+                "rate_limit_info": event["rate_limit_info"]
+            }))
+        );
+    }
+
+    #[test]
+    fn generic_or_transient_rate_limits_do_not_become_subscription_quota_errors() {
+        for event in [
+            serde_json::json!({
+                "rate_limit_info": {"status": "allowed_warning", "rateLimitType": "five_hour"}
+            }),
+            serde_json::json!({
+                "rate_limit_info": {"status": "rejected", "rateLimitType": "overage"}
+            }),
+            serde_json::json!({"error": {"type": "rate_limit_error"}}),
+        ] {
+            assert_eq!(subscription_usage_limit_error_data(&event), None);
+        }
+    }
+
+    #[test]
+    fn rate_limit_event_metadata_keeps_uninterpreted_vendor_fields() {
+        let event = serde_json::json!({
+            "rate_limit_info": {"status": "allowed", "futureField": "kept"},
+            "uuid": "evt-2"
+        });
+
+        assert_eq!(
+            claude_rate_limit_meta(&event)["_claude/rateLimit"],
+            serde_json::json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": "allowed", "futureField": "kept"},
+                "uuid": "evt-2"
+            })
+        );
+    }
+
+    #[test]
     fn test_handle_initialize() {
         let request = InitializeRequest::new(ProtocolVersion::LATEST);
         let config = AgentConfig::from_env();
@@ -1974,6 +2156,42 @@ mod tests {
         drain_messages_synchronously(session_id, request_id, &mut stream).await;
 
         // Successful completion means it handled the empty stream correctly
+    }
+
+    #[tokio::test]
+    async fn cancelled_replacement_interrupts_drains_then_flushes() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain_events = events.clone();
+        let mut stream: Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            claude_code_agent_sdk::Message,
+                            claude_code_agent_sdk::ClaudeError,
+                        >,
+                    > + Send,
+            >,
+        > = Box::pin(stream::poll_fn(move |_| {
+            drain_events.lock().unwrap().push("drain");
+            std::task::Poll::Ready(None)
+        }));
+
+        interrupt_drain_and_flush(
+            "session",
+            "request",
+            &mut stream,
+            || {
+                events.lock().unwrap().push("interrupt");
+                async { Ok::<(), std::io::Error>(()) }
+            },
+            || {
+                events.lock().unwrap().push("flush");
+                async {}
+            },
+        )
+        .await;
+
+        assert_eq!(*events.lock().unwrap(), ["interrupt", "drain", "flush"]);
     }
 
     /// Test that drain_messages_synchronously respects the maximum timeout

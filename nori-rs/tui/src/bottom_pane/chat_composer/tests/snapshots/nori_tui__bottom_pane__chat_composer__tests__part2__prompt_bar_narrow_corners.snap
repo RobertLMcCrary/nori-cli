@@ -1,0 +1,6 @@
+---
+source: tui/src/bottom_pane/chat_composer/tests/part2.rs
+assertion_line: 662
+expression: row
+---
+ ⎇ long-branch  [ Plan ]

@@ -7,6 +7,7 @@
 //! This drives the real `nori` binary against the mock agent and verifies the
 //! agent's sessions show up in the picker and can be resumed.
 
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 use tui_pty_e2e::Key;
 use tui_pty_e2e::SessionConfig;
@@ -58,4 +59,67 @@ fn resume_picker_lists_agent_sessions_when_session_list_supported() {
     session
         .wait_for_text("Resuming session with", Duration::from_secs(5))
         .expect("Selecting a listed session should resume it over ACP");
+}
+
+#[test]
+fn resumed_session_keeps_modal_editor_cursor_and_git_branch() {
+    let config = SessionConfig::new()
+        .with_agent("mock-model".to_owned())
+        .with_agent_env("MOCK_AGENT_SUPPORT_SESSION_LIST", "1")
+        .with_agent_env("MOCK_AGENT_SUPPORT_LOAD_SESSION", "1")
+        .with_agent_env(
+            "MOCK_AGENT_MODEL_DISPLAY",
+            "Long resumed model display name",
+        );
+    let mut session = TuiSession::spawn_with_config(30, 64, config).expect("spawn TUI");
+    session
+        .wait_for_text("INSERT", TIMEOUT)
+        .expect("initial insert mode");
+    session
+        .wait_for_text("master", TIMEOUT)
+        .expect("initial git branch");
+    std::thread::sleep(TIMEOUT_INPUT);
+    session.submit_input("/resume").expect("open resume picker");
+    session
+        .wait_for_text("First mock session", TIMEOUT)
+        .expect("saved session listed");
+    session.send_key(Key::Down).expect("select saved session");
+    session.send_key(Key::Enter).expect("resume saved session");
+    session
+        .wait_for_text("Resuming session with", TIMEOUT)
+        .expect("resume starts");
+    session
+        .wait_for_text("INSERT", TIMEOUT)
+        .expect("insert mode after resume");
+    session
+        .wait_for_text("master", TIMEOUT)
+        .expect("git branch after resume");
+    session.start_output_capture();
+    session
+        .type_input("draft")
+        .expect("type into resumed session");
+    session
+        .wait_for_text("draft", TIMEOUT)
+        .expect("draft visible");
+    assert!(
+        session
+            .output_bytes()
+            .expect("captured output")
+            .windows(5)
+            .any(|bytes| bytes == b"\x1b[6 q"),
+        "resumed insert mode uses a bar cursor"
+    );
+    session.start_output_capture();
+    session.send_key(Key::Escape).expect("enter normal mode");
+    session
+        .wait_for_text("NORMAL", TIMEOUT)
+        .expect("normal mode after resume");
+    assert!(
+        session
+            .output_bytes()
+            .expect("captured output")
+            .windows(5)
+            .any(|bytes| bytes == b"\x1b[2 q"),
+        "resumed normal mode uses a block cursor"
+    );
 }

@@ -100,6 +100,7 @@ impl AcpBackend {
     /// Hand the parent agent the results it is owed, in a hidden turn, if it is idle. A busy
     /// parent gets them when its turn ends.
     pub(in crate::backend) async fn deliver_task_results_if_idle(&self) {
+        let _admission = self.orchestrator.rewind_admission().await;
         let busy = self.session_driver.lock().await.prompt_is_busy();
         if busy
             || self
@@ -117,7 +118,7 @@ impl AcpBackend {
                 NoriEvent::TaskResultsDelivered(wake.delivered),
             )))
             .await;
-        let _ = self
+        if self
             .session_event_tx
             .send(SessionRuntimeInput::Reducer(
                 session_reducer::InboundEvent::PromptSubmit(QueuedPrompt {
@@ -132,6 +133,18 @@ impl AcpBackend {
                     display_text: None,
                 }),
             ))
-            .await;
+            .await
+            .is_ok()
+        {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            if self
+                .session_event_tx
+                .send(SessionRuntimeInput::Barrier { response_tx })
+                .await
+                .is_ok()
+            {
+                let _ = response_rx.await;
+            }
+        }
     }
 }

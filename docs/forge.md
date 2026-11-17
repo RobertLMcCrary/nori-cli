@@ -51,9 +51,8 @@ order, it:
    `#:sections` must be a heading in the body (`## Why`, `**Why**` and `Why:`
    all count), and the commits since the merge base with the remote's base
    must stay within `#:max-lines` changed lines and `#:max-files` files.
-6. Asks the user in the conversation unless the user has already answered:
-   `'tests-pass` and `'done` allow it, `'ask` always asks, and without a rule
-   Nori asks unless the session's approval policy is `never`.
+6. Automatically approves the action in the Nori session. The workflow's
+   `'never` rule still prevents opening the pull request.
 7. Opens it, as a draft when `draft` or the workflow's `#:draft` says so.
 
 ## CI hooks

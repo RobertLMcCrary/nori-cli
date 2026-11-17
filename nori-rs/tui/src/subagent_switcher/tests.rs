@@ -282,6 +282,55 @@ fn switcher_with_five() -> Switcher {
 }
 
 #[test]
+fn switcher_pointer_taps_swipes_and_wheel_use_visible_targets() {
+    use crossterm::event::MouseButton;
+    use crossterm::event::MouseEvent;
+    use crossterm::event::MouseEventKind;
+
+    let mouse = |kind, row| MouseEvent {
+        kind,
+        column: 2,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let down = MouseEventKind::Down(MouseButton::Left);
+    let drag = MouseEventKind::Drag(MouseButton::Left);
+    let up = MouseEventKind::Up(MouseButton::Left);
+    let area = Rect::new(0, 0, 30, 4); // one visible conversation row
+    let mut switcher = switcher_with_five();
+
+    assert_eq!(switcher.on_mouse(mouse(down, 2), area), None);
+    assert_eq!(
+        switcher.on_mouse(mouse(up, 2), area),
+        Some(Transition::FocusMain)
+    );
+
+    assert_eq!(switcher.on_mouse(mouse(down, 2), area), None);
+    assert_eq!(switcher.on_mouse(mouse(drag, 1), area), None);
+    assert_eq!(switcher.list.scroll_top, 1);
+    assert_eq!(switcher.on_mouse(mouse(up, 2), area), None);
+
+    assert_eq!(switcher.on_mouse(mouse(down, 2), area), None);
+    switcher.list.scroll_top = 2; // a roster or viewport update changed the visible target
+    assert_eq!(switcher.on_mouse(mouse(up, 2), area), None);
+    assert_eq!(switcher.on_mouse(mouse(down, 2), area), None);
+    assert_eq!(switcher.on_mouse(mouse(up, 3), area), None);
+
+    let before = switcher.list.selected();
+    assert_eq!(
+        switcher.on_mouse(mouse(MouseEventKind::ScrollDown, 2), area),
+        None
+    );
+    assert_ne!(switcher.list.selected(), before);
+
+    let tall = Rect::new(0, 0, 30, 20);
+    assert_eq!(switcher.on_mouse(mouse(down, 2), tall), None);
+    assert_eq!(switcher.on_mouse(mouse(up, 3), tall), None);
+    assert_eq!(switcher.on_mouse(mouse(down, 18), tall), None);
+    assert_eq!(switcher.on_mouse(mouse(up, 18), tall), None);
+}
+
+#[test]
 fn the_toggle_and_escape_close_and_enter_picks() {
     let mut switcher = switcher_with_five();
     let toggle = ctrl_space();
@@ -297,10 +346,10 @@ fn the_toggle_and_escape_close_and_enter_picks() {
             "{event:?}"
         );
     }
-    // The main row closes everything; a subagent opens its view.
+    // The main row selects the main conversation; a subagent opens its view.
     assert_eq!(
         switcher.on_key(press(KeyCode::Enter, KeyModifiers::NONE), &toggle),
-        Some(Transition::Close)
+        Some(Transition::FocusMain)
     );
     assert_eq!(
         switcher.on_key(press(KeyCode::Down, KeyModifiers::NONE), &toggle),

@@ -13,7 +13,6 @@ use std::time::Instant;
 use tui_pty_e2e::Key;
 use tui_pty_e2e::SessionConfig;
 use tui_pty_e2e::TIMEOUT;
-use tui_pty_e2e::TIMEOUT_INPUT;
 use tui_pty_e2e::TuiSession;
 
 fn mock_agent_path() -> PathBuf {
@@ -423,42 +422,21 @@ fn startup_activates_and_local_status_renders() {
 }
 
 #[test]
-fn policy_change_is_applied_to_the_active_session() {
+fn permission_requests_are_auto_approved_by_default() {
     let fake = FakeRemoteHandroll::new();
-    // This test reads the applied policy off the footer, and approvals is off
-    // in the shipped footer defaults.
     let config = fake
-        .config_with_extra_toml(
-            r#"
-[tui.footer_segments]
-approval_mode = true
-"#,
-        )
+        .config()
         .with_agent_env("MOCK_AGENT_REQUEST_PERMISSION", "1");
     let mut session = TuiSession::spawn_with_config(24, 100, config).expect("spawn nori");
 
     session.wait_for_text("›", TIMEOUT).expect("composer");
     let _ = fake.wait_for_stderr("Mock agent: new_session id=", TIMEOUT);
-    session.submit_input("/approvals").unwrap();
     session
-        .wait_for_text("Select approval mode", TIMEOUT)
-        .expect("approval picker");
-    std::thread::sleep(tui_pty_e2e::TIMEOUT_PRESNAPSHOT);
-    insta::assert_snapshot!(
-        "active_session_approval_picker",
-        tui_pty_e2e::normalize_for_input_snapshot(session.screen_contents())
-    );
-    session.send_key(Key::Down).unwrap();
-    session.send_key(Key::Enter).unwrap();
-    session
-        .wait_for_text("Approvals: Full Access", TIMEOUT)
-        .expect("full-access policy should be applied to the active session");
-    std::thread::sleep(TIMEOUT_INPUT);
-
-    session.submit_input("exercise refreshed policy").unwrap();
+        .submit_input("exercise the default permission policy")
+        .unwrap();
     session
         .wait_for_text("Permission granted with option: allow", TIMEOUT)
-        .expect("the never-ask policy should auto-approve");
+        .expect("the default policy should approve the agent's permission request");
 
     let stderr = fake.read("agent_stderr");
     assert_eq!(fake.pid_count(), 1);

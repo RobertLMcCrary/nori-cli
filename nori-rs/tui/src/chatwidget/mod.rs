@@ -60,11 +60,17 @@ mod local_echo;
 mod model_cycle;
 pub(crate) use model_cycle::ModelStep;
 pub(crate) use model_cycle::WaitingModelPresses;
+mod owned_transcript;
+mod quit_keys;
+pub(crate) mod response_focus;
+mod session_transcript;
 mod stream_frame;
 pub(crate) mod subagents;
+pub(crate) mod tool_projection;
 pub(crate) use self::agent::HarnessHandle;
 use self::agent::spawn_acp_agent_resume;
 use self::agent::spawn_agent;
+pub(crate) use quit_keys::QuitKeyAction;
 pub(crate) use rewind::Rewind;
 
 mod approvals;
@@ -77,6 +83,7 @@ mod goal;
 mod helpers;
 mod key_handling;
 mod login;
+mod login_input;
 mod pickers;
 mod remote_control;
 mod replay;
@@ -86,7 +93,6 @@ mod user_input;
 use crate::nori::session_header::CloudSessionInfo;
 use crate::streaming::controller::StreamController;
 use codex_common::approval_presets::ApprovalPreset;
-use codex_common::approval_presets::approval_mode_label;
 use codex_common::approval_presets::builtin_approval_presets;
 
 use crate::ui_types::PlanUpdate;
@@ -194,10 +200,19 @@ pub(crate) struct ChatWidget {
     live_tail: layout_cache::CachedCell,
     /// Rows of the terminal, so the viewport can leave room for history to flush above it.
     screen_rows: std::cell::Cell<u16>,
+    subagent_strip: subagents::StripState,
+    bottom_pane_area: std::cell::Cell<Option<ratatui::layout::Rect>>,
     /// Whether the live tail starts the message, so it carries the `• ` header.
     live_tail_has_header: bool,
     /// Subagent sessions of this conversation.
     subagents: subagents::SubagentTree,
+    focused_subagent: Option<crate::subagent_switcher::SubagentKey>,
+    main_queued_prompts: Vec<String>,
+    child_queued_prompts: HashMap<nori_protocol::acp::v1::SessionId, Vec<String>>,
+    focused_transcript: Option<session_transcript::SessionTranscript>,
+    response_focus: response_focus::ResponseFocus,
+    quit_keys: quit_keys::QuitKeys,
+    focused_session_config: Option<crate::nori::agent_config_state::AgentConfigState>,
     /// How many running subagents the status line currently names.
     subagents_running_shown: usize,
     /// A rewind waiting for the edit journal (see `rewind`).
@@ -292,6 +307,7 @@ pub(crate) struct ChatWidget {
     // Failed/selected switch target used only to route a bare /login. This
     // does not imply a pending agent switch.
     login_agent_override: Option<String>,
+    login_child_target: Option<crate::subagent_switcher::SubagentKey>,
     active_resume_picker_generation: Option<u64>,
     // The first user prompt text, preserved for /first-prompt command
     first_prompt_text: Option<String>,
@@ -383,9 +399,77 @@ impl Drop for ChatWidget {
 }
 
 impl ChatWidget {
+    pub(crate) fn subagent_parent(
+        &self,
+        key: crate::subagent_switcher::SubagentKey,
+    ) -> Option<crate::subagent_switcher::SubagentKey> {
+        self.subagents.parent_for_key(key)
+    }
+    #[cfg(test)]
+    pub(crate) fn subagent_at(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::subagent_switcher::SubagentKey> {
+        match self.subagent_strip.action_at(column, row) {
+            Some(subagents::StripAction::Focus(key)) => Some(key),
+            Some(subagents::StripAction::Previous | subagents::StripAction::Next) | None => None,
+        }
+    }
+
+    pub(crate) fn subagent_strip_action(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<subagents::StripAction> {
+        self.subagent_strip.action_at(column, row)
+    }
+
+    pub(crate) fn subagent_strip_contains(&self, column: u16, row: u16) -> bool {
+        self.subagent_strip.contains(column, row)
+    }
+
+    #[cfg(test)]
+    fn subagent_strip_area(&self) -> Option<ratatui::layout::Rect> {
+        self.subagent_strip.area()
+    }
+
+    pub(crate) fn scroll_subagent_strip(&mut self, delta: isize) {
+        self.subagent_strip.scroll(delta);
+        self.request_redraw();
+    }
+
+    pub(crate) fn is_chat_content_row(&self, row: u16) -> bool {
+        self.bottom_pane_area
+            .get()
+            .is_some_and(|area| row < area.top())
+    }
+
+    pub(crate) fn place_composer_cursor(&mut self, column: u16, row: u16) -> bool {
+        let Some(area) = self.bottom_pane_area.get() else {
+            return false;
+        };
+        self.bottom_pane.place_cursor_at(column, row, area)
+    }
+
+    pub(crate) fn composer_cursor_style(&self) -> crossterm::cursor::SetCursorStyle {
+        self.bottom_pane.composer_cursor_style()
+    }
+
     /// Rows at the bottom of the viewport that belong to a popup or view that is open.
     pub(crate) fn popup_rows(&self, width: u16) -> u16 {
         self.bottom_pane.popup_rows(width)
+    }
+
+    pub(crate) fn primary_composer_height(&self, width: u16) -> u16 {
+        self.bottom_pane
+            .desired_height(width)
+            .saturating_add(1)
+            .saturating_add(if self.subagents.visible_count() > 0 {
+                1
+            } else {
+                0
+            })
     }
 }
 
@@ -441,21 +525,9 @@ impl Notification {
 
 const AGENT_NOTIFICATION_PREVIEW_GRAPHEMES: usize = 200;
 
-const PROMPT_MODE_PLACEHOLDERS: [&str; 5] = [
-    "? for shortcuts",
-    "/ for slash command menu",
-    "$ for skill listing",
-    "! for shell commands",
-    "@ for file mentions",
-];
-
-/// The prompt hint, chosen once for the run. Widgets are replaced as a session starts or an
-/// agent is switched, and a hint drawn anew each time would change under the user's eyes.
+/// Keep the cold-start prompt quiet and stable; shortcuts live in the docs.
 fn session_placeholder() -> String {
-    use rand::Rng as _;
-    static CHOSEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let index = *CHOSEN.get_or_init(|| rand::rng().random_range(0..PROMPT_MODE_PLACEHOLDERS.len()));
-    PROMPT_MODE_PLACEHOLDERS[index].to_string()
+    "Ask Nori to do anything".to_owned()
 }
 
 // Extract the first bold (Markdown) element in the form **...** from `s`.

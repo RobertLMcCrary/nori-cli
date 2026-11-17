@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::PoisonError;
 
 use async_trait::async_trait;
 use claude_code_agent_sdk::McpServerConfig;
@@ -146,6 +148,29 @@ pub fn host_tool_name(tool_name: &str) -> Option<&str> {
 #[derive(Default)]
 pub struct HostToolsBinding {
     tools: OnceLock<Arc<dyn HostTools>>,
+    active: Arc<Mutex<ActiveHostCalls>>,
+}
+
+#[derive(Default)]
+struct ActiveHostCalls {
+    cancelled: bool,
+    calls: HashMap<String, tokio_util::sync::CancellationToken>,
+    early_cancellations: std::collections::VecDeque<String>,
+}
+
+struct ActiveHostCall {
+    active: Arc<Mutex<ActiveHostCalls>>,
+    key: String,
+}
+
+impl Drop for ActiveHostCall {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .remove(&self.key);
+    }
 }
 
 impl std::fmt::Debug for HostToolsBinding {
@@ -166,6 +191,22 @@ impl HostToolsBinding {
     /// The tools, once bound.
     pub fn tools(&self) -> Option<Arc<dyn HostTools>> {
         self.tools.get().cloned()
+    }
+
+    /// A prewarmed CLI has already read the global catalog. Reuse it only
+    /// when the bound session advertises exactly the same tools and instructions.
+    pub fn matches_prewarm_catalog(&self) -> bool {
+        self.matches_catalog(nori_host_tools::catalog().as_deref())
+    }
+
+    fn matches_catalog(&self, catalog: Option<&nori_host_tools::Catalog>) -> bool {
+        match (self.tools.get(), catalog) {
+            (Some(tools), Some(catalog)) => {
+                tools.specs() == catalog.specs && tools.instructions() == catalog.instructions
+            }
+            (None, _) => true,
+            (Some(_), None) => false,
+        }
     }
 
     /// Give a session prepared ahead of time its tools. The first binding stays.
@@ -196,6 +237,61 @@ impl HostToolsBinding {
             Some(tools) => tools.call(name, arguments).await,
             None => HostToolOutput::error("Nori's tools are not connected to this session yet"),
         }
+    }
+
+    async fn call_tracked(&self, id: Value, name: &str, arguments: Value) -> HostToolOutput {
+        let key = id.to_string();
+        let call_id = id
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| id.to_string());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        {
+            let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+            if active.cancelled || active.early_cancellations.iter().any(|id| id == &key) {
+                cancellation.cancel();
+                active.early_cancellations.retain(|id| id != &key);
+            }
+            active.calls.insert(key.clone(), cancellation.clone());
+        }
+        let _guard = ActiveHostCall {
+            active: Arc::clone(&self.active),
+            key,
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => HostToolOutput::cancelled(&call_id, name),
+            output = self.call(name, arguments) => output,
+        }
+    }
+
+    fn cancel_call(&self, id: &Value) {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = id.to_string();
+        if let Some(token) = active.calls.get(&key) {
+            token.cancel();
+        } else if !active.early_cancellations.contains(&key) {
+            if active.early_cancellations.len() >= 128 {
+                active.early_cancellations.pop_front();
+            }
+            active.early_cancellations.push_back(key);
+        }
+    }
+
+    /// Cancel all in-flight calls owned by this session.
+    pub fn cancel_all(&self) {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        active.cancelled = true;
+        for token in active.calls.values() {
+            token.cancel();
+        }
+    }
+
+    /// Permit calls for the next prompt after session cancellation.
+    pub fn reset_cancelled(&self) {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        active.cancelled = false;
+        active.early_cancellations.clear();
     }
 }
 
@@ -242,11 +338,24 @@ impl SdkMcpServer for HostToolsServer {
             "tools/call" => {
                 let params = &message["params"];
                 let name = params["name"].as_str().unwrap_or_default();
-                let output = self.tools.call(name, params["arguments"].clone()).await;
-                Ok(json!({
-                    "content": [{ "type": "text", "text": output.text }],
-                    "isError": output.is_error,
-                }))
+                let id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or_else(|| json!(uuid::Uuid::new_v4().to_string()));
+                let output = self
+                    .tools
+                    .call_tracked(id, name, params["arguments"].clone())
+                    .await;
+                Ok(output.as_mcp_result())
+            }
+            "notifications/cancelled" => {
+                if let Some(id) = message
+                    .get("params")
+                    .and_then(|params| params.get("requestId"))
+                {
+                    self.tools.cancel_call(id);
+                }
+                Ok(json!({}))
             }
             method if method.starts_with("notifications/") => Ok(json!({})),
             method => Err(claude_code_agent_sdk::errors::McpError::method_not_found(method).into()),
@@ -298,9 +407,11 @@ mod tests {
         }
 
         fn call(&self, name: &str, arguments: Value) -> HostToolFuture {
-            let output = HostToolOutput {
-                text: format!("{name}:{arguments}"),
-                is_error: name != "git_status",
+            let text = format!("{name}:{arguments}");
+            let output = if name == "git_status" {
+                HostToolOutput::text(text)
+            } else {
+                HostToolOutput::error(text)
             };
             Box::pin(async move { output })
         }
@@ -352,6 +463,148 @@ mod tests {
                 .handle_message(json!({"method": "resources/list"}))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn customized_catalog_is_not_reused_from_a_prepared_session() {
+        let catalog = nori_host_tools::Catalog {
+            specs: Tools.specs(),
+            instructions: Tools.instructions(),
+        };
+        let default = HostToolsBinding::bound(Arc::new(Tools));
+        assert!(default.matches_catalog(Some(&catalog)));
+        let selection = nori_host_tools::ToolSelection {
+            enabled: Some(Default::default()),
+            instructions: vec!["Only the selected tools are available".to_owned()],
+            ..Default::default()
+        };
+        let selected = nori_host_tools::SelectedTools::new(Arc::new(Tools), &selection);
+        let bound = HostToolsBinding::bound(Arc::new(selected));
+        assert!(!bound.matches_catalog(Some(&catalog)));
+        let server = HostToolsServer { tools: bound };
+        let init = server
+            .handle_message(json!({"method": "initialize"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            init["instructions"],
+            "Only the selected tools are available"
+        );
+        let list = server
+            .handle_message(json!({"method": "tools/list"}))
+            .await
+            .unwrap();
+        assert_eq!(list["tools"], json!([]));
+        let call = server
+            .handle_message(
+                json!({"method": "tools/call", "params": {"name": "git_status", "arguments": {}}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call["isError"], true);
+    }
+
+    struct BlockingTools(Arc<tokio::sync::Notify>);
+
+    impl HostTools for BlockingTools {
+        fn instructions(&self) -> String {
+            String::new()
+        }
+        fn specs(&self) -> Vec<HostToolSpec> {
+            Vec::new()
+        }
+        fn call(&self, _name: &str, _arguments: Value) -> HostToolFuture {
+            let started = Arc::clone(&self.0);
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending::<HostToolOutput>().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_notification_and_session_cancel_return_correlated_receipts() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let binding = HostToolsBinding::bound(Arc::new(BlockingTools(Arc::clone(&started))));
+        let server = Arc::new(HostToolsServer {
+            tools: Arc::clone(&binding),
+        });
+        let task = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                server.handle_message(json!({
+                "id": 42, "method": "tools/call", "params": {"name": "slow", "arguments": {}}
+            })).await.unwrap()
+            })
+        };
+        started.notified().await;
+        server
+            .handle_message(
+                json!({"method": "notifications/cancelled", "params": {"requestId": 42}}),
+            )
+            .await
+            .unwrap();
+        let result = task.await.unwrap();
+        assert_eq!(
+            result["structuredContent"],
+            json!({"status":"cancelled", "call_id":"42", "tool":"slow"})
+        );
+        assert_eq!(result["isError"], true);
+        assert!(binding.active.lock().unwrap().calls.is_empty());
+
+        binding.cancel_all();
+        let result = server
+            .handle_message(json!({"id":"next", "method":"tools/call", "params":{"name":"slow"}}))
+            .await
+            .unwrap();
+        assert_eq!(result["structuredContent"]["call_id"], "next");
+        binding.reset_cancelled();
+        assert!(!binding.active.lock().unwrap().cancelled);
+        server
+            .handle_message(
+                json!({"method":"notifications/cancelled", "params":{"requestId":"early"}}),
+            )
+            .await
+            .unwrap();
+        let early = server
+            .handle_message(json!({"id":"early", "method":"tools/call", "params":{"name":"slow"}}))
+            .await
+            .unwrap();
+        assert_eq!(early["structuredContent"]["call_id"], "early");
+    }
+
+    struct RichTools(Value);
+    impl HostTools for RichTools {
+        fn instructions(&self) -> String {
+            String::new()
+        }
+        fn specs(&self) -> Vec<HostToolSpec> {
+            Vec::new()
+        }
+        fn call(&self, _name: &str, _arguments: Value) -> HostToolFuture {
+            let result = self.0.clone();
+            Box::pin(async move { HostToolOutput::from_mcp_result(result) })
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_server_preserves_rich_mcp_results() {
+        let result = json!({"content":[
+            {"type":"image","mimeType":"image/png","data":"YWJj"},
+            {"type":"resource","resource":{"uri":"file:///example","text":"hello"}}
+        ],"structuredContent":{"ok":true},"_meta":{"key":"value"},"isError":false});
+        let server = HostToolsServer {
+            tools: HostToolsBinding::bound(Arc::new(RichTools(result.clone()))),
+        };
+        assert_eq!(
+            server
+                .handle_message(
+                    json!({"id":"call", "method":"tools/call", "params":{"name":"rich"}})
+                )
+                .await
+                .unwrap(),
+            result
         );
     }
 

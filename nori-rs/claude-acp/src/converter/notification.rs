@@ -181,6 +181,7 @@ impl NotificationConverter {
             Message::Assistant(_) => "Assistant",
             Message::StreamEvent(_) => "StreamEvent",
             Message::Result(_) => "Result",
+            Message::RateLimitEvent(_) => "RateLimitEvent",
             Message::System(_) => "System",
             Message::User(_) => "User",
             Message::ControlCancelRequest(_) => "ControlCancelRequest",
@@ -191,6 +192,7 @@ impl NotificationConverter {
             Message::Assistant(assistant) => self.convert_assistant_message(assistant, &sid),
             Message::StreamEvent(event) => self.convert_stream_event(event, &sid),
             Message::Result(result) => self.convert_result_message(result, &sid),
+            Message::RateLimitEvent(_) => Vec::new(),
             Message::System(_) => {
                 // System messages are typically internal, not sent as notifications
                 vec![]

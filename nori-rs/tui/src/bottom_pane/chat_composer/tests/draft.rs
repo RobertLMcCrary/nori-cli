@@ -127,3 +127,47 @@ fn handoff_preserves_atomic_placeholder_editing() {
     after.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
     assert_eq!(after.current_text(), "");
 }
+
+#[test]
+fn new_session_draft_keeps_editor_configuration_and_original_state() {
+    use crate::bottom_pane::textarea::VimModeState;
+    let mut composer = composer();
+    composer.set_kakoune_mode(true);
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let old_draft = composer.take_draft();
+    assert!(composer.textarea.kakoune_mode_enabled());
+    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert_eq!(composer.current_text(), "b");
+    composer.restore_draft(old_draft);
+    assert_eq!(composer.current_text(), "a");
+    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+}
+
+#[test]
+fn restored_insert_draft_does_not_paint_a_stale_selection() {
+    use ratatui::style::Color;
+    use ratatui::style::Modifier;
+    let mut composer = composer();
+    composer.set_kakoune_mode(true);
+    composer.insert_str("a restored draft");
+    composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    let parent = composer.take_draft();
+    composer.insert_str("child draft");
+    let _child = composer.take_draft();
+    composer.restore_draft(parent);
+    assert_eq!(composer.current_text(), "a restored draft");
+    let area = Rect::new(0, 0, 30, 4);
+    let mut buffer = Buffer::empty(area);
+    composer.render(area, &mut buffer);
+    let body = composer.rendered_body_area.get().expect("rendered body");
+    for x in body.x..body.right() {
+        let cell = &buffer[(x, body.y)];
+        assert_eq!(cell.bg, Color::Reset);
+        assert!(!cell.modifier.contains(Modifier::REVERSED));
+    }
+}

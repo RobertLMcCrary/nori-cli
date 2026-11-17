@@ -1,5 +1,8 @@
+mod kakoune;
+mod pointer;
 mod vim;
 
+use self::kakoune::KakouneEditor;
 use self::vim::KillBufferKind;
 use self::vim::VimOperator;
 use self::vim::VimPending;
@@ -9,6 +12,7 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use modalkit::env::kak::KakouneMode;
 use nori_config::HotkeyConfig;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -89,6 +93,13 @@ pub(crate) struct TextArea {
     hotkey_config: HotkeyConfig,
     /// Whether vim mode is enabled (user setting).
     vim_mode_enabled: bool,
+    /// Kakoune keymap state. This is kept alongside the existing editing
+    /// buffer so the keymap can be enabled without replacing the textarea's
+    /// placeholder and completion bookkeeping.
+    kakoune_mode_enabled: bool,
+    kakoune_editor: Option<KakouneEditor>,
+    /// An external hotkey edit is the next undoable selection-editor change.
+    kakoune_external_undo_pending: bool,
     /// Current vim mode state (Insert or Normal).
     vim_mode_state: VimModeState,
     /// When Vim most recently transitioned from Insert to Normal mode.
@@ -128,6 +139,9 @@ impl TextArea {
             kill_buffer_kind: KillBufferKind::Characterwise,
             hotkey_config: HotkeyConfig::default(),
             vim_mode_enabled: false,
+            kakoune_mode_enabled: false,
+            kakoune_editor: None,
+            kakoune_external_undo_pending: false,
             vim_mode_state: VimModeState::default(),
             vim_normal_mode_entered_at: None,
             vim_pending: VimPending::None,
@@ -139,6 +153,36 @@ impl TextArea {
 
     pub fn set_hotkey_config(&mut self, config: HotkeyConfig) {
         self.hotkey_config = config;
+    }
+
+    /// Enable the modalkit Kakoune keymap for this textarea.
+    ///
+    /// The textarea remains the owner of its buffer and rendering state; the
+    /// modalkit machine supplies the modal transition and selection-first
+    /// Kakoune keymap. The editor starts in insert mode.
+    pub fn set_kakoune_mode_enabled(&mut self, enabled: bool) {
+        if self.kakoune_mode_enabled == enabled {
+            return;
+        }
+        self.kakoune_mode_enabled = enabled;
+        self.kakoune_external_undo_pending = false;
+        if enabled {
+            let editor = KakouneEditor::new();
+            editor.set_text(&self.text);
+            self.kakoune_editor = Some(editor);
+            self.vim_mode_enabled = true;
+            self.vim_mode_state = VimModeState::Insert;
+        } else {
+            self.kakoune_editor = None;
+            self.vim_mode_enabled = false;
+            self.vim_mode_state = VimModeState::Insert;
+            self.end_undo_group();
+        }
+    }
+
+    /// Whether the modalkit Kakoune keymap is active.
+    pub fn kakoune_mode_enabled(&self) -> bool {
+        self.kakoune_mode_enabled
     }
 
     /// Enable or disable vim mode. When toggled off, resets state to Insert mode.
@@ -365,9 +409,19 @@ impl TextArea {
         self.cursor_pos = pos.clamp(0, self.text.len());
         self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
         self.preferred_col = None;
+        if let Some(editor) = self.kakoune_editor.as_mut() {
+            editor.set_text(&self.text);
+            editor.set_cursor(self.cursor_pos);
+        }
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
+        if let Some(editor) = &self.kakoune_editor
+            && self.kakoune_mode_enabled
+        {
+            editor.set_text(&self.text);
+            return editor.desired_height(width);
+        }
         self.wrapped_lines(width).len() as u16
     }
 
@@ -378,6 +432,12 @@ impl TextArea {
 
     /// Compute the on-screen cursor position taking scrolling into account.
     pub fn cursor_pos_with_state(&self, area: Rect, state: TextAreaState) -> Option<(u16, u16)> {
+        if self.kakoune_mode_enabled {
+            return self
+                .kakoune_editor
+                .as_ref()
+                .and_then(KakouneEditor::term_cursor);
+        }
         let lines = self.wrapped_lines(area.width);
         let effective_scroll = self.effective_scroll(area.height, &lines, state.scroll);
         let i = Self::wrapped_line_index_by_start(&lines, self.cursor_pos)?;
@@ -444,6 +504,138 @@ impl TextArea {
     }
 
     pub fn input(&mut self, event: KeyEvent) {
+        if self.kakoune_mode_enabled
+            && self.kakoune_external_undo_pending
+            && self.vim_mode_state == VimModeState::Normal
+            && event.code == KeyCode::Char('u')
+            && event.modifiers == KeyModifiers::NONE
+            && matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            self.undo();
+            self.kakoune_external_undo_pending = false;
+            if let Some(editor) = self.kakoune_editor.as_mut() {
+                editor.set_text(&self.text);
+                editor.set_cursor(self.cursor_pos);
+            }
+            return;
+        }
+        if self.kakoune_mode_enabled
+            && self.vim_mode_state == VimModeState::Insert
+            && matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            let kill = matches_binding(&self.hotkey_config.kill_to_end_of_line, &event);
+            let yank = matches_binding(&self.hotkey_config.yank, &event);
+            if kill || yank {
+                let before = self.text.clone();
+                self.end_undo_group();
+                if kill {
+                    self.kill_to_end_of_line();
+                } else {
+                    self.yank();
+                }
+                self.kakoune_external_undo_pending = self.text != before;
+                if let Some(editor) = self.kakoune_editor.as_mut() {
+                    editor.set_text(&self.text);
+                    editor.set_cursor(self.cursor_pos);
+                }
+                return;
+            }
+        }
+        if self.kakoune_mode_enabled
+            && let Some(editor) = self.kakoune_editor.as_mut()
+        {
+            let previous_cursor = self.cursor_pos;
+            editor.set_text(&self.text);
+            if editor.cursor_needs_sync() {
+                editor.set_cursor(previous_cursor);
+            }
+            editor.input(event);
+            let mut updated = editor.text();
+            // Changing a selected final line must keep the separator before it.
+            // The Kakoune engine includes that separator in its line selection.
+            if self.vim_mode_state == VimModeState::Normal
+                && event.code == KeyCode::Char('c')
+                && event.modifiers == KeyModifiers::NONE
+                && !updated.is_empty()
+                && self.text.starts_with(&updated)
+                && self.text[updated.len()..].starts_with('\n')
+            {
+                editor.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                updated = editor.text();
+            }
+            let editor_cursor = editor.cursor(&updated);
+            if updated != self.text {
+                self.kakoune_external_undo_pending = false;
+                let prefix = self
+                    .text
+                    .chars()
+                    .zip(updated.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(c, _)| c.len_utf8())
+                    .sum::<usize>();
+                let old_tail = &self.text[prefix..];
+                let new_tail = &updated[prefix..];
+                let suffix = old_tail
+                    .chars()
+                    .rev()
+                    .zip(new_tail.chars().rev())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(c, _)| c.len_utf8())
+                    .sum::<usize>();
+                let mut old_end = self.text.len() - suffix;
+                let replacement = &updated[prefix..updated.len() - suffix];
+                if prefix == old_end {
+                    let at = self.clamp_pos_for_insertion(prefix);
+                    self.replace_range(at..at, replacement);
+                } else {
+                    let mut start = prefix;
+                    for (offset, grapheme) in self.text.grapheme_indices(true) {
+                        let end = offset + grapheme.len();
+                        if offset < prefix && prefix < end {
+                            start = offset;
+                        }
+                        if offset < old_end && old_end < end {
+                            old_end = end;
+                        }
+                    }
+                    let expanded = start != prefix || old_end != self.text.len() - suffix;
+                    if expanded {
+                        self.end_undo_group();
+                    }
+                    self.replace_range(start..old_end, replacement);
+                    self.kakoune_external_undo_pending = expanded;
+                }
+            }
+            let desired_cursor = if self.find_element_containing(editor_cursor).is_some() {
+                if editor_cursor < previous_cursor {
+                    self.prev_atomic_boundary(previous_cursor)
+                } else if editor_cursor > previous_cursor {
+                    self.next_atomic_boundary(previous_cursor)
+                } else {
+                    self.clamp_pos_to_nearest_boundary(editor_cursor)
+                }
+            } else {
+                editor_cursor.min(self.text.len())
+            };
+            self.cursor_pos = self.clamp_pos_to_nearest_boundary(desired_cursor);
+            if let Some(editor) = self.kakoune_editor.as_mut() {
+                if updated != self.text {
+                    editor.set_text(&self.text);
+                    editor.set_cursor(self.cursor_pos);
+                } else if editor_cursor != self.cursor_pos {
+                    editor.set_cursor(self.cursor_pos);
+                }
+                self.vim_mode_state = match editor.mode() {
+                    KakouneMode::Insert | KakouneMode::Prompt => VimModeState::Insert,
+                    KakouneMode::Normal
+                    | KakouneMode::User
+                    | KakouneMode::Goto
+                    | KakouneMode::View
+                    | KakouneMode::ObjectSelect => VimModeState::Normal,
+                };
+            }
+            return;
+        }
         // 0. Vim mode handling (when enabled).
         if self.vim_mode_enabled {
             match self.vim_mode_state {
@@ -1607,6 +1799,13 @@ impl TextArea {
 
 impl WidgetRef for &TextArea {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
+        if self.kakoune_mode_enabled
+            && let Some(editor) = self.kakoune_editor.as_ref()
+        {
+            editor.set_text(&self.text);
+            editor.render(area, buf);
+            return;
+        }
         let lines = self.wrapped_lines(area.width);
         self.render_lines(area, buf, &lines, 0..lines.len());
     }
@@ -1616,6 +1815,13 @@ impl StatefulWidgetRef for &TextArea {
     type State = TextAreaState;
 
     fn render_ref(&self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        if self.kakoune_mode_enabled
+            && let Some(editor) = self.kakoune_editor.as_ref()
+        {
+            editor.set_text(&self.text);
+            editor.render(area, buf);
+            return;
+        }
         let lines = self.wrapped_lines(area.width);
         let scroll = self.effective_scroll(area.height, &lines, state.scroll);
         state.scroll = scroll;

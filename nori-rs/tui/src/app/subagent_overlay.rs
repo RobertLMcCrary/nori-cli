@@ -17,11 +17,61 @@ use crate::subagent_switcher::Transition;
 use crate::subagent_switcher::cell_lines;
 
 impl App {
+    pub(super) fn cycle_subagent_session(&mut self, tui: &mut tui::Tui, reverse: bool) {
+        if matches!(self.overlay, Some(Overlay::Subagents(_))) {
+            self.close_subagent_switcher(tui);
+        }
+        let roster = self.subagent_roster();
+        let target = self.session_view.step(&roster, reverse, Instant::now());
+        self.focus_session_view(tui, target);
+        tui.frame_requester().schedule_frame();
+    }
+
+    pub(super) fn restore_subagent_draft(
+        &mut self,
+        tui: &mut tui::Tui,
+        key: crate::subagent_switcher::SubagentKey,
+        text: &str,
+        image_paths: Vec<std::path::PathBuf>,
+    ) {
+        let target = Target::Subagent(key);
+        let current = self.session_view.focused();
+        if current != target {
+            self.session_view
+                .save_draft(current, self.chat_widget.take_composer_draft());
+            if let Some(draft) = self.session_view.take_draft(target) {
+                self.chat_widget.restore_composer_draft(draft);
+            }
+        }
+        self.chat_widget
+            .restore_composer_submission(text.to_owned());
+        for path in image_paths {
+            let (width, height) = image::image_dimensions(&path).unwrap_or((0, 0));
+            self.chat_widget.attach_image(path, width, height, "image");
+        }
+        if current != target {
+            self.session_view
+                .save_draft(target, self.chat_widget.take_composer_draft());
+            if let Some(draft) = self.session_view.take_draft(current) {
+                self.chat_widget.restore_composer_draft(draft);
+            }
+        }
+        tui.frame_requester().schedule_frame();
+    }
+
     /// Open the list of the main session and every subagent.
     pub(super) fn open_subagent_switcher(&mut self, tui: &mut tui::Tui) {
         let roster = self.subagent_roster();
         let overlay = SubagentOverlay::switcher(&roster, self.switcher_binding());
         self.show_subagent_overlay(tui, overlay);
+    }
+
+    pub(super) fn focus_subagent_from_mouse(
+        &mut self,
+        tui: &mut tui::Tui,
+        subagent: crate::subagent_switcher::SubagentKey,
+    ) {
+        self.focus_session_view(tui, Target::Subagent(subagent));
     }
 
     fn switcher_binding(&self) -> nori_config::HotkeyBinding {
@@ -31,9 +81,7 @@ impl App {
     }
 
     fn show_subagent_overlay(&mut self, tui: &mut tui::Tui, overlay: SubagentOverlay) {
-        if self.overlay.is_none() {
-            let _ = tui.enter_alt_screen();
-        }
+        let _ = tui.set_mouse_capture(true);
         self.overlay = Some(Overlay::Subagents(Box::new(overlay)));
         tui.frame_requester().schedule_frame();
     }
@@ -107,20 +155,30 @@ impl App {
         };
         match transition {
             Transition::Close => {
-                self.close_transcript_overlay(tui);
+                self.close_subagent_switcher(tui);
                 tui.frame_requester().schedule_frame();
             }
-            Transition::OpenSwitcher => self.open_subagent_switcher(tui),
+            Transition::FocusMain => {
+                self.close_subagent_switcher(tui);
+                self.focus_session_view(tui, Target::Main);
+            }
             Transition::Focus(subagent) => {
-                let roster = self.subagent_roster();
-                let width = tui.terminal.size()?.width;
-                if let Some(focused) =
-                    SubagentOverlay::focused(&roster, subagent, self.switcher_binding(), width)
-                {
-                    self.show_subagent_overlay(tui, focused);
-                }
+                self.close_subagent_switcher(tui);
+                self.focus_session_view(tui, Target::Subagent(subagent));
             }
         }
         Ok(())
+    }
+
+    fn close_subagent_switcher(&mut self, tui: &mut tui::Tui) {
+        self.overlay = None;
+        let _ = tui.set_mouse_capture(false);
+        tui.request_full_repaint();
+        if self.session_view.focused() == Target::Main
+            && !self.session_view.main_scrolling()
+            && !self.deferred_history_lines.is_empty()
+        {
+            tui.insert_history_lines(std::mem::take(&mut self.deferred_history_lines));
+        }
     }
 }

@@ -64,6 +64,69 @@ fn the_fluent_chain_reads_like_the_builder_api() {
 }
 
 #[test]
+fn commit_review_designates_an_agent_without_changing_commit_rules() {
+    let workflow = eval(
+        r#"(~> (workflow "w") (commit-style 'conventional) (commit-review 'claude #:model "haiku"))"#,
+    );
+    assert_eq!(
+        workflow,
+        Workflow {
+            commit: Some(CommitRules {
+                style: Some(CommitStyle::Conventional),
+                ..CommitRules::default()
+            }),
+            commit_reviewer: Some(CommitAgent {
+                agent: "claude".to_owned(),
+                model: Some("haiku".to_owned()),
+            }),
+            ..Workflow::named("w")
+        }
+    );
+    assert!(
+        workflow
+            .instructions()
+            .contains("draft commit messages without committing")
+    );
+    assert!(
+        fail(r#"(~> (workflow "w") (commit-review 'claude #:model 1))"#)
+            .message
+            .contains("commit-review")
+    );
+}
+
+#[test]
+fn fallback_models_are_ordered_replaced_and_validated() {
+    assert_eq!(
+        eval(r#"(~> (workflow "w") (fallback-models "a") (fallback-ranked-models))"#),
+        Workflow {
+            fallback_ranked: true,
+            ..Workflow::named("w")
+        }
+    );
+    assert_eq!(
+        eval(
+            r#"(~> (workflow "w") (fallback-models "provider/first" "second") (fallback-models "third" "provider/fourth"))"#
+        ),
+        Workflow {
+            fallback_models: vec!["third".to_owned(), "provider/fourth".to_owned()],
+            ..Workflow::named("w")
+        }
+    );
+    assert_eq!(
+        eval(r#"(~> (workflow "w") (fallback-models "a") (fallback-models))"#),
+        Workflow::named("w")
+    );
+    for source in [
+        r#"(~> (workflow "w") (fallback-models ""))"#,
+        r#"(~> (workflow "w") (fallback-models "has space"))"#,
+        r#"(~> (workflow "w") (fallback-models "a" "a"))"#,
+        r#"(~> (workflow "w") (fallback-models 'model))"#,
+    ] {
+        assert!(fail(source).message.contains("fallback-models"));
+    }
+}
+
+#[test]
 fn define_workflow_registers_and_binds_the_name() {
     let (registry, _) = run(r#"
 (define-workflow land

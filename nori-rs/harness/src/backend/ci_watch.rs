@@ -9,8 +9,8 @@ use std::time::Instant;
 use nori_forge::CheckState;
 use nori_forge::Checks;
 use nori_forge::RunState;
-use nori_script::HookEvent;
-use nori_script::Workflow;
+use nori_workflow::HookEvent;
+use nori_workflow::Workflow;
 
 use super::*;
 use workflow::notice;
@@ -33,6 +33,7 @@ const LOGS_READ: usize = 3;
 
 /// What CI decided about a pushed commit, ready to go to the agent.
 pub(crate) struct CiReport {
+    generation: i64,
     event: HookEvent,
     /// One line for the user.
     summary: String,
@@ -64,7 +65,10 @@ impl AcpBackend {
 
     /// After a turn: when the agent pushed during the user's turn and the workflow has CI
     /// hooks, start watching the pushed commit. A newer push replaces the watch.
-    pub(super) async fn maybe_watch_ci(&self) {
+    pub(super) async fn maybe_watch_ci(&self, generation: i64) {
+        if generation != self.orchestrator.admission_generation() {
+            return;
+        }
         let before = {
             let state = self.workflow.lock().await;
             match &state.active {
@@ -76,6 +80,9 @@ impl AcpBackend {
         let (Some(before), Some(pushed)) = (before, self.pushed_commit().await) else {
             return;
         };
+        if generation != self.orchestrator.admission_generation() {
+            return;
+        }
         {
             let mut state = self.workflow.lock().await;
             if pushed == before || state.ci_watching.as_ref() == Some(&pushed) {
@@ -84,10 +91,10 @@ impl AcpBackend {
             state.ci_watching = Some(pushed.clone());
         }
         let backend = self.clone();
-        tokio::spawn(async move { backend.watch_ci(pushed).await });
+        tokio::spawn(async move { backend.watch_ci(pushed, generation).await });
     }
 
-    async fn watch_ci(&self, sha: String) {
+    async fn watch_ci(&self, sha: String, generation: i64) {
         let place = match forge_tools::place(self.cwd.clone(), None).await {
             Ok(place) => place,
             Err(error) => {
@@ -125,8 +132,14 @@ impl AcpBackend {
                 CheckState::None | CheckState::Pending if started.elapsed() > GIVE_UP => return,
                 CheckState::None | CheckState::Pending => continue,
             };
-            let report = report(&place, &checks, event).await;
-            self.workflow.lock().await.ci_owed = Some(report);
+            let report = report(&place, &checks, event, generation).await;
+            {
+                let _admission = self.orchestrator.rewind_admission().await;
+                if generation != self.orchestrator.admission_generation() {
+                    return;
+                }
+                self.workflow.lock().await.ci_owed = Some(report);
+            }
             self.deliver_ci_if_idle().await;
             return;
         }
@@ -144,6 +157,9 @@ impl AcpBackend {
             let Some(report) = state.ci_owed.take() else {
                 return;
             };
+            if report.generation != self.orchestrator.admission_generation() {
+                return;
+            }
             let Some(workflow) = state.active.clone() else {
                 return;
             };
@@ -163,8 +179,13 @@ impl AcpBackend {
         );
         match prompt {
             Some(prompt) => {
-                self.send_hook_turn(label, report.event, format!("{}\n{prompt}", report.text))
-                    .await;
+                self.send_hook_turn(
+                    report.generation,
+                    label,
+                    report.event,
+                    format!("{}\n{prompt}", report.text),
+                )
+                .await;
             }
             None => notice(&self.backend_event_tx, report.summary).await,
         }
@@ -173,13 +194,19 @@ impl AcpBackend {
 
 /// The report of `checks` on the pushed commit: each failed check with the end of its log, or
 /// how many passed.
-async fn report(place: &forge_tools::Place, checks: &Checks, event: HookEvent) -> CiReport {
+async fn report(
+    place: &forge_tools::Place,
+    checks: &Checks,
+    event: HookEvent,
+    generation: i64,
+) -> CiReport {
     let short = checks.sha.get(..7).unwrap_or(&checks.sha);
     let failed: Vec<_> = checks.in_states(&[RunState::Failed]).collect();
     if event == HookEvent::CiPassed || failed.is_empty() {
         let passed = checks.in_states(&[RunState::Passed]).count();
         let summary = format!("CI passed on {short}");
         return CiReport {
+            generation,
             event,
             text: format!("{summary} (`{}`): {passed} checks passed.\n", place.branch),
             summary,
@@ -209,6 +236,7 @@ async fn report(place: &forge_tools::Place, checks: &Checks, event: HookEvent) -
         }
     }
     CiReport {
+        generation,
         event,
         summary,
         text,
@@ -223,7 +251,7 @@ mod tests {
 
     #[test]
     fn only_a_workflow_with_a_ci_prompt_watches_pushes() {
-        let hook = |event| nori_script::Hook {
+        let hook = |event| nori_workflow::Hook {
             event,
             prompt: "p".to_owned(),
         };
@@ -279,7 +307,7 @@ mod tests {
                 run("build", RunState::Passed, Some(8)),
             ],
         };
-        let report = report(&place, &checks, HookEvent::CiFailed).await;
+        let report = report(&place, &checks, HookEvent::CiFailed, 0).await;
         assert_eq!(report.summary, "CI failed on 0123456: test, lint");
         assert_eq!(
             report.text,

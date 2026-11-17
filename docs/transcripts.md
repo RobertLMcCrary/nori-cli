@@ -1,13 +1,20 @@
-# Nori transcript format
+# Nori transcript journal and JSONL compatibility format
 
-Reference for Nori's versioned JSONL session transcripts. Schema v3 is the
-canonical write format. The Harness keeps older v1/v2 storage compatibility
-private so embedders do not inherit the retired normalized protocol as API.
+Reference for Nori's canonical Pkl event journal and its versioned JSONL
+compatibility view. The event journal is the source of truth for conversation
+projection and stable record IDs. The Harness also writes JSONL schema v3 for
+transcript readers and keeps older v1/v2 storage compatibility private so
+embedders do not inherit the retired normalized protocol as API.
 
-Canonical implementation: `nori-rs/harness/src/transcript/` in
-`nori-harness`. The versioned `TranscriptLine` and `TranscriptEntry` storage
-types are private. Public Rust readers use `TranscriptLoader`, `Transcript`,
-`Transcript::records()`, `TranscriptRecord`, and `Transcript::context_timeline()`.
+Canonical implementation: `nori-rs/conversation/` and
+`nori-rs/harness/src/transcript/`. The versioned `TranscriptLine` and
+`TranscriptEntry` JSONL storage types are private. Public Rust readers use
+`TranscriptLoader`, `Transcript`, `Transcript::records()`, `TranscriptRecord`,
+and `Transcript::context_timeline()`.
+
+In the conversation view, a completed tool call starts compact. Click or tap its
+row to expand or collapse its details; `Ctrl+E` toggles the nearest visible tool.
+Expansion is local to the focused conversation and does not change its journal.
 
 ## File locations
 
@@ -18,21 +25,71 @@ Transcripts live under the Nori home directory (`$NORI_HOME`, or
 $NORI_HOME/transcripts/by-project/{project-id}/
   ├── project.json
   └── sessions/
-      └── {session-id}.jsonl
+      ├── {session-id}.jsonl  # compatibility transcript
+      └── {session-id}.pkl   # canonical event journal
 ```
 
 - `{session-id}` is a UUIDv4 generated when recording starts.
 - Session files are created with mode `0600` on Unix.
-- The writer creates a fresh file, appends one JSON object per line, and flushes
-  each line. It does not `fsync`, so a crashed session can lose its tail.
+- Every harness session, including delegated child sessions, has its own
+  transcript and journal. A parent's transcript also records child events
+  relayed into the parent session.
+- JSONL entries are queued to a writer, which appends one JSON object per line
+  and flushes each line. It does not `fsync`; the canonical journal is synced
+  after each append.
 - A session resumed from its own transcript, whose history is replayed from
   that transcript, goes on recording into that file
   (`TranscriptRecorder::continue_session`): same `session_id`, no second
-  `session_meta`, and a newline first if the file stopped in the middle of a
-  line. The replayed history is already in the file and is not recorded again,
-  so such a resume never copies the transcript. When the agent replays the
-  history itself (`session/load`), recording starts a new file as before, since
-  the agent's history can hold more than the local one.
+  `session_meta`, and a newline first if the JSONL file stopped in the middle
+  of a line. The replayed history is already recorded and is not appended again.
+  When the agent replays history itself (`session/load`), Nori starts a new
+  transcript when it cannot continue the local one, because the agent's history
+  may be newer than the local copy.
+
+## Canonical Pkl event journal
+
+Each `.pkl` file is an append-only sequence of Pkl properties named
+`event_<id>`. Each property contains a typed event kind and a serialized
+payload. The journal stores messages, tool calls and results, received ACP/Nori
+session events, transcript-entry references, harness commands and results,
+backend bindings, and branch operations. IDs are stable, positive, and
+monotonically increasing within a session.
+
+The journal reducer builds a visible projection from its records. `rewind`
+changes the visible head but retains earlier records and their IDs. Fork
+operations identify inclusive source ranges by session ID and event IDs, so a
+selected history slice remains addressable after later rewinds. A forked
+transcript has its own session ID and records the parent lineage and source
+range.
+
+Rewind binds a fresh ACP session to the selected visible history. It rejects
+pending prompt admission, active delegated work, and concurrent program effects.
+If recording the rewind succeeds but its new backend binding is interrupted,
+resume creates a fresh ACP session instead of reusing an older provider session.
+The archived records remain available throughout this recovery.
+
+The harness appends a command before attempting its effect. Conversation
+programs also record their source and each typed operation before dispatch, then
+record operation results. Each program also records its final outcome, including
+evaluation failures and successful programs with no operations. Actor names
+created by a program keep their local binding for that program's follow-up
+commands; their recorded bindings remain available to later programs.
+Received session events are journaled before context
+observation and live reduction. Replay reduces recorded data only; it never
+evaluates a Pkl program or repeats an external effect.
+
+The JSONL file remains available for compatibility and transcript display. If
+the companion journal exists, `TranscriptLoader` reads visible entries and
+backend binding from the journal projection. Without a journal, it falls back
+to the JSONL file. Direct JSONL readers see the flat append history and cannot
+reconstruct a rewind's current visible head or the latest provider binding.
+
+Provider handoff keeps the current Nori conversation identity. The replacement
+backend uses the existing recorder and canonical journal, which records the
+handoff attempt and the new `backend-bound` value. A later transcript load
+therefore reports the latest visible ACP session binding while retaining the
+same Nori `session_id`. A delegated child session without a handoff gets its own
+Nori session ID and journal; its parent also records the events relayed to it.
 
 ### Project IDs and `project.json`
 
@@ -62,7 +119,7 @@ and reading `project.json`.
 `git_remote` and `git_root` are `null` outside a Git repository. The file is
 rewritten when a new session starts in the project.
 
-## Common line envelope
+## JSONL common line envelope
 
 Each nonblank JSONL line is a self-contained object with flattened entry
 fields:
@@ -71,16 +128,18 @@ fields:
 - `v`: storage schema version, currently `3`; and
 - `type`: snake-case entry kind.
 
-Canonical writers put `session_meta` first. The full loader must find valid
+JSONL writers put `session_meta` first. The full loader must find valid
 session metadata and treats an unparseable line before metadata as a hard
 error. After metadata, it skips blank, unknown, or unparseable lines so an
 otherwise readable transcript survives schema changes.
 
-## Canonical schema v3
+## JSONL schema v3
 
-The runtime v3 writer emits three entry kinds: `session_meta`, `user`, and
+The JSONL v3 writer emits three entry kinds: `session_meta`, `user`, and
 `session_event`. It does not write `assistant`, `client_event`, `tool_call`,
-`tool_result`, or `patch_apply` entries.
+`tool_result`, or `patch_apply` entries. The companion Pkl journal contains the
+stable event IDs, commands, and branch operations that are not represented by
+those JSONL entry kinds.
 
 ### `session_meta`
 
@@ -105,11 +164,11 @@ Optional identity fields, including `agent`, `git`, `acp_session_id`, and
 Nori transcript for a branch-at-head fork. Within `git`, `branch` and
 `commit_hash` are optional.
 `acp_session_id` is the agent's identity used for ACP session load or resume;
-it is distinct from Nori's transcript `session_id`. A transcript that a resume
-continued may hold sessions the agent started since (a `session/new` fallback);
-the metadata keeps the first, and resuming the transcript resumes the last one
-recorded (`Transcript::latest_acp_session_id`: the last non-archived
-`session_started` event, else the metadata's).
+it is distinct from Nori's transcript `session_id`. The metadata keeps the
+first ACP ID. When present, the latest visible `backend-bound` journal command
+overrides it; this tracks engine replacements and provider handoffs. For
+older journals without a binding command, `Transcript::latest_acp_session_id`
+uses the last non-archived `session_started` event, then the metadata value.
 
 ### `user`
 
@@ -199,9 +258,9 @@ responses retain the schema `RequestId`, which may be a string, number, or
 `null`. Because v3 stores the exact public event payload, its nested ACP shape
 tracks the ACP schema re-export selected by `nori-protocol`.
 
-V3 intentionally has one canonical copy of agent output: the raw ACP
-notification. It does not also persist a derived assistant record or the
-private TUI/Harness presentation projection.
+The JSONL v3 view has one copy of agent output: the raw ACP notification. It
+does not also persist a derived assistant record or the private TUI/Harness
+presentation projection.
 
 ## Setup, phases, and replay
 

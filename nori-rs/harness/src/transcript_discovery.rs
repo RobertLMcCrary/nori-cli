@@ -112,6 +112,10 @@ pub fn discover_transcript_for_agent_with_message(
     agent: AgentKind,
     first_message: Option<&str>,
 ) -> Result<TranscriptLocation, DiscoveryError> {
+    // OpenCode stores sessions in its database. Do not scan another agent's transcript files.
+    if agent == AgentKind::OpenCode {
+        return Err(DiscoveryError::NoSessionsFound(cwd.to_path_buf()));
+    }
     let home = dirs::home_dir().ok_or_else(|| DiscoveryError::HomeNotFound("~".to_string()))?;
     let base_dir = home.join(agent.transcript_base_dir());
 
@@ -313,6 +317,7 @@ pub fn parse_transcript_tokens(path: &Path, agent: AgentKind) -> Option<Transcri
         AgentKind::ClaudeCode => parse_claude_tokens(path),
         AgentKind::Codex => parse_codex_tokens(path),
         AgentKind::Gemini => parse_gemini_tokens(path),
+        AgentKind::OpenCode => None,
     }
 }
 

@@ -25,8 +25,8 @@ pub enum CommandScope {
 pub enum SlashCommand {
     // DO NOT ALPHA-SORT! Enum order is presentation order in the popup, so
     // more frequently used commands should be listed first.
-    Agent,
     Model,
+    Providers,
     Config,
     Approvals,
     Settings,
@@ -35,6 +35,7 @@ pub enum SlashCommand {
     New,
     Resume,
     ResumeViewonly,
+    Reference,
     Close,
     Init,
     Compact,
@@ -62,10 +63,11 @@ impl SlashCommand {
     /// User-visible description shown in the popup.
     pub fn description(self) -> &'static str {
         match self {
-            SlashCommand::Agent => "switch between available ACP agents",
+            SlashCommand::Providers => "connect model providers",
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Resume => "resume a previous session",
             SlashCommand::ResumeViewonly => "view a previous session transcript (read-only)",
+            SlashCommand::Reference => "search past chats and reference one in your draft",
             SlashCommand::Close => "close (release) the current session and start a fresh chat",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Nori",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
@@ -80,7 +82,7 @@ impl SlashCommand {
             SlashCommand::RemoteControl => "manage remote ACP access to this running session",
             SlashCommand::Memory => "show the contents of all active instruction files",
             SlashCommand::FirstPrompt => "show the first prompt from this session",
-            SlashCommand::Model => "choose what model and reasoning effort to use",
+            SlashCommand::Model => "choose a model",
             SlashCommand::Config => "configure ACP agent settings (if exposed by the agent)",
             SlashCommand::Approvals => "choose what Nori can do without approval",
             SlashCommand::Settings => "configure Nori CLI settings (theme, hotkeys, layout, …)",
@@ -104,7 +106,7 @@ impl SlashCommand {
     /// Whether this command can be run while a task is in progress.
     pub fn available_during_task(self) -> bool {
         match self {
-            SlashCommand::Agent
+            SlashCommand::Providers
             | SlashCommand::New
             | SlashCommand::Resume
             | SlashCommand::ResumeViewonly
@@ -125,6 +127,7 @@ impl SlashCommand {
             | SlashCommand::Close
             | SlashCommand::Browser => false,
             SlashCommand::Browse
+            | SlashCommand::Reference
             | SlashCommand::Diff
             | SlashCommand::Mention
             | SlashCommand::Status
@@ -148,7 +151,7 @@ impl SlashCommand {
             | SlashCommand::Browse
             | SlashCommand::Diff
             | SlashCommand::Browser => CommandScope::LocalOnly,
-            SlashCommand::Agent
+            SlashCommand::Providers
             | SlashCommand::Model
             | SlashCommand::Config
             | SlashCommand::Approvals
@@ -158,6 +161,7 @@ impl SlashCommand {
             | SlashCommand::New
             | SlashCommand::Resume
             | SlashCommand::ResumeViewonly
+            | SlashCommand::Reference
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Undo
@@ -179,6 +183,7 @@ impl SlashCommand {
 
     fn is_visible(self) -> bool {
         match self {
+            SlashCommand::Approvals => false,
             #[cfg(not(feature = "login"))]
             SlashCommand::Logout => false,
             _ => true,
@@ -217,6 +222,27 @@ mod tests {
         assert!(
             has_logout,
             "/logout should be visible when login feature is enabled"
+        );
+    }
+
+    #[test]
+    fn agent_and_approval_commands_are_unavailable() {
+        let commands = built_in_slash_commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|(_, command)| *command == SlashCommand::Approvals)
+        );
+        assert!("agent".parse::<SlashCommand>().is_err());
+        assert!(
+            commands
+                .iter()
+                .any(|(_, command)| *command == SlashCommand::Providers)
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|(_, command)| *command == SlashCommand::Model)
         );
     }
 

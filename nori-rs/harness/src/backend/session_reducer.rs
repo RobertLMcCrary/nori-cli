@@ -40,6 +40,10 @@ pub enum InboundEvent {
     PermissionRequest { request_id: String, call_id: String },
     /// The user submitted a prompt (may be queued if a request is in flight).
     PromptSubmit(QueuedPrompt),
+    /// Prioritize this prompt and interrupt the current turn.
+    PromptSteer(QueuedPrompt),
+    /// Interrupt the current turn and start the oldest queued prompt.
+    PromoteQueued,
     /// A remote controller submitted a prompt that must not queue.
     PromptSubmitIfIdle(QueuedPrompt),
     /// The user requested cancellation of the active prompt.
@@ -58,7 +62,10 @@ pub(super) fn inbound_event_kind(event: &InboundEvent) -> &'static str {
         InboundEvent::LoadResponse => "load_response",
         InboundEvent::PromptStarted { .. } => "prompt_started",
         InboundEvent::PermissionRequest { .. } => "permission_request",
-        InboundEvent::PromptSubmit(_) | InboundEvent::PromptSubmitIfIdle(_) => "prompt_submit",
+        InboundEvent::PromptSubmit(_)
+        | InboundEvent::PromptSubmitIfIdle(_)
+        | InboundEvent::PromptSteer(_) => "prompt_submit",
+        InboundEvent::PromoteQueued => "promote_queued",
         InboundEvent::CancelSubmit | InboundEvent::CancelSubmitFor { .. } => "cancel_submit",
         InboundEvent::LoadSubmit { .. } => "load_submit",
     }
@@ -114,6 +121,28 @@ pub fn reduce(
     match event {
         InboundEvent::PromptSubmit(prompt) => {
             reduce_prompt_submit(runtime, prompt, &mut out);
+        }
+        InboundEvent::PromptSteer(prompt) => {
+            if runtime.phase == SessionPhase::Idle {
+                start_prompt(runtime, prompt, &mut out);
+            } else {
+                runtime.queue.push_front(prompt);
+                runtime.steer_after_cancel = true;
+                out.events.push(ClientEvent::QueueChanged(QueueChanged {
+                    prompts: queued_prompt_texts(runtime),
+                }));
+                reduce_cancel_submit(runtime, None, &mut out);
+            }
+        }
+        InboundEvent::PromoteQueued => {
+            if !runtime.queue.is_empty() {
+                if runtime.phase == SessionPhase::Idle {
+                    start_next_queued(runtime, &mut out);
+                } else {
+                    runtime.steer_after_cancel = true;
+                    reduce_cancel_submit(runtime, None, &mut out);
+                }
+            }
         }
         InboundEvent::PromptSubmitIfIdle(prompt) => {
             if runtime.phase == SessionPhase::Idle && runtime.queue.is_empty() {
@@ -183,6 +212,15 @@ fn reduce_prompt_submit(
     }
 
     start_prompt(runtime, prompt, out);
+}
+
+fn start_next_queued(runtime: &mut SessionRuntime, out: &mut ReduceOutput) {
+    if let Some(next_prompt) = runtime.queue.pop_front() {
+        out.events.push(ClientEvent::QueueChanged(QueueChanged {
+            prompts: queued_prompt_texts(runtime),
+        }));
+        start_prompt(runtime, next_prompt, out);
+    }
 }
 
 fn start_prompt(runtime: &mut SessionRuntime, prompt: QueuedPrompt, out: &mut ReduceOutput) {
@@ -343,7 +381,8 @@ fn reduce_prompt_response(
         return;
     }
 
-    let should_drain_queue = stop_reason == acp::StopReason::EndTurn;
+    let should_drain_queue = stop_reason == acp::StopReason::EndTurn || runtime.steer_after_cancel;
+    runtime.steer_after_cancel = false;
     let last_agent_message = finalize_active(runtime);
 
     runtime.phase = SessionPhase::Idle;
@@ -366,11 +405,8 @@ fn reduce_prompt_response(
             failure: None,
         }));
 
-    if should_drain_queue && let Some(next_prompt) = runtime.queue.pop_front() {
-        out.events.push(ClientEvent::QueueChanged(QueueChanged {
-            prompts: queued_prompt_texts(runtime),
-        }));
-        start_prompt(runtime, next_prompt, out);
+    if should_drain_queue {
+        start_next_queued(runtime, out);
     }
 }
 
@@ -398,6 +434,7 @@ fn reduce_prompt_failed(
         return;
     }
 
+    let should_drain_queue = std::mem::take(&mut runtime.steer_after_cancel);
     let last_agent_message = finalize_active(runtime);
     runtime.phase = SessionPhase::Idle;
     out.events
@@ -408,6 +445,9 @@ fn reduce_prompt_failed(
             last_agent_message,
             failure,
         }));
+    if should_drain_queue {
+        start_next_queued(runtime, out);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +487,10 @@ fn reduce_load_response(runtime: &mut SessionRuntime, out: &mut ReduceOutput) {
     out.events
         .push(ClientEvent::SessionPhaseChanged(runtime.phase_view()));
     out.events.push(ClientEvent::LoadCompleted);
-    // Loads never drain the queue.
+    if std::mem::take(&mut runtime.steer_after_cancel) {
+        start_next_queued(runtime, out);
+    }
+    // Loads otherwise leave the queue untouched.
 }
 
 // ---------------------------------------------------------------------------

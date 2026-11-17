@@ -8,6 +8,19 @@
 use super::*;
 
 impl ChatWidget {
+    /// Drain only the unfinished portion of a streaming response before exit.
+    pub(crate) fn take_stream_cell_for_exit(&mut self) -> Option<Box<dyn HistoryCell>> {
+        let mut controller = self.stream_controller.take()?;
+        let cell = controller.finish_for_exit();
+        self.live_tail.set(None);
+        cell
+    }
+
+    /// Move the last visible cell into native history before the event loop exits.
+    pub(crate) fn take_active_cell_for_exit(&mut self) -> Option<Box<dyn HistoryCell>> {
+        self.active_cell.take()
+    }
+
     /// Render the stream's pending input. Called before every draw.
     pub(crate) fn commit_stream_for_frame(&mut self) {
         let Some(controller) = self.stream_controller.as_mut() else {

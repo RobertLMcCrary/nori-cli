@@ -1,0 +1,10 @@
+{"t_ms":0,"update":{"sessionUpdate":"subagent_update","sessionId":"oc-child","title":"child"}}
+{"t_ms":1,"update":{"sessionUpdate":"subagent_update","sessionId":"oc-child","state":{"state":"running"}}}
+{"t_ms":2,"session":"oc-child","update":{"sessionUpdate":"tool_call","toolCallId":"read-1","title":"read","kind":"read","status":"in_progress","rawInput":{"path":"file"}}}
+{"t_ms":3,"session":"oc-child","update":{"sessionUpdate":"tool_call_update","toolCallId":"read-1","status":"completed","rawOutput":{"text":"child tool result"}}}
+{"t_ms":4,"session":"oc-child","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"child-only words"}}}
+{"t_ms":5,"session":"oc-child","update":{"sessionUpdate":"subagent_update","sessionId":"oc-grandchild","title":"grandchild","state":{"state":"running"}}}
+{"t_ms":6,"session":"oc-grandchild","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"grandchild-only words"}}}
+{"t_ms":7,"session":"oc-child","update":{"sessionUpdate":"subagent_update","sessionId":"oc-grandchild","state":{"state":"idle","stopReason":"end_turn"}}}
+{"t_ms":8,"update":{"sessionUpdate":"subagent_update","sessionId":"oc-child","state":{"state":"idle","stopReason":"end_turn"}}}
+{"t_ms":9,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"parent-only words"}}}

@@ -1,0 +1,20 @@
+---
+source: tui/src/chatwidget/tests/subagents.rs
+assertion_line: 393
+expression: rendered
+---
+
+Investigate build · running
+› Please inspect the build
+I found the failing dependency.
+Failed to load session sample: not found
+
+
+
+
+
+
+
+
+
+› Ask Nori to do anything

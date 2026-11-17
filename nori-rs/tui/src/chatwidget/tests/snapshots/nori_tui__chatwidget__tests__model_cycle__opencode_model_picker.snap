@@ -1,0 +1,17 @@
+---
+source: tui/src/chatwidget/tests/model_cycle.rs
+assertion_line: 390
+expression: rendered
+---
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Select model                                                                ×│
+│ ⌕  Type to search                                                            │
+│                                                                              │
+│ ▏1. Big Pickle (current)                                                   ▕ │
+│  2. Coder                                                                    │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+                                                        Claude Code · Big Pickle
+› ! for shell commands

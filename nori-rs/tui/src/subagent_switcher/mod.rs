@@ -28,7 +28,6 @@ use nori_config::HotkeyBinding;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-pub(crate) use preview::header_lines;
 pub(crate) use roster::Body;
 pub(crate) use roster::BodyQuery;
 pub(crate) use roster::Entry;
@@ -40,7 +39,6 @@ use switcher::Switcher;
 pub(crate) use tail::Tail;
 pub(crate) use tail::cell_lines;
 
-use crate::pager_overlay::SubagentFocus;
 use crate::tui;
 use crate::tui::TuiEvent;
 
@@ -49,50 +47,29 @@ use crate::tui::TuiEvent;
 pub(crate) enum Transition {
     /// Leave for the normal chat view.
     Close,
+    /// Open the main conversation.
+    FocusMain,
     /// Open the focused view of a subagent.
     Focus(SubagentKey),
-    /// Go back to the list.
-    OpenSwitcher,
-}
-
-enum Mode {
-    Switcher(Box<Switcher>),
-    Focused(Box<SubagentFocus>),
 }
 
 pub(crate) struct SubagentOverlay {
-    mode: Mode,
-    /// The binding that opened the switcher; it closes it, and opens it from the focused view.
+    switcher: Switcher,
     toggle: HotkeyBinding,
     transition: Option<Transition>,
+    area: Rect,
 }
 
 impl SubagentOverlay {
-    /// The list of the main session and every subagent.
     pub(crate) fn switcher(roster: &Roster, toggle: HotkeyBinding) -> Self {
         Self {
-            mode: Mode::Switcher(Box::new(Switcher::new(roster))),
+            switcher: Switcher::new(roster),
             toggle,
             transition: None,
+            area: Rect::default(),
         }
     }
 
-    /// The conversation of one subagent, if it is still known.
-    pub(crate) fn focused(
-        roster: &Roster,
-        subagent: SubagentKey,
-        toggle: HotkeyBinding,
-        width: u16,
-    ) -> Option<Self> {
-        let focus = SubagentFocus::new(roster, Target::Subagent(subagent), width)?;
-        Some(Self {
-            mode: Mode::Focused(Box::new(focus)),
-            toggle,
-            transition: None,
-        })
-    }
-
-    /// The transition the last event asked for, once.
     pub(crate) fn take_transition(&mut self) -> Option<Transition> {
         self.transition.take()
     }
@@ -101,44 +78,25 @@ impl SubagentOverlay {
         self.transition == Some(Transition::Close)
     }
 
-    /// The conversation tail the overlay shows and does not have, for a screen of `area`.
     pub(crate) fn body_query(&self, area: Rect, now: Instant) -> Option<BodyQuery> {
-        match &self.mode {
-            Mode::Switcher(switcher) => switcher.body_query(area, now),
-            Mode::Focused(focus) => focus.body_query(area, now),
-        }
+        self.switcher.body_query(area, now)
     }
 
-    /// Take a fresh roster.
-    pub(crate) fn update(&mut self, roster: &Roster, area: Rect) {
-        match &mut self.mode {
-            Mode::Switcher(switcher) => switcher.apply(roster),
-            Mode::Focused(focus) => focus.apply(roster, None, area.width),
-        }
+    pub(crate) fn update(&mut self, roster: &Roster, _area: Rect) {
+        self.switcher.apply(roster);
     }
 
-    /// Take the body that [`Self::body_query`] asked for.
-    pub(crate) fn set_body(&mut self, roster: &Roster, body: Body, area: Rect) {
-        match &mut self.mode {
-            Mode::Switcher(switcher) => switcher.set_body(body),
-            Mode::Focused(focus) => focus.apply(roster, Some(body), area.width),
-        }
+    pub(crate) fn set_body(&mut self, _roster: &Roster, body: Body, _area: Rect) {
+        self.switcher.set_body(body);
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        match &mut self.mode {
-            Mode::Switcher(switcher) => switcher.render(area, buf, &self.toggle),
-            Mode::Focused(focus) => focus.render(area, buf, &self.toggle),
-        }
+        self.switcher.render(area, buf, &self.toggle);
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
-        let transition = match &mut self.mode {
-            Mode::Switcher(switcher) => switcher.on_key(key, &self.toggle),
-            Mode::Focused(focus) => focus.on_key(key, &self.toggle),
-        };
-        if transition.is_some() {
-            self.transition = transition;
+        if let Some(transition) = self.switcher.on_key(key, &self.toggle) {
+            self.transition = Some(transition);
         }
     }
 
@@ -148,12 +106,28 @@ impl SubagentOverlay {
                 self.on_key(key);
                 tui.frame_requester().schedule_frame();
             }
+            TuiEvent::Paste(text) => {
+                for character in text.chars().filter(|character| !character.is_control()) {
+                    self.on_key(KeyEvent::new(
+                        crossterm::event::KeyCode::Char(character),
+                        crossterm::event::KeyModifiers::NONE,
+                    ));
+                }
+                tui.frame_requester().schedule_frame();
+            }
             TuiEvent::Draw => {
-                tui.draw(u16::MAX, 0, |frame| {
+                tui.draw_overlay(|frame| {
+                    self.area = frame.area();
                     self.render(frame.area(), frame.buffer);
                 })?;
             }
-            TuiEvent::Paste(_) | TuiEvent::Mouse(_) => {}
+            TuiEvent::Mouse(mouse) => {
+                if mouse.kind == crossterm::event::MouseEventKind::Moved {
+                    return Ok(());
+                }
+                self.transition = self.switcher.on_mouse(mouse, self.area);
+                tui.frame_requester().schedule_frame();
+            }
         }
         Ok(())
     }

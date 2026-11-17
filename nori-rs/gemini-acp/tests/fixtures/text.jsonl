@@ -1,0 +1,1 @@
+{"method":"generateContentStream","response":[{"candidates":[{"content":{"parts":[{"text":"hello from official Gemini Core fake transport"}],"role":"model"},"finishReason":"STOP"}]}]}

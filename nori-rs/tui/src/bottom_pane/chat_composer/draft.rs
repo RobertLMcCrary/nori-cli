@@ -19,8 +19,15 @@ impl ChatComposer {
     /// Take the edit before discarding this composer. A buffered first character
     /// or paste is part of the draft even when `current_text()` is still empty.
     pub(crate) fn take_draft(&mut self) -> ComposerDraft {
+        let mut fresh = TextArea::new();
+        fresh.set_hotkey_config(self.textarea.hotkey_config().clone());
+        if self.textarea.kakoune_mode_enabled() {
+            fresh.set_kakoune_mode_enabled(true);
+        } else {
+            fresh.set_vim_mode_enabled(self.textarea.vim_mode_state_if_enabled().is_some());
+        }
         ComposerDraft {
-            textarea: std::mem::replace(&mut self.textarea, TextArea::new()),
+            textarea: std::mem::replace(&mut self.textarea, fresh),
             textarea_state: self.textarea_state.take(),
             pending_pastes: std::mem::take(&mut self.pending_pastes),
             attached_images: std::mem::take(&mut self.attached_images),

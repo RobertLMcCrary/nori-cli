@@ -135,8 +135,8 @@ mod tests {
         );
         assert_eq!(config.os_notifications, OsNotifications::Enabled);
         assert!(!config.vertical_footer);
-        assert_eq!(config.sandbox_mode, crate::SandboxMode::WorkspaceWrite);
-        assert_eq!(config.approval_policy, AskForApproval::OnRequest);
+        assert_eq!(config.sandbox_mode, crate::SandboxMode::DangerFullAccess);
+        assert_eq!(config.approval_policy, AskForApproval::Never);
     }
 
     #[test]

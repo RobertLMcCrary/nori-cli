@@ -6,6 +6,11 @@ use std::io;
 use std::io::Error as IoError;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use nori_conversation::ConversationLog;
+use nori_conversation::Event;
+use tokio::sync::Mutex;
 
 use serde_json;
 use tokio::fs::File;
@@ -43,6 +48,7 @@ enum TranscriptCmd {
 #[derive(Clone)]
 pub struct TranscriptRecorder {
     tx: Sender<TranscriptCmd>,
+    conversation: Option<Arc<Mutex<ConversationLog>>>,
     session_id: String,
     project_id: String,
     transcript_path: PathBuf,
@@ -51,7 +57,42 @@ pub struct TranscriptRecorder {
     continues_recorded_session: bool,
 }
 
+impl std::fmt::Debug for TranscriptRecorder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TranscriptRecorder")
+            .field("session_id", &self.session_id)
+            .field("transcript_path", &self.transcript_path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TranscriptRecorder {
+    /// Read the current canonical conversation as replay events, including durable response
+    /// boundaries. Flush first so a caller can safely use those boundaries for history actions.
+    pub async fn replay_session_events(&self) -> io::Result<Vec<nori_protocol::SessionEvent>> {
+        self.flush().await?;
+        let transcript = super::loader::load_transcript_from_path(&self.transcript_path).await?;
+        Ok(crate::backend::transcript_to_replay_session_events(
+            &transcript,
+        ))
+    }
+
+    pub(crate) fn has_conversation_log(&self) -> bool {
+        self.conversation.is_some()
+    }
+
+    /// Read a child journal with its exact terminal response receipts.
+    pub async fn replay_child_session_events(
+        &self,
+    ) -> io::Result<Vec<nori_protocol::SessionEvent>> {
+        self.flush().await?;
+        let transcript = super::loader::load_transcript_from_path(&self.transcript_path).await?;
+        Ok(crate::backend::transcript_to_child_replay_session_events(
+            &transcript,
+        ))
+    }
+
     /// Initialize for a new session.
     ///
     /// - Detects project from cwd (git root or cwd path)
@@ -118,11 +159,20 @@ impl TranscriptRecorder {
             forked_from: None,
         };
 
+        let mut log = ConversationLog::open(transcript_path.with_extension("pkl"))?;
+        let meta_line = TranscriptLine::new(TranscriptEntry::SessionMeta(session_meta.clone()));
+        log.append(Event::Operation {
+            name: "transcript-entry".into(),
+            args: serde_json::to_string(&meta_line)?,
+        })?;
+        let conversation = Some(Arc::new(Mutex::new(log)));
+
         // Spawn background writer
         tokio::spawn(transcript_writer(file, rx, session_meta));
 
         Ok(Self {
             tx,
+            conversation,
             session_id,
             project_id: project_id_info.id,
             transcript_path,
@@ -184,8 +234,37 @@ impl TranscriptRecorder {
             cli_version: cli_version.to_string(),
             git: git_info,
             acp_session_id: Some(new_acp_session_id),
-            forked_from: Some(forked_from),
+            forked_from: Some(forked_from.clone()),
         };
+
+        let mut log = ConversationLog::open(transcript_path.with_extension("pkl"))?;
+        let parent_path = sessions_dir.join(format!("{forked_from}.pkl"));
+        if parent_path.exists() {
+            let parent = ConversationLog::open(parent_path)?;
+            if let (Some(start), Some(end)) = (
+                parent.projection().visible().first(),
+                parent.projection().visible().last(),
+            ) {
+                let payload = serde_json::json!({ "session_id": forked_from, "start": start.id, "end": end.id }).to_string();
+                log.append(Event::Command {
+                    name: "fork-source".into(),
+                    payload,
+                })?;
+            }
+        }
+        let meta_line = TranscriptLine::new(TranscriptEntry::SessionMeta(session_meta.clone()));
+        log.append(Event::Operation {
+            name: "transcript-entry".into(),
+            args: serde_json::to_string(&meta_line)?,
+        })?;
+        for entry in &seed_entries {
+            let line = TranscriptLine::new(entry.clone());
+            log.append(Event::Operation {
+                name: "transcript-entry".into(),
+                args: serde_json::to_string(&line)?,
+            })?;
+        }
+        let conversation = Some(Arc::new(Mutex::new(log)));
 
         // Batch the metadata line plus every seeded entry into a single write.
         let mut batch = serialize_line(&TranscriptLine::new(TranscriptEntry::SessionMeta(
@@ -202,6 +281,7 @@ impl TranscriptRecorder {
 
         Ok(Self {
             tx,
+            conversation,
             session_id,
             project_id: project_id_info.id,
             transcript_path,
@@ -232,10 +312,17 @@ impl TranscriptRecorder {
                 file.write_all(b"\n").await?;
             }
         }
+        let log_path = transcript_path.with_extension("pkl");
+        let conversation = if log_path.exists() {
+            Some(Arc::new(Mutex::new(ConversationLog::open(log_path)?)))
+        } else {
+            None
+        };
         let (tx, rx) = mpsc::channel::<TranscriptCmd>(256);
         tokio::spawn(run_writer_loop(file, rx));
         Ok(Self {
             tx,
+            conversation,
             session_id: meta.session_id.clone(),
             project_id: meta.project_id.clone(),
             transcript_path,
@@ -264,9 +351,222 @@ impl TranscriptRecorder {
     }
 
     /// Record the exact public event delivered across the Harness boundary.
-    pub(crate) async fn record_session_event(&self, event: &SessionEventEntry) -> io::Result<()> {
-        self.send_entry(TranscriptEntry::SessionEvent(event.clone()))
+    pub(crate) async fn record_session_event(
+        &self,
+        event: &SessionEventEntry,
+    ) -> io::Result<Option<i64>> {
+        self.send_entry_with_id(TranscriptEntry::SessionEvent(event.clone()))
             .await
+    }
+
+    /// Resolve a stable range within this session's current visible projection.
+    pub(crate) async fn projected_fork_records(
+        &self,
+        session_id: &str,
+        start: i64,
+        end: i64,
+    ) -> io::Result<Vec<nori_conversation::Record>> {
+        if session_id != self.session_id {
+            return Err(io::Error::other("fork source is not the active session"));
+        }
+        let log = self
+            .conversation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
+        log.lock()
+            .await
+            .projection()
+            .slice(nori_conversation::SliceRef { start, end })
+            .ok_or_else(|| io::Error::other("fork source range is not visible"))
+    }
+
+    /// Capture the current visible conversation as provider fallback context.
+    pub async fn visible_context(&self) -> io::Result<String> {
+        let head = self.conversation_head().await;
+        self.projected_context(head).await
+    }
+
+    /// Compute the text fallback for a prospective head without modifying the log.
+    pub(crate) async fn projected_context(&self, head: Option<i64>) -> io::Result<String> {
+        let log = self
+            .conversation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
+        let log = log.lock().await;
+        let visible = log.projection().visible();
+        let length = match head {
+            Some(id) => visible
+                .iter()
+                .position(|record| record.id == id)
+                .map(|index| index + 1)
+                .ok_or_else(|| io::Error::other("rewind head is not visible"))?,
+            None => 0,
+        };
+        let entries = visible[..length]
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::Operation { name, args } if name == "transcript-entry" => {
+                    Some(serde_json::from_str::<TranscriptLine>(args).map_err(io::Error::other))
+                }
+                _ => None,
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let meta = log
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::Operation { name, args } if name == "transcript-entry" => {
+                    serde_json::from_str::<TranscriptLine>(args).ok()
+                }
+                _ => None,
+            })
+            .find_map(|line| match line.entry {
+                TranscriptEntry::SessionMeta(meta) => Some(meta),
+                _ => None,
+            })
+            .ok_or_else(|| io::Error::other("conversation log has no session metadata"))?;
+        let transcript = super::loader::Transcript {
+            meta,
+            entries,
+            backend_binding: None,
+            requires_fresh_binding: false,
+            event_ids: Vec::new(),
+        };
+        let has_fork_seed = visible[..length].iter().any(|record| {
+            matches!(
+                &record.event, Event::Command { name, .. } if name == "fork-context"
+            )
+        });
+        if has_fork_seed {
+            // The archived source is provenance, not live context: a rewind may select an
+            // earlier inherited response. Build from visible replay-safe entries so discarded
+            // source events cannot leak into the replacement provider session.
+            let updates: Vec<_> = crate::backend::transcript_to_replay_session_events(&transcript)
+                .into_iter()
+                .filter_map(|event| match event {
+                    nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                        nori_protocol::acp::v1::AgentNotification::SessionNotification(
+                            notification,
+                        ),
+                    )) => Some(notification.update),
+                    _ => None,
+                })
+                .collect();
+            Ok(format!(
+                "Visible conversation history:\n{}",
+                serde_json::to_string(&updates).map_err(io::Error::other)?
+            ))
+        } else {
+            Ok(crate::backend::transcript_to_summary(&transcript))
+        }
+    }
+
+    /// Most recent visible payload for a previously recorded command.
+    pub(crate) async fn recorded_command_payload(&self, name: &str) -> Option<String> {
+        let log = self.conversation.as_ref()?.lock().await;
+        log.projection()
+            .visible()
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::Command {
+                    name: recorded_name,
+                    payload,
+                } if recorded_name == name => Some(payload.clone()),
+                _ => None,
+            })
+    }
+
+    /// Record the identity of an engine bound to this conversation.
+    pub(crate) async fn record_backend_bound(&self, payload: String) -> io::Result<()> {
+        self.record_command("backend-bound", payload).await
+    }
+
+    pub(crate) async fn conversation_head(&self) -> Option<i64> {
+        match &self.conversation {
+            Some(log) => log.lock().await.projection().head(),
+            None => None,
+        }
+    }
+
+    pub(crate) async fn conversation_next_id(&self) -> io::Result<i64> {
+        self.conversation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("legacy session has no event log"))?
+            .lock()
+            .await
+            .next_id()
+    }
+
+    /// The ordered records in this journal's current visible projection.
+    pub(crate) async fn visible_records(&self) -> io::Result<Vec<nori_conversation::Record>> {
+        let log = self
+            .conversation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
+        Ok(log.lock().await.projection().visible().to_vec())
+    }
+
+    /// Move the visible head while retaining all previous records.
+    pub(crate) async fn rewind_head(&self, head: Option<i64>) -> io::Result<()> {
+        let log = self
+            .conversation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
+        log.lock().await.append(Event::Rewind { head })?;
+        Ok(())
+    }
+
+    /// Anchor a child session to an inclusive range in its source session.
+    pub(crate) async fn record_fork_source(
+        &self,
+        session_id: String,
+        start: i64,
+        end: i64,
+        context: String,
+        entries: Vec<super::types::TranscriptLine>,
+    ) -> io::Result<()> {
+        self.record_command(
+            "fork-source",
+            serde_json::json!({"session_id": session_id, "start": start, "end": end}).to_string(),
+        )
+        .await?;
+        self.record_command("fork-context", context).await?;
+        for line in entries {
+            self.send_entry(line.entry).await?;
+        }
+        Ok(())
+    }
+
+    /// Persist the received event before the live timeline applies it.
+    pub(crate) async fn record_received_event(
+        &self,
+        event: &nori_protocol::SessionEvent,
+    ) -> io::Result<Option<(i64, i64)>> {
+        if let Some(log) = &self.conversation {
+            let mut log = log.lock().await;
+            let record = log.append(Event::SessionEvent {
+                payload: serde_json::to_string(event)?,
+            })?;
+            let start = log
+                .projection()
+                .visible()
+                .first()
+                .map_or(record.id, |first| first.id);
+            return Ok(Some((start, record.id)));
+        }
+        Ok(None)
+    }
+
+    /// Persist a submitted harness command before executing it.
+    pub(crate) async fn record_command(&self, name: &str, payload: String) -> io::Result<()> {
+        if let Some(log) = &self.conversation {
+            log.lock().await.append(Event::Command {
+                name: name.into(),
+                payload,
+            })?;
+        }
+        Ok(())
     }
 
     /// Flush all pending writes.
@@ -308,10 +608,29 @@ impl TranscriptRecorder {
 
     /// Send an entry to the background writer.
     async fn send_entry(&self, entry: TranscriptEntry) -> io::Result<()> {
+        self.send_entry_with_id(entry).await.map(drop)
+    }
+
+    async fn send_entry_with_id(&self, entry: TranscriptEntry) -> io::Result<Option<i64>> {
+        let id = if let Some(log) = &self.conversation {
+            let line = TranscriptLine::new(entry.clone());
+            Some(
+                log.lock()
+                    .await
+                    .append(Event::Operation {
+                        name: "transcript-entry".into(),
+                        args: serde_json::to_string(&line)?,
+                    })?
+                    .id,
+            )
+        } else {
+            None
+        };
         self.tx
             .send(TranscriptCmd::Write(Box::new(entry)))
             .await
-            .map_err(|e| IoError::other(format!("failed to queue transcript entry: {e}")))
+            .map_err(|e| IoError::other(format!("failed to queue transcript entry: {e}")))?;
+        Ok(id)
     }
 }
 
@@ -492,7 +811,7 @@ mod tests {
         let sessions = std::fs::read_dir(first.transcript_path().parent().unwrap())
             .unwrap()
             .count();
-        assert_eq!(sessions, 1);
+        assert_eq!(sessions, 2);
         let reloaded = loader
             .load_transcript(first.project_id(), first.session_id())
             .await
@@ -506,6 +825,304 @@ mod tests {
             })
             .collect();
         assert_eq!(turns, vec!["first turn", "second turn"]);
+    }
+
+    #[tokio::test]
+    async fn projected_backend_binding_tracks_rewind() {
+        let dir = TempDir::new().unwrap();
+        let recorder = TranscriptRecorder::new(
+            dir.path(),
+            dir.path(),
+            Some("first".into()),
+            "0.1.0",
+            Some("first-id".into()),
+        )
+        .await
+        .unwrap();
+        recorder
+            .record_backend_bound(
+                serde_json::json!({"agent":"first", "acp_session_id":"first-id"}).to_string(),
+            )
+            .await
+            .unwrap();
+        let head = recorder.conversation_head().await.unwrap();
+        recorder
+            .record_backend_bound(
+                serde_json::json!({"agent":"second", "acp_session_id":"second-id"}).to_string(),
+            )
+            .await
+            .unwrap();
+        let loader = super::super::TranscriptLoader::new(dir.path().to_path_buf());
+        let before = loader
+            .load_transcript(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                before.meta.agent.as_deref(),
+                before.latest_acp_session_id().as_deref()
+            ),
+            (Some("second"), Some("second-id"))
+        );
+        let listed = loader
+            .load_session_meta(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            (listed.agent.as_deref(), listed.acp_session_id.as_deref()),
+            (Some("second"), Some("second-id"))
+        );
+        recorder.rewind_head(Some(head)).await.unwrap();
+        let listed = loader
+            .load_session_meta(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            (listed.agent.as_deref(), listed.acp_session_id.as_deref()),
+            (Some("first"), None)
+        );
+        let after = loader
+            .load_transcript(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                after.meta.agent.as_deref(),
+                after.latest_acp_session_id().as_deref()
+            ),
+            (Some("first"), None)
+        );
+        assert!(after.requires_fresh_binding);
+        recorder
+            .record_backend_bound(
+                serde_json::json!({"agent":"first", "acp_session_id":"replacement-id"}).to_string(),
+            )
+            .await
+            .unwrap();
+        let rebound = loader
+            .load_transcript(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            rebound.latest_acp_session_id().as_deref(),
+            Some("replacement-id")
+        );
+        assert!(!rebound.requires_fresh_binding);
+        recorder.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handoff_audit_is_persisted_but_hidden_from_transcript_replay() {
+        let dir = TempDir::new().unwrap();
+        let recorder = TranscriptRecorder::new(
+            dir.path(),
+            dir.path(),
+            Some("mock-model".into()),
+            "0.1.0",
+            Some("old-engine".into()),
+        )
+        .await
+        .unwrap();
+        recorder
+            .record_user_message("request-1", "Keep working on this", Vec::new())
+            .await
+            .unwrap();
+        recorder
+            .record_command(
+                "handoff-attempt",
+                serde_json::json!({
+                    "status": "failed",
+                    "provider": "mock-model-alt",
+                    "model": "secret-ranked-candidate",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        recorder.shutdown().await.unwrap();
+        let log = ConversationLog::open(recorder.transcript_path().with_extension("pkl")).unwrap();
+        assert!(log.projection().visible().iter().any(|record| matches!(
+            &record.event,
+            Event::Command { name, payload }
+                if name == "handoff-attempt" && payload.contains("secret-ranked-candidate")
+        )));
+
+        let transcript = super::super::TranscriptLoader::new(dir.path().to_path_buf())
+            .load_transcript(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+        let summary = crate::backend::transcript_to_summary(&transcript);
+        let replay_client_events = crate::backend::transcript_to_replay_client_events(&transcript);
+        let replay_session_events =
+            crate::backend::transcript_to_replay_session_events(&transcript);
+        let replay =
+            serde_json::to_string(&(summary, replay_client_events, replay_session_events)).unwrap();
+        assert!(!replay.contains("handoff-attempt"), "{replay}");
+        assert!(!replay.contains("mock-model-alt"), "{replay}");
+        assert!(!replay.contains("secret-ranked-candidate"), "{replay}");
+    }
+
+    #[tokio::test]
+    async fn projected_context_keeps_visible_tool_input_and_output() {
+        use nori_protocol::acp::v1 as acp;
+        let dir = TempDir::new().unwrap();
+        let recorder = TranscriptRecorder::new(dir.path(), dir.path(), None, "0.1.0", None)
+            .await
+            .unwrap();
+        recorder
+            .record_user_message("one", "inspect", vec![])
+            .await
+            .unwrap();
+        let call = acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new("tool-1"), "Read")
+                .raw_input(serde_json::json!({"path": "example.txt"})),
+        );
+        let result = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            acp::ToolCallId::new("tool-1"),
+            acp::ToolCallUpdateFields::new()
+                .status(acp::ToolCallStatus::Completed)
+                .raw_output(serde_json::json!({"text": "visible result"})),
+        ));
+        for update in [call, result] {
+            let event = nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                acp::AgentNotification::SessionNotification(acp::SessionNotification::new(
+                    "session", update,
+                )),
+            ));
+            recorder
+                .record_session_event(&SessionEventEntry::new(event))
+                .await
+                .unwrap();
+        }
+        let head = recorder.conversation_head().await.unwrap();
+        recorder
+            .record_user_message("two", "discarded text", vec![])
+            .await
+            .unwrap();
+        let context = recorder.projected_context(Some(head)).await.unwrap();
+        let user = context.find("User: inspect").unwrap();
+        let input = context.find("example.txt").unwrap();
+        let output = context.find("visible result").unwrap();
+        assert!(user < input && input < output);
+        assert!(!context.contains("discarded text"));
+        recorder.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopened_replay_retains_response_range_and_hidden_history() {
+        use nori_protocol::acp::v1 as acp;
+        let dir = TempDir::new().unwrap();
+        let recorder = TranscriptRecorder::new(dir.path(), dir.path(), None, "0.1.0", None)
+            .await
+            .unwrap();
+        recorder
+            .record_user_message("one", "first", vec![])
+            .await
+            .unwrap();
+        let update = acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+            acp::ContentBlock::Text(acp::TextContent::new("answer")),
+        ));
+        let event = nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+            acp::AgentNotification::SessionNotification(acp::SessionNotification::new(
+                "session", update,
+            )),
+        ));
+        let end = recorder
+            .record_session_event(&SessionEventEntry::new(event))
+            .await
+            .unwrap()
+            .unwrap();
+        recorder
+            .record_user_message("two", "hidden", vec![])
+            .await
+            .unwrap();
+        recorder.rewind_head(Some(end)).await.unwrap();
+        let live_replay = recorder.replay_session_events().await.unwrap();
+        assert!(
+            matches!(live_replay.last(), Some(nori_protocol::SessionEvent::Nori(
+            nori_protocol::NoriEvent::ConversationResponseBoundary(boundary)
+        )) if boundary.transcript_id == recorder.session_id() && boundary.end == end)
+        );
+        assert!(
+            !serde_json::to_string(&live_replay)
+                .unwrap()
+                .contains("hidden")
+        );
+        recorder.shutdown().await.unwrap();
+        let loader = super::super::TranscriptLoader::new(dir.path().to_path_buf());
+        let loaded = loader
+            .load_transcript(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+        let replay = crate::backend::transcript_to_replay_session_events(&loaded);
+        assert!(
+            matches!(replay.last(), Some(nori_protocol::SessionEvent::Nori(
+            nori_protocol::NoriEvent::ConversationResponseBoundary(boundary)
+        )) if boundary.transcript_id == recorder.session_id() && boundary.end == end)
+        );
+        let log = ConversationLog::open(recorder.transcript_path().with_extension("pkl")).unwrap();
+        assert!(log.records().iter().any(|record| match &record.event {
+            Event::Operation { args, .. } => args.contains("hidden"),
+            _ => false,
+        }));
+        assert!(!loaded.entries.iter().any(
+            |line| matches!(&line.entry, TranscriptEntry::User(user) if user.content == "hidden")
+        ));
+    }
+
+    #[tokio::test]
+    async fn canonical_projection_survives_rewind_and_reload() {
+        let dir = TempDir::new().unwrap();
+        let recorder = TranscriptRecorder::new(dir.path(), dir.path(), None, "0.1.0", None)
+            .await
+            .unwrap();
+        recorder
+            .record_user_message("one", "first", vec![])
+            .await
+            .unwrap();
+        recorder
+            .record_user_message("two", "hidden", vec![])
+            .await
+            .unwrap();
+        recorder.shutdown().await.unwrap();
+
+        let path = recorder.transcript_path().with_extension("pkl");
+        let mut log = ConversationLog::open(&path).unwrap();
+        let head = log.projection().visible()[1].id;
+        log.append(Event::Rewind { head: Some(head) }).unwrap();
+        drop(log);
+        let loader = super::super::TranscriptLoader::new(dir.path().to_path_buf());
+        let loaded = loader
+            .load_transcript(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap();
+        let messages: Vec<_> = loaded
+            .entries
+            .iter()
+            .filter_map(|line| match &line.entry {
+                TranscriptEntry::User(user) => Some(user.content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages, vec!["first"]);
+        assert_eq!(
+            loader
+                .count_user_turns(recorder.project_id(), recorder.session_id())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            loader
+                .load_first_user_preview(recorder.project_id(), recorder.session_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+        let reopened = ConversationLog::open(path).unwrap();
+        assert_eq!(reopened.records().len(), 4);
     }
 
     #[tokio::test]

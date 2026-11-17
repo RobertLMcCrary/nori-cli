@@ -24,6 +24,44 @@ fn acp_tool_snapshot(
 }
 
 #[test]
+fn flushed_running_tool_completion_updates_history_without_a_second_cell() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    while rx.try_recv().is_ok() {}
+    let mut snapshot = acp_tool_snapshot(
+        "call",
+        "Executing command",
+        crate::presentation::ToolKind::Execute,
+        crate::presentation::ToolPhase::Pending,
+    );
+    snapshot.invocation = Some(crate::presentation::Invocation::Command {
+        command: "test".to_owned(),
+    });
+    chat.handle_client_event(crate::presentation::ClientEvent::ToolSnapshot(
+        snapshot.clone(),
+    ));
+    chat.flush_active_cell();
+    snapshot.phase = crate::presentation::ToolPhase::Completed;
+    snapshot.raw_output = Some(serde_json::json!({"exit_code": 0}));
+    chat.handle_client_event(crate::presentation::ClientEvent::ToolSnapshot(snapshot));
+    let mut inserted = 0;
+    let mut completed = 0;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::InsertHistoryCell(cell) if cell.as_any().is::<ClientToolCell>() => {
+                inserted += 1
+            }
+            AppEvent::UpdateHistoryToolSnapshot { snapshot, .. }
+                if snapshot.phase == crate::presentation::ToolPhase::Completed =>
+            {
+                completed += 1
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((inserted, completed), (1, 1));
+}
+
+#[test]
 fn acp_tool_snapshots_update_exit_stats_once_and_extract_skill() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
 

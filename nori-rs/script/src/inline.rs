@@ -64,6 +64,11 @@ impl Loaded {
         }
         let mut engine =
             ScriptEngine::new().map_err(|failure| failure.locate(Origin::Prompt, ""))?;
+        if self.builtin_defaults {
+            engine
+                .run(crate::load::DEFAULT_SCRIPT)
+                .map_err(|failure| failure.locate(Origin::Prompt, crate::load::DEFAULT_SCRIPT))?;
+        }
         for script in &self.scripts {
             script.run(&mut engine)?;
         }

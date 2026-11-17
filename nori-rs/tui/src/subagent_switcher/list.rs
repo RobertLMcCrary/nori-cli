@@ -89,6 +89,10 @@ impl ListState {
             .position(|row| row.entry.target == self.selected)
     }
 
+    pub(crate) fn select_index_at(&mut self, index: usize) {
+        self.select_index(index);
+    }
+
     /// Whether the conversation has any subagent at all, for the empty-state hint.
     pub(crate) fn has_subagents(&self) -> bool {
         self.entries.len() > 1

@@ -165,3 +165,21 @@ fn context_query_results_from_the_parent_are_discarded_after_a_fork() {
     chat.handle_context_timeline(generation, Some(parent), Err("parent stopped".into()));
     assert!(rx.try_recv().is_err());
 }
+
+#[test]
+fn child_focus_does_not_show_the_main_sessions_context_usage() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane.set_session_usage(Some(SessionUsageState {
+        used_tokens: 42,
+        total_tokens: 100,
+        cost_display: None,
+    }));
+    chat.set_focused_subagent_view(
+        Some(crate::subagent_switcher::SubagentKey(1)),
+        Vec::new(),
+        0,
+    );
+    assert_eq!(chat.bottom_pane.context_usage_snapshot().0.tokens, None);
+    chat.set_focused_subagent_view(None, Vec::new(), 0);
+    assert_eq!(chat.bottom_pane.context_usage_snapshot().0.tokens, Some(42));
+}

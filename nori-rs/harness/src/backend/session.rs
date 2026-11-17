@@ -73,6 +73,7 @@ impl ReplayBatch {
 
 fn drain_setup_session_events(
     event_rx: &mut mpsc::Receiver<crate::connection::ConnectionEvent>,
+    agent: &str,
 ) -> Result<Vec<nori_protocol::SessionEvent>> {
     let mut events = Vec::new();
     while let Ok(event) = event_rx.try_recv() {
@@ -85,8 +86,13 @@ fn drain_setup_session_events(
             crate::connection::ConnectionEvent::SessionUpdate(_) => {}
             crate::connection::ConnectionEvent::Subagent(wire) => {
                 events.push(nori_protocol::SessionEvent::Nori(
-                    nori_protocol::NoriEvent::Subagent(wire),
+                    nori_protocol::NoriEvent::Subagent(subagent_identity::native_child(
+                        wire, agent,
+                    )),
                 ));
+            }
+            crate::connection::ConnectionEvent::Barrier(reply) => {
+                let _ = reply.send(());
             }
             crate::connection::ConnectionEvent::DelegatedRequest(request) => {
                 let _ =
@@ -166,6 +172,7 @@ impl AcpBackend {
         );
 
         let agent_config = get_agent_config(&config.agent)?;
+        let initial_setup_events = setup_events.clone();
         forward_setup_session_events(&backend_event_tx, setup_events).await?;
         let mut event_rx = event_rx;
 
@@ -175,6 +182,8 @@ impl AcpBackend {
             .session_capabilities
             .resume
             .is_some();
+        let acp_session_id = acp_session_id
+            .filter(|_| !transcript.is_some_and(|transcript| transcript.requires_fresh_binding));
         let initial_goal_replay_events = transcript
             .map(transcript_to_replay_client_events)
             .unwrap_or_default();
@@ -183,7 +192,23 @@ impl AcpBackend {
         ));
         let goal_mcp_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let goal_mcp_http_server = Arc::new(Mutex::new(None));
-        let workflow: Arc<Mutex<workflow::WorkflowState>> = Arc::default();
+        let policy_before_session =
+            super::host_tools::accepted_by(&connection) || nori_client_mcp::reachable(&connection);
+        let (workflow, machine_snapshot) = if policy_before_session {
+            workflow::prepare_workflow(
+                &config.nori_home,
+                &cwd,
+                orchestrator.project_trusted(),
+                orchestrator.is_child(),
+                transcript.map(|transcript| {
+                    crate::transcript::TranscriptLoader::new(config.nori_home.clone())
+                        .session_path(&transcript.meta.project_id, &transcript.meta.session_id)
+                }),
+            )
+            .await?
+        } else {
+            (Arc::default(), Arc::new(tokio::sync::OnceCell::new()))
+        };
 
         // Either load the session server-side or create a fresh session for
         // client-side replay.
@@ -203,9 +228,9 @@ impl AcpBackend {
             pending_summary,
             is_first_prompt_val,
             used_fallback,
-            deferred_setup_session_events,
+            mut deferred_setup_session_events,
             deferred_replay_client_events,
-            deferred_replay_batches,
+            mut deferred_replay_batches,
             event_rx,
             session_driver_state,
         ) = if let Some(sid) = acp_session_id
@@ -217,6 +242,7 @@ impl AcpBackend {
             // load_session() finishes and signals completion via the oneshot.
             let (load_done_tx, load_done_rx) = tokio::sync::oneshot::channel::<()>();
             let (load_started_tx, load_started_rx) = tokio::sync::oneshot::channel();
+            let agent = config.agent.clone();
             let collect_handle = tokio::spawn(async move {
                 let mut event_rx = event_rx;
                 let mut session_driver = session_runtime_driver::SessionDriver::new();
@@ -251,10 +277,11 @@ impl AcpBackend {
                                 }
                                 Some(crate::connection::ConnectionEvent::Subagent(wire)) => {
                                     buffered_session_events.push(nori_protocol::SessionEvent::Nori(
-                                        nori_protocol::NoriEvent::Subagent(wire),
+                                        nori_protocol::NoriEvent::Subagent(subagent_identity::native_child(wire, &agent)),
                                     ));
                                 }
                                 Some(crate::connection::ConnectionEvent::SessionClosed) => break,
+                                Some(crate::connection::ConnectionEvent::Barrier(reply)) => { let _ = reply.send(()); }
                                 Some(crate::connection::ConnectionEvent::DelegatedRequest(request)) => {
                                     let _ = request.response_tx.send(Ok(
                                         acp::ClientResponse::RequestPermissionResponse(
@@ -289,10 +316,11 @@ impl AcpBackend {
                                     }
                                     crate::connection::ConnectionEvent::Subagent(wire) => {
                                         buffered_session_events.push(nori_protocol::SessionEvent::Nori(
-                                            nori_protocol::NoriEvent::Subagent(wire),
+                                            nori_protocol::NoriEvent::Subagent(subagent_identity::native_child(wire, &agent)),
                                         ));
                                     }
                                     crate::connection::ConnectionEvent::SessionClosed => {}
+                                    crate::connection::ConnectionEvent::Barrier(reply) => { let _ = reply.send(()); }
                                     crate::connection::ConnectionEvent::DelegatedRequest(request) => {
                                         let _ = request.response_tx.send(Ok(
                                             acp::ClientResponse::RequestPermissionResponse(
@@ -382,14 +410,26 @@ impl AcpBackend {
                         ),
                     ));
                     debug!("ACP session resumed via session/load: {sid}");
+                    let canonical =
+                        transcript.filter(|transcript| !transcript.event_ids.is_empty());
+                    let replay_client_events = canonical
+                        .map(transcript_to_replay_client_events)
+                        .unwrap_or(buffered_client_events);
+                    let (source, replay_session_events) = match canonical {
+                        Some(transcript) => (
+                            nori_protocol::ReplaySource::Transcript,
+                            transcript_to_replay_session_events(transcript),
+                        ),
+                        None => (nori_protocol::ReplaySource::Agent, replay_session_events),
+                    };
                     (
                         session_id,
                         None,
                         false,
                         None,
                         setup_session_events,
-                        buffered_client_events,
-                        ReplayBatch::new(nori_protocol::ReplaySource::Agent, replay_session_events)
+                        replay_client_events,
+                        ReplayBatch::new(source, replay_session_events)
                             .into_iter()
                             .collect(),
                         recovered_rx,
@@ -431,7 +471,10 @@ impl AcpBackend {
                     ));
 
                     let Some(transcript) = transcript else {
-                        setup_session_events.extend(drain_setup_session_events(&mut recovered_rx)?);
+                        setup_session_events.extend(drain_setup_session_events(
+                            &mut recovered_rx,
+                            &config.agent,
+                        )?);
                         forward_setup_session_events(&backend_event_tx, setup_session_events)
                             .await?;
                         return Err(enhance_agent_error(e, &agent_config));
@@ -452,8 +495,10 @@ impl AcpBackend {
                     let session_id = match connection.create_session(&cwd, mcp_servers).await {
                         Ok(session_id) => session_id,
                         Err(error) => {
-                            setup_session_events
-                                .extend(drain_setup_session_events(&mut recovered_rx)?);
+                            setup_session_events.extend(drain_setup_session_events(
+                                &mut recovered_rx,
+                                &config.agent,
+                            )?);
                             forward_setup_session_events(&backend_event_tx, setup_session_events)
                                 .await?;
                             return Err(enhance_agent_error(error, &agent_config));
@@ -468,7 +513,10 @@ impl AcpBackend {
                         )
                         .await;
                     }
-                    setup_session_events.extend(drain_setup_session_events(&mut recovered_rx)?);
+                    setup_session_events.extend(drain_setup_session_events(
+                        &mut recovered_rx,
+                        &config.agent,
+                    )?);
 
                     let replay_events = transcript_to_replay_client_events(transcript);
                     let replay_session_events = transcript_to_replay_session_events(transcript);
@@ -478,10 +526,13 @@ impl AcpBackend {
                     } else {
                         Some(summary_text)
                     };
-                    let mut replay_batches =
+                    let mut replay_batches = if transcript.event_ids.is_empty() {
                         ReplayBatch::new(nori_protocol::ReplaySource::Agent, agent_replay_events)
                             .into_iter()
-                            .collect::<Vec<_>>();
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
                     if let Some(transcript_batch) = ReplayBatch::new(
                         nori_protocol::ReplaySource::Transcript,
                         replay_session_events,
@@ -526,13 +577,13 @@ impl AcpBackend {
             let session_id = match connection.resume_session(sid, &cwd, mcp_servers).await {
                 Ok(session_id) => session_id,
                 Err(error) => {
-                    let setup_events = drain_setup_session_events(&mut event_rx)?;
+                    let setup_events = drain_setup_session_events(&mut event_rx, &config.agent)?;
                     forward_setup_session_events(&backend_event_tx, setup_events).await?;
                     return Err(enhance_agent_error(error, &agent_config));
                 }
             };
             debug!("ACP session resumed via session/resume: {sid}");
-            let setup_session_events = drain_setup_session_events(&mut event_rx)?;
+            let setup_session_events = drain_setup_session_events(&mut event_rx, &config.agent)?;
             let history = transcript
                 .and_then(|transcript| {
                     ReplayBatch::new(
@@ -573,7 +624,7 @@ impl AcpBackend {
             let session_id = match connection.create_session(&cwd, mcp_servers).await {
                 Ok(session_id) => session_id,
                 Err(error) => {
-                    let setup_events = drain_setup_session_events(&mut event_rx)?;
+                    let setup_events = drain_setup_session_events(&mut event_rx, &config.agent)?;
                     forward_setup_session_events(&backend_event_tx, setup_events).await?;
                     return Err(enhance_agent_error(error, &agent_config));
                 }
@@ -583,7 +634,7 @@ impl AcpBackend {
                 session_defaults::apply_default_model(&connection, &session_id, default_model)
                     .await;
             }
-            let setup_session_events = drain_setup_session_events(&mut event_rx)?;
+            let setup_session_events = drain_setup_session_events(&mut event_rx, &config.agent)?;
 
             let (replay_events, replay_session_events, summary) = if let Some(t) = transcript {
                 let client_events = transcript_to_replay_client_events(t);
@@ -617,6 +668,27 @@ impl AcpBackend {
             )
         };
 
+        if let Some(transcript) = transcript
+            && !deferred_replay_batches
+                .iter()
+                .any(|batch| batch.source == nori_protocol::ReplaySource::Transcript)
+        {
+            let history = transcript_to_replay_session_events(transcript)
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(_))
+                            | SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(_))
+                    )
+                })
+                .collect();
+            deferred_replay_batches.extend(ReplayBatch::new(
+                nori_protocol::ReplaySource::Transcript,
+                history,
+            ));
+        }
+
         if !deferred_replay_client_events.is_empty() {
             let mut replay_events_for_goal_state = initial_goal_replay_events;
             replay_events_for_goal_state.extend(deferred_replay_client_events.iter().cloned());
@@ -624,11 +696,84 @@ impl AcpBackend {
                 thread_goal::ThreadGoalState::from_replay_events(&replay_events_for_goal_state);
         }
 
-        forward_setup_session_events(&backend_event_tx, deferred_setup_session_events).await?;
-
-        let capabilities_update =
-            nori_client_mcp::capabilities_update_for_session(&connection, &goal_mcp_connected);
+        let capabilities_update = nori_client_mcp::capabilities_update_for_session(
+            &connection,
+            &goal_mcp_connected,
+            goal_mcp_http_server
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(nori_client_mcp::NoriClient::has_goal_tools),
+        );
         let connection = Arc::new(connection);
+        let native_children = Arc::new(super::native_child_sessions::NativeChildren::default());
+        if let Some(transcript) = transcript {
+            for line in &transcript.entries {
+                if let crate::transcript::TranscriptEntry::SessionEvent(entry) = &line.entry
+                    && !entry.historical_evidence
+                    && let SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(wire)) =
+                        &entry.event
+                {
+                    native_children
+                        .observe_replayed(&connection, &backend_event_tx, &session_id, wire)
+                        .await;
+                } else if let crate::transcript::TranscriptEntry::SessionEvent(entry) = &line.entry
+                    && !entry.historical_evidence
+                    && let SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(
+                        notification,
+                    )) = &entry.event
+                {
+                    let _ = native_children.observe_notification(notification).await;
+                }
+            }
+        }
+        for batch in &deferred_replay_batches {
+            for event in &batch.events {
+                if let SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(wire)) = event {
+                    if batch.source == nori_protocol::ReplaySource::Transcript {
+                        native_children
+                            .observe_replayed(&connection, &backend_event_tx, &session_id, wire)
+                            .await;
+                    } else {
+                        let _ = native_children
+                            .observe(&connection, &backend_event_tx, &session_id, wire)
+                            .await;
+                    }
+                } else if let SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(
+                    notification,
+                )) = event
+                {
+                    let _ = native_children.observe_notification(notification).await;
+                }
+            }
+        }
+        let mut fresh_subagent_events = initial_setup_events
+            .iter()
+            .chain(&deferred_setup_session_events)
+            .filter(|event| {
+                matches!(
+                    event,
+                    SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(_))
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for event in initial_setup_events
+            .iter()
+            .chain(&deferred_setup_session_events)
+        {
+            match event {
+                SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(wire)) => {
+                    let _ = native_children
+                        .observe(&connection, &backend_event_tx, &session_id, wire)
+                        .await;
+                }
+                SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(notification)) => {
+                    let _ = native_children.observe_notification(notification).await;
+                }
+                _ => {}
+            }
+        }
         let pending_approvals = Arc::new(Mutex::new(Vec::new()));
         let session_driver = Arc::new(Mutex::new(session_driver_state));
         let (session_event_tx, mut session_event_rx) = mpsc::channel(128);
@@ -644,10 +789,9 @@ impl AcpBackend {
         let (history_log_id, history_entry_count) =
             crate::message_history::history_metadata(&config.nori_home).await;
 
-        // A child keeps no transcript of its own: its parent's shows what it did. A session
-        // resumed from its transcript goes on recording into that transcript. One the agent
-        // replays itself gets a new transcript instead: the agent's history may hold more than
-        // the local one, and recording it into the local one would repeat what is there.
+        // Every session owns a canonical transcript. A resumed session whose history is already
+        // recorded continues that transcript; agent-side replay starts a fresh transcript so it
+        // does not repeat history that may be newer than the local copy.
         let agent_replays = deferred_replay_batches
             .iter()
             .any(|batch| batch.source == nori_protocol::ReplaySource::Agent);
@@ -659,7 +803,7 @@ impl AcpBackend {
                 (path, &transcript.meta)
             })
             .filter(|(path, _)| path.is_file());
-        let transcript_recorder = if config.delegation.is_child() {
+        let transcript_recorder = if !config.delegation.record_transcript {
             None
         } else {
             let recorder = match recorded_transcript {
@@ -675,13 +819,9 @@ impl AcpBackend {
                     .await
                 }
             };
-            match recorder {
-                Ok(recorder) => Some(Arc::new(recorder)),
-                Err(e) => {
-                    warn!("Failed to initialize transcript recorder: {e}");
-                    None
-                }
-            }
+            Some(Arc::new(recorder.map_err(|error| {
+                anyhow::anyhow!("failed to initialize canonical transcript: {error}")
+            })?))
         };
         // A new transcript of a resumed session starts with the evidence of the old one.
         if let (Some(recorder), Some(transcript)) = (&transcript_recorder, transcript)
@@ -694,6 +834,10 @@ impl AcpBackend {
                 }
             }
         }
+        if policy_before_session {
+            workflow::record_prepared_snapshot(transcript_recorder.as_ref(), &machine_snapshot)
+                .await;
+        }
         let transcript_id = transcript_recorder
             .as_ref()
             .map(|recorder| recorder.session_id().to_string());
@@ -704,15 +848,55 @@ impl AcpBackend {
             .as_ref()
             .and_then(|recorder| ConversationId::from_string(recorder.session_id()).ok())
             .unwrap_or_default();
+        if let Some(recorder) = &transcript_recorder
+            && let Err(error) = recorder
+                .record_backend_bound(
+                    serde_json::json!({
+                        "agent": config.agent,
+                        "acp_session_id": session_id.to_string(),
+                    })
+                    .to_string(),
+                )
+                .await
+        {
+            warn!(%error, "Failed to record resumed backend binding");
+        }
         let pending_hook_context = session_context_for_connection(config, &connection);
         let goal_ext_capability =
             goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta());
+        let transcript_recorder_cell = Arc::new(RwLock::new(transcript_recorder));
+        if transcript_recorder_cell
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|recorder| recorder.has_conversation_log())
+        {
+            native_children
+                .configure_history(Arc::new(super::native_child_history::NativeHistory::new(
+                    config.nori_home.clone(),
+                    config.cwd.clone(),
+                    config.agent.clone(),
+                    config.cli_version.clone(),
+                    transcript_recorder_cell.clone(),
+                )))
+                .await;
+        }
+        if let Some(transcript) = transcript
+            && transcript_recorder_cell
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|recorder| recorder.has_conversation_log())
+        {
+            native_children.bootstrap_history(transcript).await?;
+        }
         let backend = Self {
             connection,
             session_id: Arc::new(RwLock::new(session_id)),
             backend_event_tx: backend_event_tx.clone(),
             cwd: cwd.clone(),
             pending_approvals: Arc::clone(&pending_approvals),
+            withdrawn_questions: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_prompt_submissions: Arc::new(Mutex::new(HashMap::new())),
             user_notifier: Arc::clone(&user_notifier),
             idle_timer_abort: Arc::clone(&idle_timer_abort),
@@ -730,7 +914,7 @@ impl AcpBackend {
             goal_mcp_http_server,
             goal_ext_capability,
             pending_hook_context: Arc::new(Mutex::new(pending_hook_context)),
-            transcript_recorder: Arc::new(RwLock::new(transcript_recorder)),
+            transcript_recorder: transcript_recorder_cell,
             session_event_tx: session_event_tx.clone(),
             prompt_result_tx: prompt_result_tx.clone(),
             prompt_phase_gate: Arc::new(Mutex::new(None)),
@@ -738,8 +922,15 @@ impl AcpBackend {
             edit_journal: Arc::new(EditJournal::new()),
             is_first_prompt: Arc::new(Mutex::new(is_first_prompt_val)),
             workflow,
+            machine_snapshot,
+            workflow_ready: tokio::sync::watch::channel(
+                policy_before_session || config.delegation.is_child(),
+            )
+            .0,
+            program_effects: Arc::new(tokio::sync::RwLock::new(())),
             prompt_summary_enabled: config.prompt_summary_enabled,
             agent_name: config.agent.clone(),
+            handoff_candidate: false,
             cli_version: config.cli_version.clone(),
             auto_worktree: config.auto_worktree,
             auto_worktree_repo_root: config.auto_worktree_repo_root.clone(),
@@ -761,8 +952,12 @@ impl AcpBackend {
             runtime_task_abort: Arc::new(Mutex::new(None)),
             relay_task_abort: Arc::new(Mutex::new(None)),
             orchestrator,
+            native_children,
         };
-        backend.load_workflow();
+
+        if !policy_before_session && !backend.orchestrator.is_child() {
+            backend.load_workflow_without_tools();
+        }
 
         let runtime_backend = backend.clone();
         let runtime_task = tokio::spawn(async move {
@@ -771,8 +966,19 @@ impl AcpBackend {
                     session_runtime_driver::SessionRuntimeInput::Reducer(event) => {
                         runtime_backend.apply_session_event(event).await;
                     }
+                    session_runtime_driver::SessionRuntimeInput::GuardedContinuation {
+                        generation,
+                        event,
+                    } => {
+                        runtime_backend
+                            .apply_guarded_continuation(generation, event)
+                            .await;
+                    }
                     session_runtime_driver::SessionRuntimeInput::Barrier { response_tx } => {
                         let _ = response_tx.send(());
+                    }
+                    session_runtime_driver::SessionRuntimeInput::QuestionCancelled(event) => {
+                        runtime_backend.withdraw_cancelled_question(&event).await;
                     }
                     session_runtime_driver::SessionRuntimeInput::PermissionRequest {
                         pending_request,
@@ -791,6 +997,97 @@ impl AcpBackend {
             approval_policy: backend.approval_policy_tx.subscribe(),
         });
         backend.serve_orchestrator(orchestrator_signals);
+        let previous_root =
+            transcript.and_then(crate::transcript::Transcript::latest_acp_session_id);
+        let mut restored = backend
+            .restore_native_children(previous_root.as_deref())
+            .await?;
+        restored.extend(
+            backend
+                .restore_managed_children(previous_root.as_deref())
+                .await?,
+        );
+        for child in restored {
+            let id = child.id.clone();
+            let related = |event: &SessionEvent| match event {
+                SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(notification)) => {
+                    child.retired.contains(&notification.session_id)
+                }
+                SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(
+                    nori_protocol::SubagentWire::Update(update),
+                )) => child.retired.contains(&update.session_id),
+                SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(
+                    nori_protocol::SubagentWire::Message(message),
+                )) => {
+                    message
+                        .sender_session_id
+                        .as_ref()
+                        .is_some_and(|id| child.retired.contains(id))
+                        || message
+                            .recipient_session_id
+                            .as_ref()
+                            .is_some_and(|id| child.retired.contains(id))
+                }
+                SessionEvent::Nori(nori_protocol::NoriEvent::SubagentQueueChanged {
+                    session_id,
+                    ..
+                }) => child.retired.contains(session_id),
+                _ => false,
+            };
+            let saved = deferred_setup_session_events
+                .iter()
+                .chain(
+                    deferred_replay_batches
+                        .iter()
+                        .flat_map(|batch| &batch.events),
+                )
+                .find_map(|event| match event {
+                    SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(
+                        nori_protocol::SubagentWire::Update(update),
+                    )) if update.session_id == id => Some(update.clone()),
+                    _ => None,
+                });
+            deferred_setup_session_events.retain(|event| !related(event));
+            fresh_subagent_events.retain(|event| !related(event));
+            for batch in &mut deferred_replay_batches {
+                batch.events.retain(|event| !related(event));
+            }
+            let mut announcement = saved.unwrap_or(nori_protocol::SubagentUpdate {
+                parent_session_id: child.parent.clone(),
+                session_id: id.clone(),
+                agent: nori_protocol::Patch::Keep,
+                title: nori_protocol::Patch::Keep,
+                description: nori_protocol::Patch::Keep,
+                state: nori_protocol::Patch::Keep,
+            });
+            announcement.parent_session_id = child.parent;
+            announcement.state = nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle);
+            let announcement = SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(
+                nori_protocol::SubagentWire::Update(announcement),
+            ));
+            deferred_setup_session_events.push(announcement.clone());
+            fresh_subagent_events.push(announcement);
+            let replay = child
+                .events
+                .into_iter()
+                .filter_map(|event| match event {
+                    SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                        acp::AgentNotification::SessionNotification(mut notification),
+                    )) => {
+                        notification.session_id = id.clone();
+                        Some(SessionEvent::Acp(
+                            nori_protocol::AcpEvent::ChildNotification(notification),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect();
+            deferred_replay_batches.extend(ReplayBatch::new(
+                nori_protocol::ReplaySource::Transcript,
+                replay,
+            ));
+        }
+        forward_setup_session_events(&backend_event_tx, deferred_setup_session_events).await?;
         orchestrator::remember_models(&config.nori_home, &config.agent, &backend.config_options());
 
         // Execute session_start hooks
@@ -857,6 +1154,7 @@ impl AcpBackend {
         };
 
         let replay_session_id = backend.session_id().await;
+        let has_replay = !deferred_replay_batches.is_empty();
         let relay_backend = backend.clone();
         let relay_task = tokio::spawn(async move {
             for ReplayBatch { source, events } in deferred_replay_batches {
@@ -883,6 +1181,20 @@ impl AcpBackend {
                         nori_protocol::NoriEvent::ReplayFinished,
                     )))
                     .await;
+            }
+            let _ = relay_backend
+                .backend_event_tx
+                .send(BackendEvent::Public(SessionEvent::Nori(
+                    nori_protocol::NoriEvent::SessionReady(replay_session_id.clone()),
+                )))
+                .await;
+            if has_replay {
+                for event in fresh_subagent_events {
+                    let _ = relay_backend
+                        .backend_event_tx
+                        .send(BackendEvent::Public(event))
+                        .await;
+                }
             }
             if let Some(update) = resume_goal_notice {
                 let _ = relay_backend

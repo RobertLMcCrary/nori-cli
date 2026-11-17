@@ -1,4 +1,4 @@
-//! The live block: one header and one activity row per running subagent.
+//! The live block: one header and one activity row per live subagent.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -40,12 +40,13 @@ pub(crate) struct SubagentBlock<'a> {
     pub(crate) now: Instant,
     /// Terminal rows, or zero when unknown (no cap).
     pub(crate) screen_rows: u16,
-    /// Esc stops these subagents, because the agent that started them is idle: say so.
-    pub(crate) stoppable: bool,
 }
 
 impl SubagentBlock<'_> {
     fn spinner(&self, node: &Node) -> Span<'static> {
+        if node.idle {
+            return "○".dim();
+        }
         if !self.tree.animations() {
             return "•".dim();
         }
@@ -93,7 +94,9 @@ impl SubagentBlock<'_> {
             header.push(kind.dim());
         }
         header.push(trailer.dim());
-        let activity_text = if node.activity.is_empty() {
+        let activity_text = if node.idle {
+            "idle · tap to continue".to_owned()
+        } else if node.activity.is_empty() {
             "starting…".to_owned()
         } else {
             truncate_text(&node.activity, usable)
@@ -107,12 +110,40 @@ impl SubagentBlock<'_> {
         (header, activity)
     }
 
+    pub(crate) fn target_at(&self, row: u16) -> Option<crate::subagent_switcher::SubagentKey> {
+        let total = self.tree.visible_count();
+        let budget = if self.screen_rows == 0 {
+            usize::MAX
+        } else {
+            usize::from((self.screen_rows / SCREEN_FRACTION).max(MIN_ROWS))
+        };
+        let limit = if total.saturating_mul(2) <= budget {
+            total
+        } else {
+            budget.saturating_sub(1) / 2
+        };
+        let live = self.tree.display_order(limit);
+        let index = usize::from(row) / 2;
+        live.get(index)
+            .map(|(id, _, _)| crate::subagent_switcher::SubagentKey(id.0))
+            .or_else(|| {
+                self.tree
+                    .ended
+                    .iter()
+                    .rev()
+                    .take(limit.saturating_sub(live.len()))
+                    .nth(index.saturating_sub(live.len()))
+                    .filter(|_| index >= live.len())
+                    .map(|(id, _)| crate::subagent_switcher::SubagentKey(id.0))
+            })
+    }
+
     /// The rows to show at `width`: whole nodes while they fit, then a count of the rest.
     ///
     /// Only the nodes shown are visited, so a frame costs the rows on screen however many
     /// subagents run.
     pub(crate) fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        let total = self.tree.running_count();
+        let total = self.tree.visible_count();
         if total == 0 {
             return Vec::new();
         }
@@ -128,19 +159,38 @@ impl SubagentBlock<'_> {
             budget.saturating_sub(1) / 2
         };
         let shown = self.tree.display_order(limit);
-        let mut lines = Vec::with_capacity(shown.len() * 2 + 1);
-        for (node, depth) in &shown {
+        let ended = self
+            .tree
+            .ended
+            .iter()
+            .rev()
+            .take(limit.saturating_sub(shown.len()));
+        let mut lines = Vec::with_capacity(limit.saturating_mul(2).saturating_add(1));
+        for (_, node, depth) in &shown {
             let (mut header, activity) = self.rows_for(node, *depth, width);
             // The spinner goes after the indent.
             header.insert(1, self.spinner(node));
             lines.push(Line::from(header));
             lines.push(activity);
         }
-        if shown.len() < total {
-            lines.push(Line::from(format!("  +{} more running", total - shown.len())).dim());
+        let mut count = shown.len();
+        for (_, record) in ended {
+            let label = truncate_text(
+                &record.finished.label,
+                usize::from(width).saturating_sub(4).max(1),
+            );
+            lines.push(Line::from(vec!["○ ".dim(), label.into()]));
+            let status = match &record.finished.outcome {
+                nori_protocol::SubagentOutcome::Completed { .. } => "completed · tap to view",
+                nori_protocol::SubagentOutcome::Failed { .. } => "failed · tap to view",
+                nori_protocol::SubagentOutcome::Cancelled
+                | nori_protocol::SubagentOutcome::Closed => "cancelled · tap to view",
+            };
+            lines.push(Line::from(format!("  {status}")).dim());
+            count += 1;
         }
-        if self.stoppable {
-            lines.push(Line::from("  esc to stop subagents").dim());
+        if count < total {
+            lines.push(Line::from(format!("  +{} more", total - count)).dim());
         }
         lines
     }

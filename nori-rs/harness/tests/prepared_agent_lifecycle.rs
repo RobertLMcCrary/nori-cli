@@ -42,6 +42,7 @@ fn prepare_spec(cwd: &Path, wire_log_dir: PathBuf) -> AgentPrepareSpec {
         ..Default::default()
     };
     AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: "prepared-agent-test".to_string(),
         session_context: None,
@@ -491,6 +492,11 @@ async fn activation_refreshes_mutable_policy_without_replacing_the_connection() 
         start: SessionStart::New,
     });
     wait_for_started(&mut session).await;
+    session
+        .handle
+        .set_approval_policy(AskForApproval::OnRequest)
+        .await
+        .expect("update approval policy");
     let prompt_request_id = session
         .handle
         .prompt(vec![nori_protocol::acp::v1::ContentBlock::Text(
@@ -593,4 +599,76 @@ async fn refresh_rejects_spawn_fixed_changes_without_destroying_the_prepared_age
     assert_eq!(methods.first().map(String::as_str), Some("initialize"));
     assert!(methods.iter().any(|method| method == "session/new"));
     session.handle.shutdown().await.expect("shutdown session");
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(unix)]
+async fn selecting_a_model_only_changes_the_selected_agent_session() {
+    use nori_protocol::acp::v1 as acp;
+    let temp = tempfile::tempdir().expect("create test directory");
+    let first = prepare_agent(prepare_spec(temp.path(), temp.path().join("first-logs")))
+        .await
+        .expect("prepare first agent");
+    let mut second_spec = prepare_spec(temp.path(), temp.path().join("second-logs"));
+    Arc::make_mut(&mut second_spec.config).active_agent = "mock-model-alt".to_string();
+    let second = prepare_agent(second_spec)
+        .await
+        .expect("prepare second agent");
+    let mut first = launch_session(SessionLaunchSpec {
+        agent: first,
+        start: SessionStart::New,
+    });
+    let mut second = launch_session(SessionLaunchSpec {
+        agent: second,
+        start: SessionStart::New,
+    });
+    wait_for_started(&mut first).await;
+    wait_for_started(&mut second).await;
+    second
+        .handle
+        .set_session_config_option("model".to_string(), "mock-model-fast".to_string())
+        .await
+        .expect("select second agent's model");
+    let selected = |options: Vec<acp::SessionConfigOption>| {
+        options.into_iter().find_map(|option| {
+            if option.category != Some(acp::SessionConfigOptionCategory::Model) {
+                return None;
+            }
+            let acp::SessionConfigKind::Select(select) = option.kind else {
+                return None;
+            };
+            Some(select.current_value.to_string())
+        })
+    };
+    assert_eq!(
+        selected(
+            first
+                .handle
+                .get_session_config()
+                .await
+                .expect("first config")
+        ),
+        Some("mock-model-default".to_string())
+    );
+    assert_eq!(
+        selected(
+            second
+                .handle
+                .get_session_config()
+                .await
+                .expect("second config")
+        ),
+        Some("mock-model-fast".to_string())
+    );
+    first
+        .handle
+        .shutdown()
+        .await
+        .expect("shutdown first session");
+    second
+        .handle
+        .shutdown()
+        .await
+        .expect("shutdown second session");
 }

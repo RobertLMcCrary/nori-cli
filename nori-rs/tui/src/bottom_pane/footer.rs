@@ -91,17 +91,6 @@ pub(crate) enum FooterMode {
     ContextOnly,
 }
 
-pub(crate) fn toggle_shortcut_mode(current: FooterMode, ctrl_c_hint: bool) -> FooterMode {
-    if ctrl_c_hint && matches!(current, FooterMode::CtrlCReminder) {
-        return current;
-    }
-
-    match current {
-        FooterMode::ShortcutOverlay | FooterMode::CtrlCReminder => FooterMode::ShortcutSummary,
-        _ => FooterMode::ShortcutOverlay,
-    }
-}
-
 pub(crate) fn esc_hint_mode(current: FooterMode, is_task_running: bool) -> FooterMode {
     if is_task_running {
         current
@@ -336,6 +325,7 @@ fn esc_hint_line(esc_backtrack_hint: bool) -> Line<'static> {
 fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
     let mut commands = Line::from("");
     let mut newline = Line::from("");
+    let mut steer = Line::from("");
     let mut file_paths = Line::from("");
     let mut paste_image = Line::from("");
     let mut edit_previous = Line::from("");
@@ -349,6 +339,7 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
             match descriptor.id {
                 ShortcutId::Commands => commands = text,
                 ShortcutId::InsertNewline => newline = text,
+                ShortcutId::Steer => steer = text,
                 ShortcutId::FilePaths => file_paths = text,
                 ShortcutId::PasteImage => paste_image = text,
                 ShortcutId::EditPrevious => edit_previous = text,
@@ -363,6 +354,7 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
     let ordered = vec![
         commands,
         newline,
+        steer,
         file_paths,
         paste_image,
         edit_previous,
@@ -515,13 +507,13 @@ fn builtin_footer_segment(props: &FooterProps, segment: FooterSegment) -> Option
             if props.is_worktree {
                 #[allow(clippy::disallowed_methods)]
                 Line::from(vec![
-                    Span::from("⎇ ").light_red(),
+                    Span::from("git ").light_red(),
                     Span::from(branch.clone()).light_red(),
                 ])
             } else {
                 #[allow(clippy::disallowed_methods)]
                 Line::from(vec![
-                    Span::from("⎇ ").yellow(),
+                    Span::from("git ").yellow(),
                     Span::from(branch.clone()).yellow(),
                 ])
             }
@@ -745,6 +737,7 @@ fn join_footer_segments(segments: &[Line<'static>]) -> Line<'static> {
 enum ShortcutId {
     Commands,
     InsertNewline,
+    Steer,
     FilePaths,
     PasteImage,
     EditPrevious,
@@ -770,7 +763,6 @@ impl ShortcutBinding {
 enum DisplayCondition {
     Always,
     WhenShiftEnterHint,
-    WhenNotShiftEnterHint,
 }
 
 impl DisplayCondition {
@@ -778,7 +770,6 @@ impl DisplayCondition {
         match self {
             DisplayCondition::Always => true,
             DisplayCondition::WhenShiftEnterHint => state.use_shift_enter_hint,
-            DisplayCondition::WhenNotShiftEnterHint => !state.use_shift_enter_hint,
         }
     }
 }
@@ -828,18 +819,21 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         id: ShortcutId::InsertNewline,
-        bindings: &[
-            ShortcutBinding {
-                key: key_hint::shift(KeyCode::Enter),
-                condition: DisplayCondition::WhenShiftEnterHint,
-            },
-            ShortcutBinding {
-                key: key_hint::ctrl(KeyCode::Char('j')),
-                condition: DisplayCondition::WhenNotShiftEnterHint,
-            },
-        ],
+        bindings: &[ShortcutBinding {
+            key: key_hint::alt(KeyCode::Enter),
+            condition: DisplayCondition::Always,
+        }],
         prefix: "",
         label: " for newline",
+    },
+    ShortcutDescriptor {
+        id: ShortcutId::Steer,
+        bindings: &[ShortcutBinding {
+            key: key_hint::shift(KeyCode::Enter),
+            condition: DisplayCondition::WhenShiftEnterHint,
+        }],
+        prefix: "",
+        label: " to steer",
     },
     ShortcutDescriptor {
         id: ShortcutId::FilePaths,
@@ -968,7 +962,12 @@ mod tests {
             session_title: None,
             worktree_name: None,
             footer_segment_config: snapshot_segment_config(),
-            footer_layout_config: nori_config::FooterLayoutConfig::default(),
+            // These fixtures exercise footer rendering with metadata explicitly
+            // placed below the prompt; shipped defaults are tested separately.
+            footer_layout_config: layout_from_toml(
+                r#"[tui.footer_layout]
+footer_right = ["git_branch", "worktree_name", "context"]"#,
+            ),
             acp_mode_label: None,
             model_label: None,
             cloud_session: None,
@@ -1249,12 +1248,12 @@ footer_right = ["mode_indicator"]
 
         let first_line = rendered.lines().next().unwrap_or_default();
         assert!(first_line.ends_with("[ Plan ]"));
-        assert!(first_line.contains("⎇ main"));
+        assert!(first_line.contains("git main"));
         assert!(!first_line.contains("Mode:"));
     }
 
     #[test]
-    fn default_idle_footer_shows_only_location_and_headroom() {
+    fn default_prompt_bar_shows_location_and_headroom() {
         let props = FooterProps {
             git_branch: Some("main".to_string()),
             context_window_percent: Some(44),
@@ -1276,11 +1275,10 @@ footer_right = ["mode_indicator"]
         };
         let rendered = render_footer_text(props.clone());
 
-        // Branch and context, right-aligned, and nothing else.
-        assert_eq!(rendered.trim(), "⎇ main · 44% / 272k");
-        assert!(
-            rendered.ends_with("⎇ main · 44% / 272k"),
-            "footer metadata should be right-aligned: {rendered:?}"
+        assert_eq!(rendered.trim(), "");
+        assert_eq!(
+            textarea_corner_segments(&props).top_left.to_string(),
+            "git main · 44% / 272k"
         );
         for clutter in ["Approvals", "Skillset", "Skillsets v", "Title:", "Tokens:"] {
             assert!(
@@ -1342,7 +1340,10 @@ footer_right = ["mode_indicator"]
         };
         let rendered = render_footer_text(attached);
         assert!(rendered.contains("nori-fast-kazunoko-aac8"), "{rendered:?}");
-        assert!(rendered.contains("INSERT"), "{rendered:?}");
+        assert!(
+            !rendered.contains("INSERT"),
+            "mode belongs to the prompt bar: {rendered:?}"
+        );
     }
 
     #[test]
@@ -1371,7 +1372,10 @@ footer_right = ["mode_indicator"]
             context_window_tokens: Some(272_000),
             cloud_session: Some("nori-fast-kazunoko-aac8".to_string()),
             footer_segment_config: FooterSegmentConfig::default(),
-            footer_layout_config: FooterLayoutConfig::default(),
+            footer_layout_config: layout_from_toml(
+                r#"[tui.footer_layout]
+footer_right = ["git_branch", "worktree_name", "context"]"#,
+            ),
             ..default_props()
         };
 
@@ -1380,7 +1384,7 @@ footer_right = ["mode_indicator"]
         assert!(wide.starts_with("  ☁ nori-fast-kazunoko-aac8"), "{wide:?}");
         assert!(
             wide.trim_end()
-                .ends_with("⎇ some-quite-long-branch-name · 44% / 272k"),
+                .ends_with("git some-quite-long-branch-name · 44% / 272k"),
             "{wide:?}"
         );
 
@@ -1403,11 +1407,14 @@ footer_right = ["mode_indicator"]
         let props = FooterProps {
             git_branch: Some("main".to_string()),
             footer_segment_config: FooterSegmentConfig::default(),
-            footer_layout_config: FooterLayoutConfig::default(),
+            footer_layout_config: layout_from_toml(
+                r#"[tui.footer_layout]
+footer_right = ["git_branch", "worktree_name", "context"]"#,
+            ),
             ..default_props()
         };
 
-        assert_eq!(render_footer_row_text(&props, 12).trim(), "⎇ main");
+        assert_eq!(render_footer_row_text(&props, 12).trim(), "git main");
         // One column short of fitting: nothing rendered, no half-drawn branch.
         assert_eq!(render_footer_row_text(&props, 5).trim(), "");
     }
@@ -1651,7 +1658,7 @@ footer_right = ["mode_indicator"]
             };
 
             assert!(
-                rendered.contains("⎇ main"),
+                rendered.contains("git main"),
                 "custom segment should render in {placement}: {rendered:?}"
             );
         }
@@ -1679,7 +1686,7 @@ footer_left = [
             ..default_props()
         });
 
-        assert_eq!(rendered.trim(), "⎇ main — Approvals: Agent");
+        assert_eq!(rendered.trim(), "git main — Approvals: Agent");
     }
 
     #[test]
@@ -1703,7 +1710,7 @@ footer_left = [
             .next()
             .expect("custom segment should render");
 
-        assert_eq!(segment.to_string(), "⎇ main {ready} Approvals: Agent");
+        assert_eq!(segment.to_string(), "git main {ready} Approvals: Agent");
         assert_eq!(
             segment.spans[0].style.fg,
             Some(ratatui::style::Color::Yellow)

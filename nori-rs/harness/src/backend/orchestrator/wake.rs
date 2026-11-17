@@ -4,7 +4,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::Inner;
-use super::MAX_RETURNED_BYTES;
 use super::MAX_WAIT;
 use super::Orchestrator;
 use super::WakeTurn;
@@ -21,10 +20,6 @@ const INLINE_RESULT_BYTES: usize = 16 * 1024;
 /// The hint returned for a task that runs in the background.
 pub(super) const DELIVERED_LATER: &str = "The result will be delivered to you as a message when the task finishes. Keep working on \
      something else or end your turn; do not poll.";
-
-/// The hint returned for a finished task whose result did not fit in the answer.
-pub(super) const READ_SEPARATELY: &str =
-    "Finished, but its result did not fit in this answer: read it with task_status.";
 
 /// The hint returned for a task a wait gave up on.
 pub(super) const STILL_RUNNING: &str = "Still running. Its result will be delivered to you as a message when it finishes; keep \
@@ -142,9 +137,11 @@ impl Inner {
                 let task = state
                     .tasks
                     .iter_mut()
-                    .find(|task| &task.id == id)
+                    .find(|task| &task.id == id && !task.adoption_anchor)
                     .ok_or_else(|| format!("there is no task `{id}`"))?;
-                task.wake = Wake::Always;
+                if task.wake != Wake::Never {
+                    task.wake = Wake::Always;
+                }
             }
         }
         loop {
@@ -167,17 +164,10 @@ impl Inner {
         let mut state = self.state.lock().await;
         let now = Instant::now();
         let mut snapshots = Vec::with_capacity(ids.len());
-        let mut returned = 0;
         for id in ids {
             if let Some(task) = state.tasks.iter_mut().find(|task| &task.id == id) {
                 let mut snapshot = task.snapshot(now);
-                let size = snapshot.result.as_ref().map_or(0, String::len);
-                if task.status.is_ended() && returned + size > MAX_RETURNED_BYTES {
-                    // Too much for one answer; it stays owed, to be read with task_status.
-                    snapshot.result = None;
-                    snapshot.next = Some(READ_SEPARATELY);
-                } else if task.status.is_ended() {
-                    returned += size;
+                if task.status.is_ended() {
                     if task.delivery == Delivery::Owed {
                         task.delivery = Delivery::Delivered;
                     }

@@ -25,8 +25,10 @@ use super::PAGER_KEY_HINTS;
 use super::PagerView;
 use super::message_menu::MenuOutcome;
 use super::message_menu::MessageAction;
+use super::message_menu::MessageChoice;
 use super::message_menu::MessageMenu;
 use super::render_key_hints;
+use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::UserHistoryCell;
@@ -45,11 +47,14 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const WHEEL_ROWS: usize = 3;
 const KEY_PREVIOUS_MESSAGE: KeyBinding = key_hint::plain(KeyCode::Char('['));
 const KEY_NEXT_MESSAGE: KeyBinding = key_hint::plain(KeyCode::Char(']'));
+const KEY_PREVIOUS_RESPONSE: KeyBinding = key_hint::ctrl(KeyCode::Char('h'));
+const KEY_NEXT_RESPONSE: KeyBinding = key_hint::ctrl(KeyCode::Char('l'));
 
 pub(crate) struct TranscriptOverlay {
     pub(super) view: PagerView,
     pub(super) cells: Vec<Arc<dyn HistoryCell>>,
     highlight_cell: Option<usize>,
+    response_focus: bool,
     /// The last press of the left button, and the cell it was on, to tell a double click.
     last_click: Option<(Instant, usize)>,
     /// The actions offered for the selected message, while they are open.
@@ -69,10 +74,37 @@ impl TranscriptOverlay {
             ),
             cells: transcript_cells,
             highlight_cell: None,
+            response_focus: false,
             last_click: None,
             menu: None,
             chosen: None,
             is_done: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focus_responses(&mut self) {
+        self.response_focus = true;
+        self.step_response(true);
+    }
+
+    pub(crate) fn is_response_focus(&self) -> bool {
+        self.response_focus
+    }
+
+    fn step_response(&mut self, older: bool) {
+        let mut responses = self.cells.iter().enumerate().filter_map(|(index, cell)| {
+            ((cell.as_any().is::<AgentMessageCell>() && !cell.is_stream_continuation())
+                || cell.as_any().is::<AgentMarkdownCell>())
+            .then_some(index)
+        });
+        let next = match (self.highlight_cell, older) {
+            (None, _) => responses.next_back(),
+            (Some(current), true) => responses.rev().find(|index| *index < current),
+            (Some(current), false) => responses.find(|index| *index > current),
+        };
+        if next.is_some() {
+            self.set_highlight_cell(next);
         }
     }
 
@@ -195,7 +227,8 @@ impl TranscriptOverlay {
     fn step_message(&mut self, older: bool) {
         let is_message = |cell: &Arc<dyn HistoryCell>| {
             cell.as_any().is::<UserHistoryCell>()
-                || (cell.as_any().is::<AgentMessageCell>() && !cell.is_stream_continuation())
+                || ((cell.as_any().is::<AgentMessageCell>() && !cell.is_stream_continuation())
+                    || cell.as_any().is::<AgentMarkdownCell>())
         };
         let mut messages = self
             .cells
@@ -223,6 +256,33 @@ impl TranscriptOverlay {
                     self.menu = None;
                     self.chosen = Some(action);
                 }
+            }
+            return true;
+        }
+        if self.response_focus {
+            match key_event {
+                e if KEY_PREVIOUS_RESPONSE.is_press(e) => self.step_response(true),
+                e if KEY_NEXT_RESPONSE.is_press(e) => self.step_response(false),
+                e if KEY_ENTER.is_press(e) => {
+                    if let Some(cell) = self.highlight_cell {
+                        self.chosen = Some(MessageAction {
+                            cell,
+                            choice: MessageChoice::RollbackThrough,
+                        });
+                    }
+                }
+                e if super::KEY_SPACE.is_press(e) => {
+                    if let Some(cell) = self.highlight_cell {
+                        self.chosen = Some(MessageAction {
+                            cell,
+                            choice: MessageChoice::ForkSubagent,
+                        });
+                    }
+                }
+                e if KEY_ESC.is_press(e) || KEY_Q.is_press(e) || KEY_CTRL_C.is_press(e) => {
+                    self.is_done = true
+                }
+                _ => return false,
             }
             return true;
         }
@@ -275,8 +335,26 @@ impl TranscriptOverlay {
     fn render_hints(&self, area: Rect, buf: &mut Buffer) {
         let line1 = Rect::new(area.x, area.y, area.width, 1);
         let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
+        if self.response_focus {
+            render_key_hints(
+                line1,
+                buf,
+                &[
+                    (&[KEY_PREVIOUS_RESPONSE, KEY_NEXT_RESPONSE], "responses"),
+                    (&[KEY_ESC], "cancel"),
+                ],
+            );
+            render_key_hints(
+                line2,
+                buf,
+                &[
+                    (&[KEY_ENTER], "roll back"),
+                    (&[super::KEY_SPACE], "fork subagent"),
+                ],
+            );
+            return;
+        }
         render_key_hints(line1, buf, PAGER_KEY_HINTS);
-
         let mut pairs: Vec<(&[KeyBinding], &str)> = vec![
             (&[KEY_Q], "to quit"),
             (&[KEY_ESC], "to edit prev"),
@@ -321,7 +399,7 @@ impl TranscriptOverlay {
                 Ok(())
             }
             TuiEvent::Draw => {
-                tui.draw(u16::MAX, 0, |frame| {
+                tui.draw_overlay(|frame| {
                     self.render(frame.area(), frame.buffer);
                 })?;
                 Ok(())

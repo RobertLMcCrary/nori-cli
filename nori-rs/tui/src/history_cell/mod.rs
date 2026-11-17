@@ -29,6 +29,12 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
 
+    /// Logical lines for terminal scrollback, which the terminal may reflow.
+    /// Structured cells keep their bounded layout unless they opt in.
+    fn native_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines(width)
+    }
+
     fn desired_height(&self, width: u16) -> u16 {
         Paragraph::new(Text::from(self.display_lines(width)))
             .wrap(Wrap { trim: false })
@@ -90,6 +96,19 @@ pub(crate) struct UserHistoryCell {
 }
 
 impl HistoryCell for UserHistoryCell {
+    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let style = user_message_style();
+        let message = self
+            .message
+            .lines()
+            .map(|line| Line::from(line.to_owned()).style(style))
+            .collect();
+        let mut lines = vec![Line::from("").style(style)];
+        lines.extend(prefix_lines(message, "› ".bold().dim(), "  ".into()));
+        lines.push(Line::from("").style(style));
+        lines
+    }
+
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -159,6 +178,21 @@ impl ReasoningSummaryCell {
 }
 
 impl HistoryCell for ReasoningSummaryCell {
+    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        if self.transcript_only {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        append_markdown(&self.content, None, &mut lines);
+        let style = Style::default().dim().italic();
+        for line in &mut lines {
+            for span in &mut line.spans {
+                *span = span.clone().patch_style(style);
+            }
+        }
+        prefix_lines(lines, "• ".dim(), "  ".into())
+    }
+
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         if self.transcript_only {
             Vec::new()
@@ -196,6 +230,15 @@ impl AgentMessageCell {
 }
 
 impl HistoryCell for AgentMessageCell {
+    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let first = if self.is_first_line {
+            "• ".dim()
+        } else {
+            "  ".into()
+        };
+        prefix_lines(self.lines.clone(), first, "  ".into())
+    }
+
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         adaptive_wrap_lines(
             &self.lines,
@@ -235,6 +278,17 @@ impl AgentMarkdownCell {
 }
 
 impl HistoryCell for AgentMarkdownCell {
+    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        crate::markdown::append_markdown_with_cwd(
+            &self.markdown_source,
+            None,
+            Some(&self.cwd),
+            &mut lines,
+        );
+        prefix_lines(lines, "• ".dim(), "  ".into())
+    }
+
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut layout = self
             .layout
@@ -687,9 +741,19 @@ mod tests {
     use std::path::Path;
 
     use insta::assert_snapshot;
+    use pretty_assertions::assert_eq;
     use pretty_assertions::assert_ne;
 
     use super::*;
+
+    #[test]
+    fn native_message_keeps_a_logical_line_longer_than_u16_width() {
+        let source = "a".repeat(70_000);
+        let cell = AgentMessageCell::new(vec![Line::from(source.clone())], true);
+        let lines = cell.native_lines(80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), format!("• {source}"));
+    }
 
     #[test]
     fn finalized_agent_markdown_reparses_at_each_width() {

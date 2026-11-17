@@ -77,6 +77,57 @@ impl ChatWidget {
             }
             nori_protocol::AcpEvent::Request {
                 request_id,
+                request: nori_protocol::acp::v1::AgentRequest::ExtMethodRequest(request),
+            } if request.method.as_ref() == "_nori/request_user_input" => {
+                match serde_json::from_str::<crate::bottom_pane::UserQuestionRequest>(
+                    request.params.get(),
+                ) {
+                    Ok(mut question) => {
+                        if let Some(error) = question.validation_error() {
+                            self.add_error_message(format!(
+                                "Could not display agent question: {error}."
+                            ));
+                            if let Ok(raw) = serde_json::value::to_raw_value(
+                                &serde_json::json!({"cancelled": true}),
+                            ) {
+                                self.app_event_tx.send(AppEvent::HarnessAction(crate::app_event::HarnessAction::RespondToAgent {
+                                    request_id,
+                                    response: Box::new(Ok(nori_protocol::acp::v1::ClientResponse::ExtMethodResponse(nori_protocol::acp::v1::ExtResponse::new(std::sync::Arc::from(raw))))),
+                                }));
+                            }
+                            return;
+                        }
+                        question.label = self.subagent_label_for(&question.session_id);
+                        question.request_id = Some(request_id);
+                        self.bottom_pane.push_user_question(question);
+                        self.app_event_tx.send(AppEvent::RevealUserQuestion);
+                        self.request_redraw();
+                    }
+                    Err(error) => {
+                        self.add_error_message(format!(
+                            "Could not display agent question: {error}"
+                        ));
+                        if let Ok(raw) =
+                            serde_json::value::to_raw_value(&serde_json::json!({"cancelled": true}))
+                        {
+                            self.app_event_tx.send(AppEvent::HarnessAction(
+                                crate::app_event::HarnessAction::RespondToAgent {
+                                    request_id,
+                                    response: Box::new(Ok(
+                                        nori_protocol::acp::v1::ClientResponse::ExtMethodResponse(
+                                            nori_protocol::acp::v1::ExtResponse::new(
+                                                std::sync::Arc::from(raw),
+                                            ),
+                                        ),
+                                    )),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            nori_protocol::AcpEvent::Request {
+                request_id,
                 request: nori_protocol::acp::v1::AgentRequest::RequestPermissionRequest(request),
             } => {
                 let subagent = self.subagent_label_for(&request.session_id);
@@ -217,6 +268,11 @@ impl ChatWidget {
 
     fn handle_nori_event(&mut self, event: nori_protocol::NoriEvent) {
         match event {
+            nori_protocol::NoriEvent::ConversationResponseBoundary(boundary) => {
+                if self.flush_answer_stream_with_separator() {
+                    self.app_event_tx.send(AppEvent::ResponseBoundary(boundary));
+                }
+            }
             nori_protocol::NoriEvent::SessionStarted(started) => {
                 self.on_session_started(started);
             }
@@ -266,7 +322,27 @@ impl ChatWidget {
                 }
             }
             nori_protocol::NoriEvent::QueueChanged(queue) => {
-                self.bottom_pane.set_queued_user_messages(queue.prompts);
+                self.main_queued_prompts = queue.prompts;
+                if self.focused_subagent.is_none() {
+                    self.bottom_pane
+                        .set_queued_user_messages(self.main_queued_prompts.clone());
+                }
+                self.request_redraw();
+            }
+            nori_protocol::NoriEvent::SubagentQueueChanged {
+                session_id,
+                prompts,
+            } => {
+                self.child_queued_prompts
+                    .insert(session_id.clone(), prompts.clone());
+                if self
+                    .focused_subagent
+                    .and_then(|key| self.subagent_session(key))
+                    .as_ref()
+                    == Some(&session_id)
+                {
+                    self.bottom_pane.set_queued_user_messages(prompts);
+                }
                 self.request_redraw();
             }
             nori_protocol::NoriEvent::ContextCompacted(compacted) => {
@@ -289,6 +365,7 @@ impl ChatWidget {
                 self.on_prompt_summary(summary.summary);
             }
             nori_protocol::NoriEvent::Notice(notice) => self.on_warning(notice.message),
+            nori_protocol::NoriEvent::SubscriptionExhausted(_) => {}
             nori_protocol::NoriEvent::RequestWithdrawn(request_id) => {
                 self.bottom_pane.withdraw_approval_request(&request_id);
             }
@@ -351,7 +428,7 @@ impl ChatWidget {
                 self.flush_answer_stream_with_separator();
                 self.replay_source = Some(started.source);
                 self.app_event_tx.send(AppEvent::HistoryReplay(
-                    crate::app_event::HistoryReplay::Started,
+                    crate::app_event::HistoryReplay::Started(started.source),
                 ));
             }
             nori_protocol::NoriEvent::ReplayFinished => {
@@ -362,7 +439,9 @@ impl ChatWidget {
                 ));
             }
             nori_protocol::NoriEvent::Subagent(wire) => self.handle_subagent_wire(wire),
-            nori_protocol::NoriEvent::Undo(_) | nori_protocol::NoriEvent::UserShell(_) => {}
+            nori_protocol::NoriEvent::Undo(_)
+            | nori_protocol::NoriEvent::UserShell(_)
+            | nori_protocol::NoriEvent::SessionReady(_) => {}
             // TODO(#557): render forked-transcript lineage in the TUI history.
             nori_protocol::NoriEvent::SessionForked(forked) => {
                 self.on_session_forked(forked);
@@ -448,7 +527,7 @@ impl ChatWidget {
         self.refresh_terminal_title();
     }
 
-    pub(super) fn flush_answer_stream_with_separator(&mut self) {
+    pub(super) fn flush_answer_stream_with_separator(&mut self) -> bool {
         self.stream_ending = false;
         self.live_tail.set(None);
         if let Some(mut controller) = self.stream_controller.take() {
@@ -461,8 +540,10 @@ impl ChatWidget {
                     source,
                     cwd: self.config.cwd.clone(),
                 });
+                return true;
             }
         }
+        false
     }
 
     pub(super) fn set_status_header(&mut self, header: String) {
@@ -586,6 +667,13 @@ impl ChatWidget {
         self.pending_client_tool_cells.clear();
         self.finalize_active_cell_as_failed();
 
+        if !self.completed_client_tool_calls.is_empty() {
+            self.app_event_tx.send(AppEvent::FinalizeHistoryTools {
+                generation: self.session_generation,
+                call_ids: self.completed_client_tool_calls.iter().cloned().collect(),
+            });
+        }
+
         // Mark task stopped and request redraw now that all content is in history.
         self.bottom_pane.set_task_running(false);
         self.completed_client_tool_calls.clear();
@@ -612,6 +700,12 @@ impl ChatWidget {
     pub(super) fn finalize_turn(&mut self) {
         self.finalize_active_cell_as_failed();
         self.pending_client_tool_cells.clear();
+        if !self.completed_client_tool_calls.is_empty() {
+            self.app_event_tx.send(AppEvent::FinalizeHistoryTools {
+                generation: self.session_generation,
+                call_ids: self.completed_client_tool_calls.iter().cloned().collect(),
+            });
+        }
         self.bottom_pane.set_task_running(false);
         self.completed_client_tool_calls.clear();
         self.stream_controller = None;
@@ -858,8 +952,11 @@ impl ChatWidget {
                 self.request_redraw();
             }
             crate::presentation::ClientEvent::QueueChanged(queue_changed) => {
-                self.bottom_pane
-                    .set_queued_user_messages(queue_changed.prompts);
+                self.main_queued_prompts = queue_changed.prompts;
+                if self.focused_subagent.is_none() {
+                    self.bottom_pane
+                        .set_queued_user_messages(self.main_queued_prompts.clone());
+                }
                 self.request_redraw();
             }
             crate::presentation::ClientEvent::ContextCompacted(context_compacted) => {
@@ -1173,6 +1270,10 @@ impl ChatWidget {
             .completed_client_tool_calls
             .contains(&tool_snapshot.call_id)
         {
+            self.app_event_tx.send(AppEvent::UpdateHistoryToolSnapshot {
+                generation: self.session_generation,
+                snapshot: Box::new(tool_snapshot),
+            });
             return;
         }
 

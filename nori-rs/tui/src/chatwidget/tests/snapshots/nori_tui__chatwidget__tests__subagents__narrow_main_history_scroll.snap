@@ -1,0 +1,29 @@
+---
+source: tui/src/chatwidget/tests/subagents.rs
+assertion_line: 483
+expression: rendered
+---
+
+Earlier user request
+Earlier agent response
+Latest response
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Nori to do anything

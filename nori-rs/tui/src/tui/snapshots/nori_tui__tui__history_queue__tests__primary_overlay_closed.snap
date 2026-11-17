@@ -1,0 +1,15 @@
+---
+source: tui/src/tui/history_queue.rs
+assertion_line: 507
+expression: "screen(&terminal).join(\"\\n\")"
+---
+
+
+
+
+
+
+
+
+> prompt
+footer

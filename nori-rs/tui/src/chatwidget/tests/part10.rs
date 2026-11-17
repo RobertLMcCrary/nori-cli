@@ -1,6 +1,6 @@
 use super::*;
 
-fn render_bottom_pane(chat: &mut ChatWidget, width: u16) -> String {
+pub(super) fn render_bottom_pane(chat: &mut ChatWidget, width: u16) -> String {
     use crate::render::renderable::Renderable;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
@@ -84,8 +84,40 @@ fn successful_login_does_not_start_a_session_for_another_agent() {
 }
 
 #[test]
+fn successful_claude_cli_login_starts_a_fresh_active_session() {
+    let (mut chat, mut rx, _unused_rx) = make_chatwidget_manual();
+    chat.config.active_agent = "claude-code".to_string();
+    chat.login_handler = Some(crate::login_handler::LoginHandler::new());
+
+    chat.handle_external_cli_login_complete(true, "Claude Code".to_string());
+
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::NewSession)),
+        "successful Claude login should prepare a fresh session with the saved CLI credentials"
+    );
+}
+
+#[test]
+fn successful_claude_cli_login_does_not_restart_a_different_active_agent() {
+    let (mut chat, mut rx, _unused_rx) = make_chatwidget_manual();
+    chat.config.active_agent = "codex".to_string();
+    chat.login_handler = Some(crate::login_handler::LoginHandler::new());
+
+    chat.handle_external_cli_login_complete(true, "Claude Code".to_string());
+
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::NewSession)),
+        "logging into Claude while Codex is active must not replace the Codex session"
+    );
+}
+
+#[test]
 fn model_popup_without_a_session_asks_for_one() {
     let (mut chat, _rx, _unused_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("! for shell commands");
 
     chat.open_model_popup();
 
@@ -93,6 +125,18 @@ fn model_popup_without_a_session_asks_for_one() {
         "model_popup_without_session",
         render_bottom_pane(&mut chat, 80)
     );
+}
+
+#[test]
+fn fallback_switch_notice_is_neutral() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.add_info_message(
+        "Usage limit reached; switching to Mock ACP…".to_string(),
+        None,
+    );
+    insta::assert_snapshot!(history_text(&mut rx), @r"
+    • Usage limit reached; switching to Mock ACP…
+    ");
 }
 
 #[test]
@@ -194,7 +238,7 @@ fn follow_only_attachment_keeps_messages_in_the_composer_but_allows_agent_switch
         "follow-only input must retain draft attachments"
     );
 
-    chat.set_composer_text("/agent".to_string());
+    chat.set_composer_text("/model".to_string());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert!(chat.bottom_pane.has_active_overlay_or_popup());
@@ -1908,9 +1952,29 @@ fn user_cancellation_adds_interrupted_cell() {
     );
 }
 
+/// Keep the agent's filesystem-backed transcript home alive for the session.
+pub(super) struct MockSession {
+    session: nori_harness::runtime::LaunchedSession,
+    _home: tempfile::TempDir,
+}
+
+impl std::ops::Deref for MockSession {
+    type Target = nori_harness::runtime::LaunchedSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for MockSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
 /// Launch a live mock-agent session and wait for it to start, returning its
 /// handle for driving session-config operations.
-pub(super) async fn start_mock_session() -> nori_harness::runtime::LaunchedSession {
+pub(super) async fn start_mock_session() -> MockSession {
     let temp = tempfile::tempdir().expect("create session directory");
     let config = nori_config::NoriConfig {
         active_agent: "mock-model".to_string(),
@@ -1919,6 +1983,7 @@ pub(super) async fn start_mock_session() -> nori_harness::runtime::LaunchedSessi
         ..Default::default()
     };
     let agent = nori_harness::runtime::prepare_agent(nori_harness::runtime::AgentPrepareSpec {
+        handoff: None,
         config: std::sync::Arc::new(config),
         cli_version: "tui-test".to_string(),
         session_context: None,
@@ -1941,7 +2006,10 @@ pub(super) async fn start_mock_session() -> nori_harness::runtime::LaunchedSessi
     })
     .await
     .expect("mock session should start");
-    session
+    MockSession {
+        session,
+        _home: temp,
+    }
 }
 
 /// Selecting a value in the `/config` picker returns the user to the config
@@ -1959,6 +2027,7 @@ async fn config_value_selection_reopens_panel_focused_on_edited_option() {
         "High".to_string(),
         false,
         crate::nori::session_config_picker::ConfigPickerOrigin::Panel,
+        None,
     );
 
     let focus = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1992,6 +2061,7 @@ async fn model_picker_selection_does_not_open_the_config_panel() {
         "High".to_string(),
         false,
         crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
+        None,
     );
 
     tokio::time::timeout(std::time::Duration::from_secs(10), async {

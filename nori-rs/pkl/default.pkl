@@ -1,0 +1,6 @@
+// Default runtime policy. Unspecified limits remain unlimited.
+name = "nori-default"
+fallback_ranked = true
+fallback_models = List()
+// Set to an object such as new Dynamic { agent = "claude"; model = "haiku" }.
+commit_reviewer = null

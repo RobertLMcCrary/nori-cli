@@ -126,6 +126,7 @@ mod agent_status;
 mod burst;
 mod context;
 mod continue_and_rewind;
+mod login_pty;
 mod model_cycle;
 mod part10;
 mod part8;

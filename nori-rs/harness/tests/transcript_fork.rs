@@ -47,6 +47,7 @@ async fn launch(cwd: &Path) -> LaunchedSession {
         ..Default::default()
     };
     let agent = prepare_agent(AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: "transcript-fork-test".to_string(),
         session_context: None,

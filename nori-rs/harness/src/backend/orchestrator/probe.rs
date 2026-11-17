@@ -35,12 +35,24 @@ pub(crate) async fn refresh(
     cli_version: String,
     fresh_for: Duration,
 ) {
+    refresh_excluding(config, cli_version, fresh_for, None).await;
+}
+
+/// Refresh all stale installed agents except an agent whose primary session is being started.
+/// Its advertised config is remembered by that session as soon as it starts.
+pub(crate) async fn refresh_excluding(
+    config: Arc<crate::config::NoriConfig>,
+    cli_version: String,
+    fresh_for: Duration,
+    excluded_agent: Option<String>,
+) {
     let now = super::catalog::now_seconds();
     let permits = Arc::new(tokio::sync::Semaphore::new(PARALLEL_PROBES));
     let probes = crate::registry::list_available_agents()
         .into_iter()
         .filter(|agent| agent.is_installed)
         .map(|agent| agent.agent_name)
+        .filter(|agent| excluded_agent.as_deref() != Some(agent.as_str()))
         .filter(|agent| {
             let refreshed_at = super::catalog::remembered(&config.nori_home, agent).refreshed_at;
             now - refreshed_at >= fresh_for.as_secs() as i64
@@ -95,13 +107,14 @@ async fn probe(
     bare.async_session_end_hooks.clear();
     let bare = Arc::new(bare);
     let spec = crate::runtime::AgentPrepareSpec {
+        handoff: None,
         config: Arc::clone(&bare),
         cli_version: cli_version.clone(),
         session_context: None,
         initial_context: None,
     };
-    // As a child it keeps no transcript.
-    let seed = Seed::root(Arc::clone(&bare), cli_version);
+    // Catalog probes are not user conversations and do not need a journal.
+    let seed = Seed::root(Arc::clone(&bare), cli_version).without_transcript();
     let prepared = crate::runtime::prepare_delegated_agent(spec, &seed)
         .await
         .map_err(|error| format!("{error:#}"))?;

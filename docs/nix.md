@@ -16,7 +16,6 @@ writes `config.toml` from a Home Manager module. Nothing is fetched at run time.
     settings = {
       agent = "claude";
       default_models.claude = "claude-sonnet-5-5";
-      tui.resize_reflow = true;
     };
     agents = {
       claude = {
@@ -49,6 +48,19 @@ writes `config.toml` from a Home Manager module. Nothing is fetched at run time.
 - `adapter.executable` points an adapter at an account's own launcher (a name on `PATH` or an
   absolute path); several accounts are several entries under `agents`.
 - `adapter.kind = "opencode"` runs `opencode acp`.
+- Nori selects its in-process Rust ACP adapter for OpenCode v2 when built with
+  the default `native-opencode` feature. It starts the installed `opencode`
+  engine as a loopback server. `native = { agent = "opencode"; config = [
+  "cli_path=/path/to/opencode" ]; }` selects a particular executable. A local
+  distribution with `command = "opencode"; args = [ "acp" ];` uses the upstream
+  ACP adapter. During startup, the native adapter retries temporary HTTP 503
+  responses while OpenCode activates its location plugins, for up to 30 seconds.
+- The experimental Gemini Core adapter can be included with `nativeGemini = true`
+  when calling `nori-rs/default.nix`, supplying `nodejs` and `geminiCoreEntry`
+  for the official Core 0.68.0 entry point. The wrapper sets its Core path;
+  select it explicitly with a native `gemini` distribution and API-key or
+  Vertex authentication. The built-in Gemini distribution remains the
+  official CLI for Google-account sign-in. See `nori-rs/config.md`.
 - `native = { agent = "codex"; home = "..."; }` runs Codex inside Nori's own process: no adapter,
   no subprocess, no Node. `native = { agent = "claude"; config = [ "cli_path=/path/to/claude2" ]; }`
   does the same for Claude Code through the Rust driver, which starts only Claude Code's own CLI;
@@ -63,6 +75,7 @@ writes `config.toml` from a Home Manager module. Nothing is fetched at run time.
 
 Without Home Manager: `nix run github:tilework-tech/nori-cli` runs the package, `overlays.default`
 adds `pkgs.nori`, and `nix develop` gives a build shell. `nix flake check` builds the adapters and
-evaluates the module.
+evaluates the module. The `nori` package includes Pkl and OpenCode on its runtime `PATH` so Pkl
+programs and the native OpenCode ACP adapter work without extra user configuration.
 
 The Claude adapter runs Claude Code, which is unfree: allow `claude-code` in your nixpkgs config.

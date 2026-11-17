@@ -1,3 +1,5 @@
+mod other;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -6,32 +8,20 @@ use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use textwrap::WordSplitter;
 
-use crate::client_event_format::format_artifacts;
 use crate::client_event_format::format_edit_tool_header;
-use crate::client_event_format::format_invocation;
-use crate::client_event_format::format_tool_header;
 use crate::client_event_format::format_tool_kind;
 use crate::client_event_format::is_exploring_snapshot;
-use crate::client_event_format::is_invocation_redundant;
 use crate::client_event_format::relativize_paths_in_text;
-use crate::client_event_format::strip_code_fences;
 use crate::diff_render::create_diff_summary;
-use crate::exec_cell::OutputLinesParams;
-use crate::exec_cell::TOOL_CALL_MAX_LINES;
-use crate::exec_cell::limit_lines_from_start;
-use crate::exec_cell::output_lines;
 use crate::exec_cell::spinner;
-use crate::exec_cell::truncate_lines_middle;
 use crate::history_cell::HistoryCell;
-use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::line_utils::prefix_lines;
 use crate::render::line_utils::push_owned_lines;
 use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_line;
-use crate::wrapping::word_wrap_lines;
 use nori_harness::patch::first_line_in_file;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ClientToolCell {
     snapshot: crate::presentation::ToolSnapshot,
     exploring_snapshots: Vec<crate::presentation::ToolSnapshot>,
@@ -63,12 +53,77 @@ impl ClientToolCell {
         }
     }
 
+    /// Folded tool projection for the interactive conversation view.
+    pub(crate) fn compact_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = if matches!(
+            self.snapshot.kind,
+            crate::presentation::ToolKind::Other(_)
+                | crate::presentation::ToolKind::Fetch
+                | crate::presentation::ToolKind::Think
+                | crate::presentation::ToolKind::Execute
+        ) && self.snapshot.invocation.as_ref().is_none_or(|invocation| {
+            !matches!(
+                invocation,
+                crate::presentation::Invocation::Native(_)
+                    | crate::presentation::Invocation::Delegation(_)
+            )
+        }) && !self.is_exploring()
+        {
+            other::render(&self.snapshot, width, false)
+        } else {
+            self.display_lines(width)
+        };
+        if !self.is_active() {
+            lines.truncate(2);
+        }
+        if let Some(first) = lines.first_mut() {
+            if self.snapshot.kind != crate::presentation::ToolKind::Execute {
+                for span in &mut first.spans {
+                    span.content = relativize_paths_in_text(&span.content, &self.cwd).into();
+                }
+            }
+            first.spans.insert(0, "▸ ".dim());
+        }
+        lines
+    }
+
+    /// Complete, structured evidence for the shared conversation view.
+    pub(crate) fn expanded_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.compact_lines(width);
+        lines.truncate(1);
+        if let Some(first) = lines.first_mut()
+            && let Some(indicator) = first.spans.first_mut()
+        {
+            *indicator = "▾ ".dim();
+        }
+        if !self.edit_changes.is_empty() {
+            lines.extend(create_diff_summary(
+                &self.edit_changes,
+                &self.cwd,
+                usize::from(width),
+            ));
+        }
+        if self.exploring_snapshots.is_empty() {
+            other::append_evidence(&mut lines, &self.snapshot, width);
+        } else {
+            for snapshot in &self.exploring_snapshots {
+                lines.push(Line::from(snapshot.title.clone().bold()));
+                other::append_evidence(&mut lines, snapshot, width);
+            }
+        }
+        lines
+    }
+
     pub(crate) fn call_id(&self) -> &str {
         &self.snapshot.call_id
     }
 
     pub(crate) fn is_active(&self) -> bool {
         is_active_phase(&self.snapshot.phase)
+            || self
+                .exploring_snapshots
+                .iter()
+                .any(|snapshot| is_active_phase(&snapshot.phase))
     }
 
     pub(crate) fn snapshot_kind(&self) -> &crate::presentation::ToolKind {
@@ -152,10 +207,15 @@ impl ClientToolCell {
     }
 
     pub(crate) fn mark_failed(&mut self) {
-        if self.is_active() {
+        if is_active_phase(&self.snapshot.phase) {
             self.snapshot.phase = crate::presentation::ToolPhase::Failed;
-            self.start_time = None;
         }
+        for snapshot in &mut self.exploring_snapshots {
+            if is_active_phase(&snapshot.phase) {
+                snapshot.phase = crate::presentation::ToolPhase::Failed;
+            }
+        }
+        self.start_time = None;
     }
 
     fn render_exploring_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -489,335 +549,6 @@ impl ClientToolCell {
         }
         lines
     }
-
-    /// `full` shows declared markdown whole, as the transcript does; otherwise its first rows.
-    fn render_generic_lines(&self, width: u16, full: bool) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        let bullet = if self.is_active() {
-            spinner(self.start_time, self.animations_enabled)
-        } else if self.snapshot.phase == crate::presentation::ToolPhase::Failed {
-            "•".red().bold()
-        } else {
-            "•".dim()
-        };
-
-        let header = relativize_paths_in_text(&format_tool_header(&self.snapshot), &self.cwd);
-        lines.push(Line::from(vec![bullet, " ".into(), header.bold()]));
-
-        let mut details = Vec::new();
-        if let Some(invocation) = format_invocation(&self.snapshot.invocation)
-            && !is_invocation_redundant(&invocation, &self.snapshot.title)
-        {
-            details.push(relativize_paths_in_text(&invocation, &self.cwd));
-        }
-        for artifact in format_artifacts(&self.snapshot.artifacts) {
-            if artifact.contains('\n') {
-                details.extend(artifact.lines().map(str::to_string));
-            } else {
-                details.push(artifact);
-            }
-        }
-
-        let is_failed = self.snapshot.phase == crate::presentation::ToolPhase::Failed;
-
-        // For failed tools with no text artifacts, extract error from raw_output
-        if is_failed
-            && details.is_empty()
-            && let Some(error_text) = extract_error_text(&self.snapshot)
-        {
-            details.push(error_text);
-        }
-
-        let markdown = self.markdown_artifact_lines(width, full);
-        if details.is_empty() && markdown.is_empty() {
-            if is_failed {
-                // For failed tools with absolutely no detail, show "(failed)" fallback
-                details.push("(failed)".to_string());
-            } else {
-                // Fallback: show location paths when no other detail lines were produced
-                for location in &self.snapshot.locations {
-                    details.push(location.path.display().to_string());
-                }
-            }
-        }
-
-        let has_details = !details.is_empty();
-        for (idx, detail) in details.into_iter().enumerate() {
-            let prefix = if idx == 0 { "  └ " } else { "    " };
-            lines.push(Line::from(vec![prefix.dim(), detail.dim()]));
-        }
-        for (idx, line) in markdown.into_iter().enumerate() {
-            let prefix = if idx == 0 && !has_details {
-                "  └ "
-            } else {
-                "    "
-            };
-            let mut spans = vec![prefix.dim()];
-            spans.extend(line.spans);
-            lines.push(Line::from(spans));
-        }
-
-        lines
-    }
-
-    /// The tool's declared-markdown output, rendered: whole when `full`, else its first rows
-    /// and a note of how many more there are.
-    fn markdown_artifact_lines(&self, width: u16, full: bool) -> Vec<Line<'static>> {
-        const PREVIEW_ROWS: usize = 12;
-        let mut lines = Vec::new();
-        for artifact in &self.snapshot.artifacts {
-            let crate::presentation::Artifact::Text {
-                text,
-                format: crate::presentation::TextFormat::Markdown,
-            } = artifact
-            else {
-                continue;
-            };
-            let rendered = crate::markdown_render::render_markdown_text_with_width(
-                text,
-                Some(usize::from(width).saturating_sub(4).max(1)),
-            )
-            .lines;
-            let shown = if full {
-                rendered.len()
-            } else {
-                rendered.len().min(PREVIEW_ROWS)
-            };
-            let hidden = rendered.len() - shown;
-            lines.extend(rendered.into_iter().take(shown));
-            if hidden > 0 {
-                lines.push(Line::from(
-                    format!("… {hidden} more lines (ctrl+t for the full transcript)").dim(),
-                ));
-            }
-        }
-        lines
-    }
-
-    fn render_execute_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let success = exit_code_success(&self.snapshot);
-        let bullet = match success {
-            Some(true) => "•".green().bold(),
-            Some(false) => "•".red().bold(),
-            None => spinner(self.start_time, self.animations_enabled),
-        };
-        let title = if self.is_active() { "Running" } else { "Ran" };
-
-        let command = match &self.snapshot.invocation {
-            Some(crate::presentation::Invocation::Command { command }) => command.clone(),
-            _ => self.snapshot.title.clone(),
-        };
-
-        let mut header_line =
-            Line::from(vec![bullet.clone(), " ".into(), title.bold(), " ".into()]);
-        let header_prefix_width = header_line.width();
-
-        let highlighted_lines = highlight_bash_to_lines(&command);
-
-        let continuation_wrap_width = usize::from(width)
-            .saturating_sub(CMD_CONTINUATION_PREFIX_WIDTH)
-            .max(1);
-        let continuation_opts =
-            RtOptions::new(continuation_wrap_width).word_splitter(WordSplitter::NoHyphenation);
-
-        let mut continuation_lines: Vec<Line<'static>> = Vec::new();
-
-        if let Some((first, rest)) = highlighted_lines.split_first() {
-            let available_first_width = (width as usize).saturating_sub(header_prefix_width).max(1);
-            let first_opts =
-                RtOptions::new(available_first_width).word_splitter(WordSplitter::NoHyphenation);
-            let mut first_wrapped: Vec<Line<'static>> = Vec::new();
-            push_owned_lines(&word_wrap_line(first, first_opts), &mut first_wrapped);
-            let mut first_wrapped_iter = first_wrapped.into_iter();
-            if let Some(first_segment) = first_wrapped_iter.next() {
-                header_line.extend(first_segment);
-            }
-            continuation_lines.extend(first_wrapped_iter);
-
-            for line in rest {
-                push_owned_lines(
-                    &word_wrap_line(line, continuation_opts.clone()),
-                    &mut continuation_lines,
-                );
-            }
-        }
-
-        let mut lines: Vec<Line<'static>> = vec![header_line];
-
-        let continuation_lines = limit_lines_from_start(&continuation_lines, CMD_CONTINUATION_MAX);
-        if !continuation_lines.is_empty() {
-            lines.extend(prefix_lines(
-                continuation_lines,
-                Span::from(CMD_CONTINUATION_PREFIX).dim(),
-                Span::from(CMD_CONTINUATION_PREFIX).dim(),
-            ));
-        }
-
-        // Render output
-        let output_text = execute_output_text(&self.snapshot);
-
-        if let Some(text) = output_text {
-            if text.is_empty() {
-                lines.extend(prefix_lines(
-                    vec![Line::from("(no output)".dim())],
-                    Span::from(OUTPUT_INITIAL_PREFIX).dim(),
-                    Span::from(OUTPUT_SUBSEQUENT_PREFIX),
-                ));
-            } else {
-                let output = crate::exec_cell::CommandOutput {
-                    exit_code: extract_exit_code(&self.snapshot).unwrap_or_else(|| {
-                        if self.snapshot.phase == crate::presentation::ToolPhase::Failed {
-                            1
-                        } else {
-                            0
-                        }
-                    }),
-                    aggregated_output: text,
-                };
-                let raw_output = output_lines(
-                    Some(&output),
-                    OutputLinesParams {
-                        line_limit: TOOL_CALL_MAX_LINES,
-                        only_err: false,
-                        include_angle_pipe: false,
-                        include_prefix: false,
-                    },
-                );
-
-                let trimmed_output =
-                    truncate_lines_middle(&raw_output.lines, OUTPUT_MAX_LINES, raw_output.omitted);
-
-                let output_wrap_width = usize::from(width)
-                    .saturating_sub(OUTPUT_PREFIX_WIDTH)
-                    .max(1);
-                let output_opts =
-                    RtOptions::new(output_wrap_width).word_splitter(WordSplitter::NoHyphenation);
-                let mut wrapped_output: Vec<Line<'static>> = Vec::new();
-                for line in trimmed_output {
-                    push_owned_lines(
-                        &word_wrap_line(&line, output_opts.clone()),
-                        &mut wrapped_output,
-                    );
-                }
-
-                if !wrapped_output.is_empty() {
-                    lines.extend(prefix_lines(
-                        wrapped_output,
-                        Span::from(OUTPUT_INITIAL_PREFIX).dim(),
-                        Span::from(OUTPUT_SUBSEQUENT_PREFIX),
-                    ));
-                }
-            }
-        } else if !self.is_active() {
-            // Only show "(no output)" for completed/failed commands, not in-progress ones.
-            lines.extend(prefix_lines(
-                vec![Line::from("(no output)".dim())],
-                Span::from(OUTPUT_INITIAL_PREFIX).dim(),
-                Span::from(OUTPUT_SUBSEQUENT_PREFIX),
-            ));
-        }
-
-        lines
-    }
-
-    /// Transcript rendering for Execute tools: `$ command` shell-style format,
-    /// matching the style used in the upstream Codex ExecCell transcript view.
-    fn render_execute_transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let command = match &self.snapshot.invocation {
-            Some(crate::presentation::Invocation::Command { command }) => command.clone(),
-            _ => self.snapshot.title.clone(),
-        };
-
-        let highlighted_lines = highlight_bash_to_lines(&command);
-        let cmd_display = word_wrap_lines(
-            &highlighted_lines,
-            RtOptions::new(width as usize)
-                .initial_indent("$ ".magenta().into())
-                .subsequent_indent("    ".into()),
-        );
-        let mut lines: Vec<Line<'static>> = cmd_display;
-
-        // Output
-        if let Some(text) = execute_output_text(&self.snapshot)
-            && !text.is_empty()
-        {
-            for line_str in text.lines() {
-                lines.push(Line::from(format!("    {line_str}")).dim());
-            }
-        }
-
-        // Exit status
-        if !is_active_phase(&self.snapshot.phase) {
-            let success = exit_code_success(&self.snapshot);
-            let result: Line = match success {
-                Some(true) => Line::from("\u{2713}".green().bold()),
-                Some(false) => {
-                    let code = extract_exit_code(&self.snapshot).unwrap_or(1);
-                    Line::from(vec!["\u{2717}".red().bold(), format!(" ({code})").into()])
-                }
-                None => Line::default(),
-            };
-            if !result.spans.is_empty() {
-                lines.push(result);
-            }
-        }
-
-        lines
-    }
-}
-
-// Layout constants matching ExecCell display layout
-const CMD_CONTINUATION_PREFIX: &str = "  │ ";
-const CMD_CONTINUATION_PREFIX_WIDTH: usize = 4;
-const CMD_CONTINUATION_MAX: usize = 2;
-const OUTPUT_INITIAL_PREFIX: &str = "  └ ";
-const OUTPUT_SUBSEQUENT_PREFIX: &str = "    ";
-const OUTPUT_PREFIX_WIDTH: usize = 4;
-const OUTPUT_MAX_LINES: usize = 5;
-
-fn exit_code_success(snapshot: &crate::presentation::ToolSnapshot) -> Option<bool> {
-    if let Some(exit_code) = extract_exit_code(snapshot) {
-        return Some(exit_code == 0);
-    }
-    match snapshot.phase {
-        crate::presentation::ToolPhase::Completed => Some(true),
-        crate::presentation::ToolPhase::Failed => Some(false),
-        _ => None,
-    }
-}
-
-fn extract_exit_code(snapshot: &crate::presentation::ToolSnapshot) -> Option<i32> {
-    snapshot
-        .raw_output
-        .as_ref()?
-        .get("exit_code")
-        .and_then(serde_json::Value::as_i64)
-        .map(|c| c as i32)
-}
-
-fn execute_output_text(snapshot: &crate::presentation::ToolSnapshot) -> Option<String> {
-    // Prefer stdout from raw_output (most accurate)
-    if let Some(raw) = &snapshot.raw_output
-        && let Some(stdout) = raw.get("stdout").and_then(serde_json::Value::as_str)
-    {
-        return Some(stdout.to_string());
-    }
-
-    // Only fall back to artifact text for completed/failed snapshots.
-    // During pending/in-progress, artifact text for execute tools is
-    // the agent's description (e.g., "Print current UTC date/time"),
-    // not stdout.
-    if !is_active_phase(&snapshot.phase) {
-        for artifact in &snapshot.artifacts {
-            if let crate::presentation::Artifact::Text { text, .. } = artifact
-                && !text.is_empty()
-            {
-                return Some(strip_code_fences(text));
-            }
-        }
-    }
-
-    None
 }
 
 fn extract_error_text(snapshot: &crate::presentation::ToolSnapshot) -> Option<String> {
@@ -967,7 +698,7 @@ impl HistoryCell for ClientToolCell {
         } else if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
             self.render_exploring_lines(width)
         } else if self.snapshot.kind == crate::presentation::ToolKind::Execute {
-            self.render_execute_lines(width)
+            other::render(&self.snapshot, width, false)
         } else if matches!(
             self.snapshot.kind,
             crate::presentation::ToolKind::Create
@@ -977,32 +708,18 @@ impl HistoryCell for ClientToolCell {
         ) {
             self.render_edit_lines(width)
         } else {
-            self.render_generic_lines(width, false)
+            let mut lines = other::render(&self.snapshot, width, false);
+            if let Some(header) = lines.first_mut() {
+                for span in &mut header.spans {
+                    span.content = relativize_paths_in_text(&span.content, &self.cwd).into();
+                }
+            }
+            lines
         }
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if let Some(crate::presentation::Invocation::Delegation(call)) = &self.snapshot.invocation {
-            self.render_delegation_lines(call)
-        } else if let Some(crate::presentation::Invocation::Native(call)) =
-            &self.snapshot.invocation
-        {
-            self.render_native_lines(call, width)
-        } else if !self.exploring_snapshots.is_empty() || is_exploring_snapshot(&self.snapshot) {
-            self.render_exploring_lines(width)
-        } else if self.snapshot.kind == crate::presentation::ToolKind::Execute {
-            self.render_execute_transcript_lines(width)
-        } else if matches!(
-            self.snapshot.kind,
-            crate::presentation::ToolKind::Create
-                | crate::presentation::ToolKind::Edit
-                | crate::presentation::ToolKind::Delete
-                | crate::presentation::ToolKind::Move
-        ) {
-            self.render_edit_lines(width)
-        } else {
-            self.render_generic_lines(width, true)
-        }
+        self.expanded_lines(width)
     }
 }
 
@@ -1128,7 +845,7 @@ mod tests {
 
         assert!(lines[0].contains("Ran"));
         assert!(lines[0].contains("rm /tmp/foo.txt"));
-        assert!(lines.iter().any(|l| l.contains("(no output)")));
+        assert_eq!(lines.len(), 1);
     }
 
     #[test]
@@ -1186,19 +903,9 @@ mod tests {
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
 
-        // Should have truncation indicator
-        assert!(
-            lines.iter().any(|l| l.contains("…") && l.contains("lines")),
-            "Expected truncation ellipsis in output, got: {lines:?}"
-        );
-
-        // Should NOT show all 20 lines
-        let output_lines: Vec<_> = lines.iter().filter(|l| l.contains("line ")).collect();
-        assert!(
-            output_lines.len() < 20,
-            "Expected truncation but got {count} output lines",
-            count = output_lines.len()
-        );
+        assert!(lines.len() <= 2, "{lines:?}");
+        let expanded = render_lines(&cell.expanded_lines(80)).join("\n");
+        assert!(expanded.contains("line 1") && expanded.contains("line 20"));
     }
 
     /// Output a tool declares as markdown is rendered as markdown: no raw syntax, and only its
@@ -1226,20 +933,10 @@ mod tests {
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let collapsed = render_lines(&cell.display_lines(80)).join("\n");
         assert!(collapsed.contains("Findings"), "{collapsed}");
-        assert!(collapsed.contains("one a.rs"), "{collapsed}");
-        // Headings keep their marker, as the markdown renderer draws them; emphasis and code do
-        // not show their syntax.
-        assert!(
-            !collapsed.contains("**") && !collapsed.contains('`'),
-            "{collapsed}"
-        );
-        assert!(
-            collapsed.contains("more lines (ctrl+t for the full transcript)"),
-            "{collapsed}"
-        );
+        assert!(!collapsed.contains("line 19"), "{collapsed}");
         let full = render_lines(&cell.transcript_lines(80)).join("\n");
         assert!(
-            full.contains("line 19") && !full.contains("more lines"),
+            full.contains("one a.rs") && full.contains("line 19") && !full.contains("**"),
             "{full}"
         );
     }
@@ -1268,12 +965,8 @@ mod tests {
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
 
-        // Should use the generic format
-        assert!(
-            lines[0].contains("Tool [completed]"),
-            "Non-execute, non-exploring tool should use generic format, got: {}",
-            lines[0]
-        );
+        assert!(lines[0].contains("Fetch https://example.com"));
+        assert!(!lines[0].contains("Tool ["));
     }
 
     #[test]
@@ -2665,22 +2358,10 @@ mod tests {
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/cwd"), false);
         let lines = render_lines(&cell.transcript_lines(80));
 
-        // Should have "$ " prefix (shell-style)
-        assert!(
-            lines[0].contains("$ "),
-            "Execute transcript should use '$ ' shell format, got: {}",
-            lines[0]
-        );
-        assert!(
-            lines[0].contains("date --utc"),
-            "Execute transcript should show command, got: {}",
-            lines[0]
-        );
-        // Should NOT have bullet-style "Ran"
-        assert!(
-            !lines.iter().any(|l| l.contains("Ran")),
-            "Execute transcript should NOT use bullet-style 'Ran', got: {lines:?}"
-        );
+        let full = lines.join("\n");
+        assert!(full.contains("date --utc"));
+        assert!(full.contains("2026-03-30"));
+        assert!(!full.contains("Tool ["));
     }
 
     // --- Bug fix: Exploring transcript should use exploring format ---

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nori_config::AskForApproval;
 use nori_config::NoriConfig;
 use nori_harness::SessionContext;
 use nori_harness::runtime::AgentPrepareSpec;
@@ -30,6 +31,7 @@ fn launch_session(spec: SessionLaunchSpec) -> LaunchedSession {
         .unwrap_or(SessionStart::New);
     prepare_and_launch_session(
         AgentPrepareSpec {
+            handoff: None,
             config: spec.config,
             cli_version: spec.cli_version,
             session_context: spec.session_context,
@@ -40,6 +42,54 @@ fn launch_session(spec: SessionLaunchSpec) -> LaunchedSession {
 }
 
 struct EnvGuard(&'static str);
+
+#[tokio::test]
+#[serial]
+async fn fresh_session_signals_ready_without_replay() {
+    let home = tempfile::tempdir().expect("home");
+    let config = NoriConfig {
+        active_agent: "mock-model".to_owned(),
+        cwd: home.path().to_path_buf(),
+        nori_home: home.path().to_path_buf(),
+        ..Default::default()
+    };
+    let mut session = launch_session(SessionLaunchSpec {
+        config: Arc::new(config),
+        cli_version: "boundary-test".into(),
+        session_context: None,
+        initial_context: None,
+        resume: None,
+    });
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        loop {
+            let event = session.events.recv().await.expect("event stream open");
+            let ready = matches!(event, SessionEvent::Nori(NoriEvent::SessionReady(_)));
+            events.push(event);
+            if ready {
+                break events;
+            }
+        }
+    })
+    .await
+    .expect("fresh session becomes ready");
+    let started = events
+        .iter()
+        .find_map(|event| match event {
+            SessionEvent::Nori(NoriEvent::SessionStarted(started)) => Some(&started.acp_session_id),
+            _ => None,
+        })
+        .expect("session started");
+    assert!(
+        matches!(events.last(), Some(SessionEvent::Nori(NoriEvent::SessionReady(id))) if id == started)
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Nori(NoriEvent::ReplayStarted(_))
+            | SessionEvent::Nori(NoriEvent::ReplayFinished)
+    )));
+    session.handle.shutdown().await.expect("shutdown");
+}
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
@@ -1400,7 +1450,7 @@ async fn http_mcp_agent_receives_goal_routing_context_once_without_fallback_guid
                 "<context>",
                 "Source: this message is from Nori CLI.",
                 "",
-                "When <goal_context> is present, Nori CLI owns the goal. Use only Nori's goal tools: read it with `get_goal` and update it with `update_goal`.",
+                "When <goal_context> is present, Nori CLI owns the goal. Nori delivers changed goal context automatically when supported; use `get_goal` only if you need to inspect the current state, and use `update_goal` to change its status.",
                 "</context>",
                 "",
                 "first prompt",
@@ -1442,6 +1492,7 @@ async fn delegated_permission_round_trips_as_raw_acp_with_the_same_request_id() 
         active_agent: "mock-model".to_string(),
         cwd: temp.path().to_path_buf(),
         nori_home: temp.path().to_path_buf(),
+        approval_policy: AskForApproval::OnRequest,
         ..Default::default()
     };
     let mut session = launch_session(SessionLaunchSpec {
@@ -1952,28 +2003,40 @@ async fn failed_load_preserves_response_order_and_separates_replay_sources() {
     let _fail_guard = EnvGuard("MOCK_AGENT_LOAD_SESSION_FAIL");
     let _count_guard = EnvGuard("MOCK_AGENT_LOAD_SESSION_NOTIFICATION_COUNT");
     let temp = tempfile::tempdir().expect("create session directory");
-    let recorder = nori_harness::TranscriptRecorder::new(
-        temp.path(),
-        temp.path(),
-        Some("mock-model".to_string()),
-        "boundary-test",
-        Some("missing-session".to_string()),
-    )
-    .await
-    .expect("create fallback transcript");
-    recorder
-        .record_user_message("saved-user", "saved local user turn", Vec::new())
+    // This legacy JSONL transcript has no canonical Pkl journal, so a failed agent load must
+    // retain both the provider's partial replay batch and transcript fallback batch.
+    let sessions = temp.path().join("transcripts/by-project/project/sessions");
+    tokio::fs::create_dir_all(&sessions)
         .await
-        .expect("record fallback user turn");
-    recorder.flush().await.expect("flush fallback transcript");
+        .expect("create fallback transcript directory");
+    let transcript_path = sessions.join("missing-session.jsonl");
+    let meta = serde_json::json!({
+        "ts": "2026-01-01T00:00:00Z",
+        "v": 3,
+        "type": "session_meta",
+        "session_id": "missing-session",
+        "project_id": "project",
+        "started_at": "2026-01-01T00:00:00Z",
+        "cwd": temp.path(),
+        "agent": "mock-model",
+        "cli_version": "boundary-test",
+        "acp_session_id": "missing-session"
+    });
+    let user = serde_json::json!({
+        "ts": "2026-01-01T00:00:01Z",
+        "v": 3,
+        "type": "user",
+        "id": "saved-user",
+        "content": "saved local user turn",
+        "attachments": []
+    });
+    tokio::fs::write(&transcript_path, format!("{meta}\n{user}\n"))
+        .await
+        .expect("write fallback transcript");
     let transcript = nori_harness::TranscriptLoader::new(temp.path().to_path_buf())
-        .load_transcript(recorder.project_id(), recorder.session_id())
+        .load_transcript("project", "missing-session")
         .await
-        .expect("load fallback transcript");
-    recorder
-        .shutdown()
-        .await
-        .expect("close fallback transcript");
+        .expect("load legacy fallback transcript");
     let config = NoriConfig {
         active_agent: "mock-model".to_string(),
         cwd: temp.path().to_path_buf(),

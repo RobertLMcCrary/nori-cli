@@ -1077,17 +1077,18 @@ fn test_footer_layout_default_places_mode_above_prompt_and_state_on_the_right() 
             FooterSegment::ModeIndicator.into()
         ]
     );
-    // Location and headroom are right-aligned on the footer row.
+    // Location and headroom sit inside the prompt bar.
     assert_eq!(
-        layout.footer_right,
+        layout.textarea_top_left,
         vec![
+            FooterSegment::VimMode.into(),
             FooterSegment::GitBranch.into(),
             FooterSegment::WorktreeName.into(),
             FooterSegment::Context.into(),
         ]
     );
-    // Every other corner is empty.
-    assert_eq!(layout.textarea_top_left, Vec::new());
+    // The footer and remaining corners leave room for subagent navigation.
+    assert_eq!(layout.footer_right, Vec::new());
     assert_eq!(layout.textarea_bottom_left, Vec::new());
     assert_eq!(layout.textarea_bottom_right, Vec::new());
 }
@@ -1108,10 +1109,7 @@ fn test_footer_layout_default_left_group_is_self_hiding_state_plus_opt_ins() {
         })
         .filter(|segment| segments.is_enabled(*segment))
         .collect();
-    assert_eq!(
-        enabled_on_the_left,
-        vec![FooterSegment::CloudSession, FooterSegment::VimMode]
-    );
+    assert_eq!(enabled_on_the_left, vec![FooterSegment::CloudSession]);
 
     // The default-off segments still list a placement, so enabling one through
     // `[tui.footer_segments]` alone is enough to make it render.
@@ -1149,8 +1147,9 @@ textarea_top_right = ["git_branch"]
     // The segment moves rather than duplicating: it leaves the default
     // `footer_right` group, and the rest of that group is untouched.
     assert_eq!(
-        layout.footer_right,
+        layout.textarea_top_left,
         vec![
+            FooterSegment::VimMode.into(),
             FooterSegment::WorktreeName.into(),
             FooterSegment::Context.into(),
         ]
@@ -1301,7 +1300,7 @@ slug = "gemini"
 
 [agents.distribution.bunx]
 package = "@google/gemini-cli"
-args = ["--experimental-acp"]
+args = ["--acp"]
 "#,
     )
     .unwrap();
@@ -1309,7 +1308,7 @@ args = ["--experimental-acp"]
     assert_eq!(config.agents[0].name, "Gemini");
     let bunx = config.agents[0].distribution.bunx.as_ref().unwrap();
     assert_eq!(bunx.package, "@google/gemini-cli");
-    assert_eq!(bunx.args, vec!["--experimental-acp"]);
+    assert_eq!(bunx.args, vec!["--acp"]);
 }
 
 #[test]
@@ -1534,14 +1533,14 @@ fn test_agent_distribution_resolve_bunx() {
     let dist = AgentDistributionToml {
         bunx: Some(PackageDistribution {
             package: "@google/gemini-cli".to_string(),
-            args: vec!["--experimental-acp".to_string()],
+            args: vec!["--acp".to_string()],
         }),
         ..Default::default()
     };
     let resolved = dist.resolve().unwrap();
     if let ResolvedDistribution::Bunx { package, args } = resolved {
         assert_eq!(package, "@google/gemini-cli");
-        assert_eq!(args, vec!["--experimental-acp"]);
+        assert_eq!(args, vec!["--acp"]);
     } else {
         panic!("Expected Bunx variant");
     }

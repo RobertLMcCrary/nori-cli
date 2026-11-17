@@ -23,6 +23,8 @@ pub enum ConnectionEvent {
     Acp(Box<AcpEvent>),
     /// The active session was released successfully through ACP `session/close`.
     SessionClosed,
+    /// Ordered acknowledgement that earlier connection events have been relayed.
+    Barrier(tokio::sync::oneshot::Sender<()>),
     /// Private reducer input paired with the preceding raw notification.
     SessionUpdate(acp::SessionUpdate),
     /// A subagent announcement, decoded from the JSON envelope.

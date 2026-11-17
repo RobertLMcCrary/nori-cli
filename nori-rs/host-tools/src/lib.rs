@@ -18,6 +18,10 @@
 //!   tool call {_meta: {"nori":{"hostTool": name}}} <- tool_call_meta(name), for the UI
 //! ```
 
+mod selection;
+pub use selection::SelectedTools;
+pub use selection::ToolSelection;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -34,6 +38,14 @@ use serde_json::Value;
 /// The name the tools are grouped under where an agent needs one, such as Claude Code's
 /// `mcp__nori__git_status`.
 pub const SERVER_NAME: &str = "nori";
+
+/// Guidance for the Nori-owned cross-provider task catalog.
+pub const DELEGATION_INSTRUCTIONS: &str = "Nori can delegate work across its configured agent providers. When the user asks for a specific \
+     provider or model, call `agent_capabilities` to discover the available agent and model values, then use \
+     `delegate_task` with those values. Use these Nori tools for cross-provider delegation; another agent's \
+     built-in spawn tool may list only that agent's own models and is not Nori's provider catalog. Do not say \
+     a requested provider is unavailable based only on a built-in spawn tool. Give the child the full task, \
+     then continue or wait for its result. Tasks end with this session, and the user stopping you stops them.";
 
 /// The `_meta` key under which everything here lives.
 const META_KEY: &str = "nori";
@@ -62,14 +74,74 @@ pub struct HostToolSpec {
 pub struct HostToolOutput {
     pub text: String,
     pub is_error: bool,
+    /// Complete serialized MCP result, preserving content blocks, structuredContent,
+    /// result metadata and future fields. None means a legacy text-only result.
+    pub mcp_result: Option<Value>,
+    /// Session-scoped model context, separate from the canonical tool result.
+    pub model_context: Option<String>,
 }
 
 impl HostToolOutput {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: false,
+            mcp_result: None,
+            model_context: None,
+        }
+    }
+
     pub fn error(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             is_error: true,
+            mcp_result: None,
+            model_context: None,
         }
+    }
+
+    /// Keep the complete MCP response while deriving a legacy text view.
+    pub fn from_mcp_result(result: Value) -> Self {
+        let text = result
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|block| {
+                (block.get("type")?.as_str()? == "text")
+                    .then(|| block.get("text")?.as_str())
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Self {
+            text,
+            is_error,
+            mcp_result: Some(result),
+            model_context: None,
+        }
+    }
+
+    /// The complete MCP result, synthesizing a text block for older implementations.
+    pub fn as_mcp_result(&self) -> Value {
+        self.mcp_result.clone().unwrap_or_else(|| {
+            serde_json::json!({
+                "content": [{"type": "text", "text": self.text}], "isError": self.is_error,
+            })
+        })
+    }
+
+    /// A cancellation receipt retains the originating call ID and tool name.
+    pub fn cancelled(call_id: &str, tool: &str) -> Self {
+        Self::from_mcp_result(serde_json::json!({
+            "content": [{"type": "text", "text": format!("Tool call {call_id} was cancelled")}],
+            "structuredContent": {"status": "cancelled", "call_id": call_id, "tool": tool},
+            "isError": true,
+        }))
     }
 }
 
@@ -86,6 +158,15 @@ pub trait HostTools: Send + Sync {
     /// Run the tool `name`. An unknown name or bad arguments come back as an error output, never
     /// a panic: the model reads the error and tries again.
     fn call(&self, name: &str, arguments: Value) -> HostToolFuture;
+
+    /// Bind the root ACP session that owns this registration. Implementations
+    /// may use this trusted identity to scope conversation-local context.
+    fn bind_session_id(&self, _session_id: &str) {}
+
+    /// Call from a known ACP session. Legacy implementations remain unscoped.
+    fn call_scoped(&self, name: &str, arguments: Value, _session_id: &str) -> HostToolFuture {
+        self.call(name, arguments)
+    }
 }
 
 /// What every session's tools look like, before any session has them. Every registration has
@@ -235,10 +316,7 @@ mod tests {
         }
 
         fn call(&self, name: &str, arguments: Value) -> HostToolFuture {
-            let output = HostToolOutput {
-                text: format!("{name} {arguments}"),
-                is_error: false,
-            };
+            let output = HostToolOutput::text(format!("{name} {arguments}"));
             Box::pin(async move { output })
         }
     }

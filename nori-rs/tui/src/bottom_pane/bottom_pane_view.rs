@@ -14,8 +14,22 @@ pub(crate) trait BottomPaneView: Renderable {
     /// scheduled after this call.
     fn handle_key_event(&mut self, _key_event: KeyEvent) {}
 
+    /// Handle pointer input against the last rendered view geometry.
+    fn handle_mouse_event(&mut self, _mouse: crossterm::event::MouseEvent) -> bool {
+        false
+    }
+
+    /// Search pickers retain the draft bar in its usual bottom position.
+    fn keeps_composer_visible(&self) -> bool {
+        false
+    }
+
     /// Return `true` if the view has finished and should be removed.
     fn is_complete(&self) -> bool {
+        false
+    }
+
+    fn preserve_previous_views(&self) -> bool {
         false
     }
 

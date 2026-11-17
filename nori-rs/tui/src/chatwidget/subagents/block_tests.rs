@@ -25,6 +25,7 @@ fn announce(
         SubagentUpdate {
             parent_session_id: acp::SessionId::new(parent),
             session_id: acp::SessionId::new(child),
+            agent: Patch::Keep,
             title: Patch::Set(title.into()),
             description: Patch::Set(description.into()),
             state: Patch::Set(SubagentState::Running),
@@ -58,7 +59,6 @@ fn render(tree: &SubagentTree, now: Instant, width: u16, screen_rows: u16) -> St
         tree,
         now,
         screen_rows,
-        stoppable: false,
     }
     .lines(width)
     .iter()
@@ -160,6 +160,7 @@ fn a_finished_child_leaves_the_block_and_its_parent_stays() {
         SubagentUpdate {
             parent_session_id: acp::SessionId::new("c2"),
             session_id: acp::SessionId::new("c3"),
+            agent: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Ended(SubagentOutcome::Completed {
@@ -202,4 +203,20 @@ fn only_changed_children_rebuild_their_rows() {
     text(&mut tree, "c7", "working", base);
     let _ = render(&tree, now, 80, 0);
     assert_eq!(tree.rows_built(), built + 1);
+}
+
+#[test]
+fn hit_testing_excludes_overflow_rows() {
+    use crate::subagent_switcher::SubagentKey;
+
+    let (tree, now) = three_children();
+    let block = SubagentBlock {
+        tree: &tree,
+        now,
+        screen_rows: 12,
+    };
+    assert_eq!(block.target_at(0), Some(SubagentKey(1)));
+    assert_eq!(block.target_at(1), Some(SubagentKey(1)));
+    assert_eq!(block.target_at(2), None);
+    assert_eq!(block.target_at(3), None);
 }

@@ -1,12 +1,13 @@
 ---
 source: tui/src/subagent_switcher/snapshot_tests.rs
+assertion_line: 313
 expression: terminal.backend()
 ---
-"/ S U B A G E N T S / / / / / / / / / / / / / / / / / / / / "
-"› │ type to filter subagents                                "
+"╭─ ◇ Conversations ────────────────────────────────────────╮"
+"› │ Search conversations                                    "
 "› • main  Claude Code · opus                                "
-"  no subagents yet; agents delegate with delegate_task      "
+"  No child conversations                                    "
 "                                                            "
 "                                                            "
 "                                                            "
-" ↑↓ move · enter switch · esc close · ctrl+space close  1/1 "
+"╰───────────────────────────────────────────────────── 1/1 ╯"

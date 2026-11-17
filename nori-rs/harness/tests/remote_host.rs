@@ -54,6 +54,7 @@ async fn launch_attached() -> RemoteFixture {
         ..Default::default()
     };
     let agent = prepare_agent(AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: "remote-host-test".to_string(),
         session_context: None,
@@ -1097,6 +1098,7 @@ async fn attaching_started_replacement_preserves_current_until_commit() {
         ..Default::default()
     };
     let agent = prepare_agent(AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: "remote-host-replacement-test".to_string(),
         session_context: None,

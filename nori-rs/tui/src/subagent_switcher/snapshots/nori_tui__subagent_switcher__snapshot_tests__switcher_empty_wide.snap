@@ -1,16 +1,17 @@
 ---
 source: tui/src/subagent_switcher/snapshot_tests.rs
+assertion_line: 311
 expression: terminal.backend()
 ---
-"/ S U B A G E N T S / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / "
-"› │ type to filter subagents                                                                                  "
+"╭─ ◇ Conversations ──────────────────────────────────────────────────────────────────────────────────────────╮"
+"› │ Search conversations                                                                                      "
 "› • main  Claude Code · opus                     │ • main                                                     "
-"  no subagents yet; agents delegate with         │ Claude Code · opus · idle                                  "
-"  delegate_task                                  │ ───────────────────────────────────────────────────────────"
+"  No child conversations                         │ Claude Code · opus · idle                                  "
+"                                                 │ ───────────────────────────────────────────────────────────"
 "                                                 │ › what changed in the auth code?                           "
 "                                                 │                                                            "
 "                                                 │ I will have a subagent audit it.                           "
 "                                                 │                                                            "
 "                                                 │                                                            "
 "                                                 │                                                            "
-" ↑↓ move · enter switch · esc close · ctrl+space close                                                    1/1 "
+"╰─────────────────────────────────────────────────────────────────────────────────────────────────────── 1/1 ╯"

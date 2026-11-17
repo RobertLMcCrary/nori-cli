@@ -423,6 +423,8 @@ async fn run_event_loop(state: Arc<Mutex<HostShared>>, mut events: mpsc::Receive
             }
             SessionEvent::Nori(
                 NoriEvent::QueueChanged(_)
+                | NoriEvent::SessionReady(_)
+                | NoriEvent::SubagentQueueChanged { .. }
                 | NoriEvent::ReplayStarted(_)
                 | NoriEvent::ReplayFinished
                 | NoriEvent::ContextCompacted(_)
@@ -433,9 +435,11 @@ async fn run_event_loop(state: Arc<Mutex<HostShared>>, mut events: mpsc::Receive
                 | NoriEvent::HookOutput(_)
                 | NoriEvent::PromptSummaryUpdated(_)
                 | NoriEvent::Notice(_)
+                | NoriEvent::SubscriptionExhausted(_)
                 | NoriEvent::Subagent(_)
                 | NoriEvent::TaskResultsDelivered(_)
-                | NoriEvent::RequestWithdrawn(_),
+                | NoriEvent::RequestWithdrawn(_)
+            | NoriEvent::ConversationResponseBoundary(_),
             )
             // A remote controller sees the root session only.
             | SessionEvent::Acp(AcpEvent::ChildNotification(_)) => {}

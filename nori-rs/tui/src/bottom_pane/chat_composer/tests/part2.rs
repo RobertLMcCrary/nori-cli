@@ -232,16 +232,15 @@ fn render_composer_rows(width: u16, height: u16, acp_mode_label: &str) -> Vec<St
 }
 
 #[test]
-fn textarea_corner_hides_when_it_cannot_fit_the_composer_width() {
+fn textarea_corner_clips_without_overwriting_the_prompt() {
     // Comfortably wide: the mode indicator sits above the prompt.
     let wide = render_composer_rows(40, 3, "Plan");
     assert!(wide[0].trim_end().ends_with("[ Plan ]"), "{wide:?}");
     assert!(wide[1].starts_with("› Ask Nori"), "{wide:?}");
 
-    // Too narrow for the indicator: it disappears rather than being clipped
-    // across the row or pushed off the composer's left edge.
+    // A narrow composer clips the indicator to its own padding row.
     let narrow = render_composer_rows(6, 3, "Plan");
-    assert_eq!(narrow[0].trim(), "", "{narrow:?}");
+    assert_eq!(narrow[0].trim(), "[ Pla", "{narrow:?}");
     assert!(narrow[1].starts_with('›'), "{narrow:?}");
 }
 
@@ -292,7 +291,9 @@ fn slash_init_dispatches_command_and_does_not_submit_literal_text() {
         InputResult::Submitted(text) => {
             panic!("expected command dispatch, but composer submitted literal text: {text}")
         }
-        InputResult::None => panic!("expected Command result for '/init'"),
+        InputResult::None | InputResult::Steer(_) | InputResult::PromoteQueued => {
+            panic!("expected Command result for '/init'")
+        }
     }
     assert!(composer.textarea.is_empty(), "composer should be cleared");
 }
@@ -364,7 +365,9 @@ fn slash_tab_then_enter_dispatches_builtin_command() {
         InputResult::Submitted(text) => {
             panic!("expected command dispatch after Tab completion, got literal submit: {text}")
         }
-        InputResult::None => panic!("expected Command result for '/diff'"),
+        InputResult::None | InputResult::Steer(_) | InputResult::PromoteQueued => {
+            panic!("expected Command result for '/diff'")
+        }
     }
     assert!(composer.textarea.is_empty());
 }
@@ -397,7 +400,9 @@ fn slash_mention_dispatches_command_and_inserts_at() {
         InputResult::Submitted(text) => {
             panic!("expected command dispatch, but composer submitted literal text: {text}")
         }
-        InputResult::None => panic!("expected Command result for '/mention'"),
+        InputResult::None | InputResult::Steer(_) | InputResult::PromoteQueued => {
+            panic!("expected Command result for '/mention'")
+        }
     }
     assert!(composer.textarea.is_empty(), "composer should be cleared");
     composer.insert_str("@");
@@ -629,4 +634,54 @@ fn deleting_one_equal_length_paste_keeps_the_other_payload() {
     assert_eq!(composer.current_text(), second_placeholder);
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(result, InputResult::Submitted(second));
+}
+
+#[test]
+fn prompt_bar_metadata_stays_inside_the_composer() {
+    snapshot_composer_state("prompt_bar_git_context_model", false, |composer| {
+        composer.context_window_percent = Some(44);
+        composer.set_model_label(Some("GPT-6 Astra".to_string()));
+        composer.set_acp_mode_label(Some("Plan".to_string()));
+        let layout = toml::from_str::<nori_config::FooterLayoutConfigToml>(
+            r#"textarea_top_left = [{ format = "⎇ main · {context}" }]"#,
+        )
+        .unwrap();
+        composer.set_footer_layout_config(nori_config::FooterLayoutConfig::from_toml(&layout));
+    });
+}
+
+#[test]
+fn prompt_bar_corners_never_overwrite_each_other() {
+    let rect = Rect::new(0, 0, 24, 3);
+    let mut buffer = Buffer::empty(rect);
+    render_textarea_corner_segments(
+        rect,
+        &mut buffer,
+        crate::bottom_pane::footer::TextareaCornerSegments {
+            top_left: "⎇ long-branch · 44%".into(),
+            top_right: "[ Plan ]".into(),
+            ..Default::default()
+        },
+    );
+    let row: String = (0..rect.width).map(|x| buffer[(x, 0)].symbol()).collect();
+    insta::assert_snapshot!("prompt_bar_narrow_corners", row);
+}
+
+#[test]
+fn long_branch_keeps_insert_indicator_and_model_visible() {
+    let rect = Rect::new(0, 0, 42, 3);
+    let mut buffer = Buffer::empty(rect);
+    render_textarea_corner_segments(
+        rect,
+        &mut buffer,
+        crate::bottom_pane::footer::TextareaCornerSegments {
+            top_left: "INSERT · git very-long-feature-branch · 44%".into(),
+            top_right: "OpenCode Big Pickle".into(),
+            ..Default::default()
+        },
+    );
+    let row: String = (0..rect.width).map(|x| buffer[(x, 0)].symbol()).collect();
+    assert!(row.contains("INSERT"), "{row:?}");
+    assert!(row.contains("git"), "{row:?}");
+    assert!(row.contains("OpenCode Big Pickle"), "{row:?}");
 }

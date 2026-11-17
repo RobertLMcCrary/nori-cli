@@ -64,6 +64,54 @@ pub struct AcpErrorDetails {
     pub detail: Option<String>,
 }
 
+/// Whether an ACP error explicitly identifies exhausted provider usage.
+///
+/// A generic 429 or rate-limit message can mean a short-lived throttle and
+/// must not permanently exclude a provider from a conversation. Only inspect
+/// structured error identifiers, not arbitrary text supplied by the agent.
+pub fn is_subscription_exhausted(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(error) = cause.downcast_ref::<acp::Error>() else {
+            return false;
+        };
+        // ACP lifecycle and authentication codes take precedence over an
+        // unrelated provider-shaped field in their data.
+        if matches!(
+            i32::from(error.code),
+            -32000 | -32002 | -32010 | -32012 | -32014 | -32015
+        ) {
+            return false;
+        }
+        let Some(data) = error.data.as_ref() else {
+            return false;
+        };
+        if data
+            .get("codex_error_info")
+            .and_then(serde_json::Value::as_str)
+            == Some("usage_limit_exceeded")
+        {
+            return true;
+        }
+        [Some(data), data.get("error")]
+            .into_iter()
+            .flatten()
+            .any(|data| {
+                ["code", "type"].into_iter().any(|field| {
+                    matches!(
+                        data.get(field).and_then(serde_json::Value::as_str),
+                        Some(
+                            "insufficient_quota"
+                                | "usage_limit_exceeded"
+                                | "usage_limit_reached"
+                                | "billing_hard_limit_reached"
+                                | "subscription_exhausted"
+                        )
+                    )
+                })
+            })
+    })
+}
+
 /// Categorize an error, preferring the structured ACP error (JSON-RPC `code`
 /// + `data`) when one is present in the anyhow chain over string heuristics.
 ///
@@ -259,5 +307,40 @@ mod tests {
         assert!(!AcpErrorCategory::SessionNotResumable.is_retryable());
         assert!(!AcpErrorCategory::SessionAlreadyActive.is_retryable());
         assert!(!AcpErrorCategory::NoActiveSession.is_retryable());
+    }
+
+    #[test]
+    fn subscription_exhaustion_requires_a_structured_provider_identifier() {
+        for data in [
+            serde_json::json!({"code": "usage_limit_reached"}),
+            serde_json::json!({"error": {"type": "insufficient_quota"}}),
+            serde_json::json!({"error": {"code": "usage_limit_exceeded"}}),
+            serde_json::json!({"codex_error_info": "usage_limit_exceeded"}),
+            serde_json::json!({
+                "error": {"code": "usage_limit_exceeded"},
+                "provider": "anthropic",
+                "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour"}
+            }),
+        ] {
+            assert!(is_subscription_exhausted(&chain_with(
+                acp::Error::internal_error().data(data)
+            )));
+        }
+        for error in [
+            chain_with(acp::Error::new(429, "too many requests")),
+            chain_with(
+                acp::Error::internal_error().data(serde_json::json!({"code": "rate_limit_error"})),
+            ),
+            chain_with(
+                acp::Error::internal_error()
+                    .data(serde_json::json!({"codex_error_info": "rate_limit_exceeded"})),
+            ),
+            chain_with(
+                acp::Error::auth_required().data(serde_json::json!({"code": "insufficient_quota"})),
+            ),
+            anyhow::anyhow!("usage_limit_reached"),
+        ] {
+            assert!(!is_subscription_exhausted(&error));
+        }
     }
 }

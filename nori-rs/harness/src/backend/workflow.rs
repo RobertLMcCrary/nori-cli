@@ -1,35 +1,29 @@
-//! The session's workflow: what the user's and the project's Steel scripts say about how the
-//! agent works (see `docs/workflows.md`).
-//!
-//! Nori loads the scripts in the background when the session starts (the project's only in a
-//! trusted directory), tells the agent the active workflow's rules with its first prompt, takes
-//! inline workflow clauses out of prompts, and after a turn sends the prompts the workflow hooks
-//! to what happened (files changed, a commit landed, the turn ended) as hidden turns, at most
-//! the workflow's turn budget in a row. A workflow with a commit agent hands the after-change
-//! work to that agent as a delegated task instead of to the session's agent.
+//! Apply the Pkl workflow policy to ACP sessions and follow-up hooks.
+//! User and trusted project policies load in the background.
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nori_script::HookEvent;
-use nori_script::ScriptHost;
-use nori_script::Workflow;
+use nori_pkl::machine::MachineSnapshot;
+use nori_workflow::HookEvent;
+use nori_workflow::Workflow;
+use tokio::sync::OnceCell;
+use tokio::sync::RwLock;
+use tokio::sync::watch;
 
 use super::*;
 use crate::normalized::session_runtime::QueuedPrompt;
 use crate::normalized::session_runtime::QueuedPromptKind;
 use session_runtime_driver::CompletedTurn;
 
-/// Hidden hook turns that may follow one user turn when the workflow does not say.
-const DEFAULT_HOOK_TURNS: i64 = 3;
+/// A workflow without an explicit limit may continue producing hook turns.
+const DEFAULT_HOOK_TURNS: i64 = i64::MAX;
 
 /// One session's workflow state.
 #[derive(Default)]
 pub(crate) struct WorkflowState {
-    /// The thread that runs the scripts, once started.
-    host: Option<ScriptHost>,
-    /// The workflow in force: the scripts' default, or one an inline clause set up.
+    /// The workflow in force for this session.
     pub(super) active: Option<Workflow>,
     /// The agent has been told the active workflow's rules.
     told: bool,
@@ -49,10 +43,18 @@ pub(crate) struct WorkflowState {
     pub(super) ci_owed: Option<super::ci_watch::CiReport>,
 }
 
+/// Always release prompt waiters, including if the background task is cancelled.
+struct PolicyLoadCompletion(watch::Sender<bool>);
+impl Drop for PolicyLoadCompletion {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
 /// What the forge tools apply of the workflow in force.
 pub(crate) struct PrPolicy {
     pub(crate) workflow: String,
-    pub(crate) rules: nori_script::PrRules,
+    pub(crate) rules: nori_workflow::PrRules,
     /// The `on-pr` prompts, joined; empty when the workflow has none.
     pub(crate) before_pr: String,
 }
@@ -95,7 +97,95 @@ async fn tree_state_of(cwd: PathBuf) -> Option<TreeState> {
         .flatten()
 }
 
+/// Resolve the full policy before the agent receives its session tool catalog.
+pub(super) async fn prepare_workflow(
+    home: &Path,
+    cwd: &Path,
+    trusted: bool,
+    child: bool,
+    transcript_path: Option<PathBuf>,
+) -> anyhow::Result<(Arc<Mutex<WorkflowState>>, Arc<OnceCell<MachineSnapshot>>)> {
+    let global = nori_pkl::global_policy_path(home);
+    let project = trusted.then(|| nori_pkl::project_policy_path(cwd));
+    // Tokio waits for its blocking pool at runtime shutdown. A user-owned Pkl
+    // resource may block indefinitely, so the detached worker must not use it.
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    drop(
+        std::thread::Builder::new()
+            .name("nori-pkl-policy".into())
+            .spawn(move || {
+                let snapshot = transcript_path
+                    .and_then(|path| {
+                        let log =
+                            nori_conversation::ConversationLog::open(path.with_extension("pkl"))
+                                .ok()?;
+                        log.projection().visible().iter().rev().find_map(|record| {
+                            match &record.event {
+                                nori_conversation::Event::Command { name, payload }
+                                    if name == "pkl-machine-snapshot" =>
+                                {
+                                    serde_json::from_str(payload).ok()
+                                }
+                                _ => None,
+                            }
+                        })
+                    })
+                    .unwrap_or_else(MachineSnapshot::capture);
+                let result = nori_pkl::load_policy_with_machine(
+                    Some(&global),
+                    project.as_deref(),
+                    &snapshot,
+                );
+                let _ = sender.send((result, snapshot));
+            })?,
+    );
+    let (loaded, snapshot) = receiver
+        .await
+        .map_err(|error| anyhow::anyhow!("Workflow policy loader stopped: {error}"))?;
+    let active = match loaded {
+        Ok(policy) if child => policy.tools.map(|tools| Workflow {
+            tools: Some(tools),
+            ..Default::default()
+        }),
+        Ok(policy) => Some(policy),
+        Err(error) => return Err(anyhow::anyhow!("Workflow policy failed to load: {error}")),
+    };
+    let workflow = Arc::new(Mutex::new(WorkflowState {
+        active,
+        ..Default::default()
+    }));
+    let machine = Arc::new(OnceCell::new_with(Some(snapshot)));
+    Ok((workflow, machine))
+}
+
+/// Persist the exact snapshot used to evaluate this session's policy.
+pub(super) async fn record_prepared_snapshot(
+    recorder: Option<&Arc<crate::transcript::TranscriptRecorder>>,
+    snapshot: &OnceCell<MachineSnapshot>,
+) {
+    if let (Some(recorder), Some(snapshot)) = (recorder, snapshot.get())
+        && (!recorder.continues_recorded_session()
+            || recorder
+                .recorded_command_payload("pkl-machine-snapshot")
+                .await
+                .is_none())
+        && let Ok(payload) = serde_json::to_string(snapshot)
+        && let Err(error) = recorder
+            .record_command("pkl-machine-snapshot", payload)
+            .await
+    {
+        tracing::warn!(%error, "Failed to record Pkl machine snapshot");
+    }
+}
+
 impl WorkflowState {
+    /// A policy loaded in the background does not replace an already active policy.
+    fn install_default(&mut self, workflow: Option<Workflow>) {
+        if self.active.is_none() {
+            self.active = workflow;
+        }
+    }
+
     /// The pull request rules and `on-pr` hook of the workflow in force.
     pub(crate) fn pr_policy(&self) -> Option<PrPolicy> {
         let workflow = self.active.as_ref()?;
@@ -128,108 +218,72 @@ impl WorkflowState {
 }
 
 impl AcpBackend {
-    /// Load the workflow scripts off the session's start-up path. A prompt sent before they load
-    /// runs without a workflow; a script error is shown once. Without a script nothing starts:
-    /// a script engine costs about 100 ms of a thread. A delegated child follows its parent's
-    /// workflow, which its task carries, so it loads none.
-    pub(super) fn load_workflow(&self) {
-        if self.orchestrator.is_child() {
-            return;
+    pub(crate) async fn program_machine_properties(
+        &self,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        let snapshot = get_machine_snapshot(
+            Arc::clone(&self.machine_snapshot),
+            self.transcript_recorder_cell(),
+        )
+        .await?;
+        Ok(snapshot.properties())
+    }
+    /// Resolve fallback policy even if the background workflow load has not finished yet.
+    pub(super) async fn fallback_policy(&self) -> (Vec<String>, bool) {
+        let mut ready = self.workflow_ready.subscribe();
+        while !*ready.borrow_and_update() {
+            if ready.changed().await.is_err() {
+                break;
+            }
         }
-        let global =
-            Some(nori_script::global_script_path(&self.nori_home)).filter(|path| path.exists());
-        let project = self
-            .orchestrator
-            .project_trusted()
-            .then(|| nori_script::project_script_path(&self.cwd))
-            .filter(|path| path.exists());
-        if global.is_none() && project.is_none() {
-            return;
-        }
+        self.workflow
+            .lock()
+            .await
+            .active
+            .as_ref()
+            .map(|workflow| (workflow.fallback_models.clone(), workflow.fallback_ranked))
+            .unwrap_or_default()
+    }
+
+    /// Agents that cannot receive Nori tools may start while policy loads.
+    pub(super) fn load_workflow_without_tools(&self) {
+        let completion = PolicyLoadCompletion(self.workflow_ready.clone());
+        let home = self.nori_home.clone();
+        let cwd = self.cwd.clone();
+        let trusted = self.orchestrator.project_trusted();
+        let child = self.orchestrator.is_child();
         let workflow = Arc::clone(&self.workflow);
+        let machine = Arc::clone(&self.machine_snapshot);
+        let recorder = self.transcript_recorder_cell();
         let events = self.backend_event_tx.clone();
         tokio::spawn(async move {
-            let started = tokio::task::spawn_blocking(move || {
-                let host = ScriptHost::spawn(global, project).map_err(|error| error.to_string())?;
-                let loaded = host.loaded().map_err(|error| error.to_string());
-                Ok::<_, String>((host, loaded))
-            })
-            .await;
-            match started {
-                Ok(Ok((host, loaded))) => {
-                    let mut state = workflow.lock().await;
-                    state.host = Some(host);
-                    match loaded {
-                        Ok(loaded) => state.active = loaded.default_workflow().cloned(),
-                        Err(error) => {
-                            drop(state);
-                            notice(&events, format!("Workflow script: {error}")).await;
-                        }
+            let _completion = completion;
+            let existing_path = recorder
+                .read()
+                .await
+                .as_ref()
+                .filter(|recorder| recorder.continues_recorded_session())
+                .map(|recorder| recorder.transcript_path().to_path_buf());
+            match prepare_workflow(&home, &cwd, trusted, child, existing_path).await {
+                Ok((prepared, snapshot)) => {
+                    workflow
+                        .lock()
+                        .await
+                        .install_default(prepared.lock().await.active.clone());
+                    if let Some(snapshot) = snapshot.get() {
+                        let _ = machine.set(snapshot.clone());
                     }
+                    let recorder = recorder.read().await.clone();
+                    record_prepared_snapshot(recorder.as_ref(), &machine).await;
                 }
-                Ok(Err(error)) => notice(&events, format!("Workflow scripts: {error}")).await,
-                Err(error) => debug!("Loading workflow scripts stopped: {error}"),
+                Err(error) => notice(&events, format!("Workflow policy: {error}")).await,
             }
         });
     }
 
-    /// Apply a user prompt's inline workflow clauses and, the first time a workflow is in force,
-    /// its rules. Returns the prompt text without the clauses, and the rules to put before it.
+    /// Apply active policy instructions to the first prompt.
     pub(super) async fn workflow_for_prompt(&self, prompt_text: &str) -> (String, Option<String>) {
-        let mut text = prompt_text.to_owned();
-        let inline = if nori_script::has_inline_dsl(prompt_text) {
-            // A prompt sent before the scripts load still gets its clauses applied.
-            let host = self.workflow.lock().await.host.clone();
-            let prompt = prompt_text.to_owned();
-            let applied = tokio::task::spawn_blocking(move || {
-                let host = match host {
-                    Some(host) => host,
-                    None => ScriptHost::spawn(None, None).map_err(|error| error.to_string())?,
-                };
-                let applied = host
-                    .apply_inline(&prompt)
-                    .map_err(|error| error.to_string());
-                Ok::<_, String>((host, applied))
-            })
-            .await
-            .unwrap_or_else(|error| Err(error.to_string()));
-            Some(match applied {
-                Ok((host, applied)) => {
-                    // Started for this clause: keep it for the next.
-                    self.workflow.lock().await.host.get_or_insert(host);
-                    applied
-                }
-                Err(error) => Err(error),
-            })
-        } else {
-            None
-        };
-        let mut state = self.workflow.lock().await;
-        if let Some(applied) = inline {
-            match applied {
-                Ok(inline) => {
-                    text = inline.prompt;
-                    if let Some(workflow) = inline.workflow {
-                        state.active = Some(workflow);
-                        state.told = false;
-                    }
-                }
-                Err(error) => {
-                    notice(&self.backend_event_tx, format!("Workflow clause: {error}")).await;
-                }
-            }
-        }
-        state.hook_turns = 0;
-        state.stop_hooked = false;
-        let rules = state
-            .active
-            .as_ref()
-            .filter(|_| !state.told)
-            .map(Workflow::instructions)
-            .filter(|rules| !rules.is_empty())
-            .map(|rules| format!("<workflow>\n{rules}</workflow>"));
-        state.told |= rules.is_some();
-        (text, rules)
+        apply_policy_for_prompt(&self.workflow, &self.workflow_ready, prompt_text).await
     }
 
     /// A user turn is starting: note the working tree and what is pushed, to tell afterwards
@@ -251,8 +305,14 @@ impl AcpBackend {
 
     /// After a turn, send the prompts the workflow hooks to what happened, if the session is idle
     /// and the turn budget allows.
-    pub(super) async fn maybe_submit_workflow_hook(&self, completed_turn: &CompletedTurn) {
-        if completed_turn.stop_reason != acp::StopReason::EndTurn {
+    pub(super) async fn maybe_submit_workflow_hook(
+        &self,
+        completed_turn: &CompletedTurn,
+        generation: i64,
+    ) {
+        if completed_turn.stop_reason != acp::StopReason::EndTurn
+            || generation != self.orchestrator.admission_generation()
+        {
             return;
         }
         let (workflow, before, stop_hooked) = {
@@ -260,7 +320,9 @@ impl AcpBackend {
             let Some(workflow) = state.active.clone() else {
                 return;
             };
-            if workflow.hooks.is_empty() || state.hook_turns >= state.hook_budget() {
+            if (workflow.hooks.is_empty() && workflow.commit_reviewer.is_none())
+                || state.hook_turns >= state.hook_budget()
+            {
                 return;
             }
             (workflow, state.before.clone(), state.stop_hooked)
@@ -268,10 +330,46 @@ impl AcpBackend {
         // Without a snapshot from the turn's start (the workflow loaded during the turn, or this
         // is not a git repository) nothing is known to have changed.
         let after = tree_state_of(self.cwd.clone()).await;
+        if generation != self.orchestrator.admission_generation() {
+            return;
+        }
         let (changed, committed) = match (&before, &after) {
             (Some(before), Some(after)) => (before != after, before.head != after.head),
             _ => (false, false),
         };
+        if changed
+            && matches!(completed_turn.prompt.kind, QueuedPromptKind::User)
+            && let Some(reviewer) = &workflow.commit_reviewer
+        {
+            self.workflow.lock().await.hook_turns += 1;
+            let mut guidance = Workflow::named(&workflow.name);
+            guidance.commit = workflow.commit.clone();
+            if let Some(commit) = &mut guidance.commit {
+                commit.agent = None;
+            }
+            let task = format!(
+                "Review the current working-tree diff, including staged, unstaged, and untracked changes. Identify substantive problems and propose appropriately scoped commit messages for the changes. State what you reviewed and any limitations. Do not modify files, stage changes, or create commits. The working tree may include changes predating this turn; do not assume all changes belong to this task.\n\nCommit message guidance:\n{}",
+                guidance.instructions()
+            );
+            if let Err(error) = self
+                .orchestrator
+                .delegate_background(
+                    generation,
+                    "Review changes and draft commit messages".to_owned(),
+                    task,
+                    reviewer.agent.clone(),
+                    reviewer.model.clone(),
+                    true,
+                )
+                .await
+            {
+                notice(&self.backend_event_tx, format!("Commit reviewer: {error}")).await;
+            }
+            let state = self.workflow.lock().await;
+            if state.hook_turns >= state.hook_budget() {
+                return;
+            }
+        }
         let events: &[HookEvent] = match completed_turn.prompt.kind {
             // Hooks answer what the user's turn did; a hook turn's own commit may still be
             // followed up, but its edits never start another round.
@@ -314,10 +412,12 @@ impl AcpBackend {
             if let Err(error) = self
                 .orchestrator
                 .delegate_background(
+                    generation,
                     "Commit the changes".to_owned(),
                     task,
                     agent.agent,
                     agent.model,
+                    false,
                 )
                 .await
             {
@@ -335,6 +435,7 @@ impl AcpBackend {
             state.stop_hooked |= event == HookEvent::BeforeStop;
         }
         self.send_hook_turn(
+            generation,
             format!("Workflow \"{}\" · {}", workflow.name, event.form()),
             event,
             prompt,
@@ -343,7 +444,16 @@ impl AcpBackend {
     }
 
     /// Send `body` as the hidden turn of the workflow hook `event`, announced by an info line.
-    pub(super) async fn send_hook_turn(&self, label: String, event: HookEvent, body: String) {
+    pub(super) async fn send_hook_turn(
+        &self,
+        generation: i64,
+        label: String,
+        event: HookEvent,
+        body: String,
+    ) {
+        if generation != self.orchestrator.admission_generation() {
+            return;
+        }
         // Routine, so an info line rather than a warning.
         let _ = self
             .backend_event_tx
@@ -360,19 +470,77 @@ impl AcpBackend {
         );
         let _ = self
             .session_event_tx
-            .send(session_runtime_driver::SessionRuntimeInput::Reducer(
-                session_reducer::InboundEvent::PromptSubmit(QueuedPrompt {
-                    event_id: format!("workflow-hook-{}", uuid::Uuid::new_v4()),
-                    kind: QueuedPromptKind::WorkflowHook,
-                    text: text.clone(),
-                    prompt_meta: None,
-                    original_content: Vec::new(),
-                    content: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
-                    display_text: None,
-                }),
-            ))
+            .send(
+                session_runtime_driver::SessionRuntimeInput::GuardedContinuation {
+                    generation,
+                    event: session_reducer::InboundEvent::PromptSubmit(QueuedPrompt {
+                        event_id: format!("workflow-hook-{}", uuid::Uuid::new_v4()),
+                        kind: QueuedPromptKind::WorkflowHook,
+                        text: text.clone(),
+                        prompt_meta: None,
+                        original_content: Vec::new(),
+                        content: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+                        display_text: None,
+                    }),
+                },
+            )
             .await;
     }
+}
+
+async fn apply_policy_for_prompt(
+    workflow: &tokio::sync::Mutex<WorkflowState>,
+    ready: &watch::Sender<bool>,
+    prompt_text: &str,
+) -> (String, Option<String>) {
+    let mut ready = ready.subscribe();
+    while !*ready.borrow_and_update() {
+        if ready.changed().await.is_err() {
+            break;
+        }
+    }
+    let mut state = workflow.lock().await;
+    state.hook_turns = 0;
+    state.stop_hooked = false;
+    let rules = state
+        .active
+        .as_ref()
+        .filter(|_| !state.told)
+        .map(Workflow::instructions)
+        .filter(|rules| !rules.is_empty())
+        .map(|rules| format!("<workflow>\n{rules}</workflow>"));
+    state.told |= rules.is_some();
+    (prompt_text.to_owned(), rules)
+}
+
+async fn get_machine_snapshot(
+    cell: Arc<OnceCell<MachineSnapshot>>,
+    recorder_cell: Arc<RwLock<Option<Arc<crate::transcript::TranscriptRecorder>>>>,
+) -> anyhow::Result<MachineSnapshot> {
+    Ok(cell
+        .get_or_try_init(|| async {
+            let recorder = recorder_cell.read().await.clone();
+            if let Some(recorder) = &recorder
+                && recorder.continues_recorded_session()
+                && let Some(payload) = recorder
+                    .recorded_command_payload("pkl-machine-snapshot")
+                    .await
+            {
+                return serde_json::from_str(&payload)
+                    .map_err(anyhow::Error::from)
+                    .map_err(|error| error.context("read recorded Pkl machine snapshot"));
+            }
+
+            let snapshot = MachineSnapshot::capture();
+            if let Some(recorder) = recorder {
+                recorder
+                    .record_command("pkl-machine-snapshot", serde_json::to_string(&snapshot)?)
+                    .await?;
+            }
+            Ok(snapshot)
+        })
+        .await?
+        .clone())
 }
 
 pub(super) async fn notice(events: &mpsc::Sender<BackendEvent>, message: String) {
@@ -388,6 +556,99 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test]
+    async fn prepared_policy_drives_catalog_and_first_prompt_from_one_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("init.pkl"),
+            r#"
+            instructions = List("Policy prompt")
+            tools = new Dynamic {
+                enabled = List("get_goal")
+                instructions = List("Catalog prompt")
+            }
+        "#,
+        )
+        .unwrap();
+        let (state, snapshot) = prepare_workflow(home.path(), cwd.path(), false, false, None)
+            .await
+            .unwrap();
+        let policy = state.lock().await.active.clone().unwrap();
+        assert_eq!(
+            policy.tools.unwrap().enabled,
+            Some(vec!["get_goal".to_owned()])
+        );
+        assert!(snapshot.get().is_some());
+        let (ready, _) = watch::channel(true);
+        let (_, rules) = apply_policy_for_prompt(&state, &ready, "hello").await;
+        assert!(rules.unwrap().contains("Policy prompt"));
+    }
+
+    #[tokio::test]
+    async fn invalid_configured_policy_cannot_expose_an_unfiltered_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("init.pkl"),
+            "tools = new Dynamic { unknown = true }",
+        )
+        .unwrap();
+        assert!(
+            prepare_workflow(home.path(), cwd.path(), false, false, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_prompt_waits_for_policy_instructions() {
+        let workflow = Arc::new(tokio::sync::Mutex::new(WorkflowState::default()));
+        let (ready, _) = watch::channel(false);
+        let prompt = {
+            let workflow = Arc::clone(&workflow);
+            let ready = ready.clone();
+            tokio::spawn(async move { apply_policy_for_prompt(&workflow, &ready, "hello").await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!prompt.is_finished());
+        let mut policy = Workflow::named("project");
+        policy.instructions.push("Check the tests".into());
+        workflow.lock().await.install_default(Some(policy));
+        ready.send_replace(true);
+        let (text, rules) = prompt.await.unwrap();
+        assert_eq!(text, "hello");
+        assert!(rules.unwrap().contains("Check the tests"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_waiting_prompt() {
+        let workflow = tokio::sync::Mutex::new(WorkflowState::default());
+        let (ready, _) = watch::channel(false);
+        let completion = PolicyLoadCompletion(ready.clone());
+        let task = tokio::spawn(async move {
+            let _completion = completion;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            apply_policy_for_prompt(&workflow, &ready, "hello").await,
+            ("hello".into(), None)
+        );
+    }
+
+    #[test]
+    fn late_default_load_does_not_replace_an_active_policy() {
+        let active = Workflow::named("active");
+        let mut state = WorkflowState {
+            active: Some(active.clone()),
+            ..Default::default()
+        };
+        state.install_default(Some(Workflow::named("default")));
+        assert_eq!(state.active, Some(active));
+    }
 
     #[test]
     fn a_tree_state_sees_edits_to_an_already_changed_file() {

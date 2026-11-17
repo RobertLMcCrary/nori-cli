@@ -88,29 +88,31 @@ impl ChatComposer {
                 })
             })
         });
-        let (context_tokens, context_window_percent, context_window_tokens) =
-            if let Some(session_usage) = &self.session_usage {
-                (
-                    Some(session_usage.used_tokens).filter(|&tokens| tokens >= 0),
-                    (session_usage.total_tokens > 0).then(|| {
-                        session_usage
-                            .used_tokens
-                            .saturating_mul(100)
-                            .saturating_div(session_usage.total_tokens)
-                            .clamp(0, 100)
-                    }),
-                    Some(session_usage.total_tokens).filter(|&tokens| tokens > 0),
-                )
-            } else {
-                (
-                    context_tokens,
-                    context_window_percent,
-                    context_window_size.filter(|&tokens| tokens > 0),
-                )
-            };
+        let (context_tokens, context_window_percent, context_window_tokens) = if self.child_context
+        {
+            (None, None, None)
+        } else if let Some(session_usage) = &self.session_usage {
+            (
+                Some(session_usage.used_tokens).filter(|&tokens| tokens >= 0),
+                (session_usage.total_tokens > 0).then(|| {
+                    session_usage
+                        .used_tokens
+                        .saturating_mul(100)
+                        .saturating_div(session_usage.total_tokens)
+                        .clamp(0, 100)
+                }),
+                Some(session_usage.total_tokens).filter(|&tokens| tokens > 0),
+            )
+        } else {
+            (
+                context_tokens,
+                context_window_percent,
+                context_window_size.filter(|&tokens| tokens > 0),
+            )
+        };
 
         FooterProps {
-            mode: self.footer_mode(),
+            mode: FooterMode::ContextOnly,
             esc_backtrack_hint: self.esc_backtrack_hint,
             use_shift_enter_hint: self.use_shift_enter_hint,
             is_task_running: self.is_task_running,
@@ -179,6 +181,9 @@ impl ChatComposer {
     /// Current context only: cumulative transcript billing totals must never
     /// be presented as the occupied portion of a context window.
     pub(crate) fn context_usage_snapshot(&self) -> (ContextStatus, &'static str) {
+        if self.child_context {
+            return (ContextStatus::default(), "Child usage unavailable");
+        }
         if let Some(usage) = &self.session_usage {
             return (
                 ContextStatus {

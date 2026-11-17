@@ -28,6 +28,7 @@ fn update(parent: acp::SessionId, child: usize, state: SubagentState) -> Subagen
     SubagentUpdate {
         parent_session_id: parent,
         session_id: session(child),
+        agent: Patch::Keep,
         title: Patch::Set("general-purpose".into()),
         description: Patch::Set(format!("task {child}")),
         state: Patch::Set(state),
@@ -144,7 +145,7 @@ proptest! {
             let shown = tree.display_order(usize::MAX);
             prop_assert_eq!(shown.len(), tree.running_count());
             let mut seen = BTreeSet::new();
-            for (node, _depth) in &shown {
+            for (_id, node, _depth) in &shown {
                 prop_assert!(seen.insert(node as *const _ as usize), "a node is shown twice");
                 if let Some(id) = &node.session_id {
                     let index: usize = id.0.trim_start_matches('c').parse().unwrap_or(usize::MAX);
@@ -172,7 +173,7 @@ fn a_finished_grandchild_is_nested_in_its_parent_and_reported_once() {
     assert_eq!(
         tree.display_order(usize::MAX)
             .iter()
-            .map(|(node, depth)| (node.label().to_owned(), *depth))
+            .map(|(_id, node, depth)| (node.label().to_owned(), *depth))
             .collect::<Vec<_>>(),
         vec![("task 1".to_owned(), 0), ("task 2".to_owned(), 1)]
     );
@@ -237,7 +238,6 @@ fn a_frame_costs_the_rows_that_changed_not_the_updates_that_arrived() {
             tree,
             now: base,
             screen_rows: 0,
-            stoppable: false,
         }
         .lines(80)
         .len()

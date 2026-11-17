@@ -28,7 +28,7 @@ use nori_config::ResolvedDistribution;
 /// Default idle timeout for ACP streaming (5 minutes)
 const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-fn codex_config_with_native_goals_disabled(config: Option<&str>) -> Result<String> {
+fn codex_config_for_nori(config: Option<&str>) -> Result<String> {
     let mut config = match config {
         Some(config) => serde_json::from_str::<serde_json::Value>(config)
             .context("CODEX_CONFIG must be valid JSON")?,
@@ -37,6 +37,11 @@ fn codex_config_with_native_goals_disabled(config: Option<&str>) -> Result<Strin
     let config = config
         .as_object_mut()
         .context("CODEX_CONFIG must contain a JSON object")?;
+    config.insert("approval_policy".to_owned(), "never".into());
+    config.insert("sandbox_mode".to_owned(), "danger-full-access".into());
+    // These are alternative permission selectors, not independent account settings.
+    config.remove("default_permissions");
+    config.remove("permission_profile");
     let features = config
         .entry("features")
         .or_insert_with(|| serde_json::json!({}))
@@ -117,6 +122,8 @@ pub enum AgentKind {
     Codex,
     /// Google's Gemini CLI
     Gemini,
+    /// OpenCode's multi-provider coding agent.
+    OpenCode,
 }
 
 impl AgentKind {
@@ -126,6 +133,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "claude-code",
             AgentKind::Codex => "codex",
             AgentKind::Gemini => "gemini",
+            AgentKind::OpenCode => "opencode",
         }
     }
 
@@ -135,6 +143,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "Claude Code",
             AgentKind::Codex => "Codex",
             AgentKind::Gemini => "Gemini",
+            AgentKind::OpenCode => "OpenCode",
         }
     }
 
@@ -149,6 +158,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => 1_000_000,
             AgentKind::Codex => 258_000,
             AgentKind::Gemini => 1_000_000,
+            AgentKind::OpenCode => 200_000,
         }
     }
 
@@ -158,6 +168,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => Provider::Anthropic,
             AgentKind::Codex => Provider::OpenAI,
             AgentKind::Gemini => Provider::Google,
+            AgentKind::OpenCode => Provider::OpenCode,
         }
     }
 
@@ -167,6 +178,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "@anthropic-ai/claude-code",
             AgentKind::Codex => "@openai/codex",
             AgentKind::Gemini => "@google/gemini-cli",
+            AgentKind::OpenCode => "opencode-ai",
         }
     }
 
@@ -179,12 +191,18 @@ impl AgentKind {
             AgentKind::Codex => "@agentclientprotocol/codex-acp@latest",
             // Gemini has native ACP support
             AgentKind::Gemini => "@google/gemini-cli",
+            AgentKind::OpenCode => "opencode-ai",
         }
     }
 
     /// Get all agent variants
     pub fn all() -> &'static [AgentKind] {
-        &[AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Gemini]
+        &[
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::Gemini,
+            AgentKind::OpenCode,
+        ]
     }
 
     /// The out-of-band channel this built-in agent uses to receive a forced
@@ -200,6 +218,7 @@ impl AgentKind {
                 var: "GEMINI_MODEL".to_string(),
             },
             AgentKind::Codex => ModelInjection::CodexConfig,
+            AgentKind::OpenCode => ModelInjection::None,
         }
     }
 
@@ -211,6 +230,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => ".claude/projects",
             AgentKind::Codex => ".codex/sessions",
             AgentKind::Gemini => ".gemini/tmp",
+            AgentKind::OpenCode => ".local/share/opencode",
         }
     }
 
@@ -222,6 +242,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "Run /login for instructions, or set ANTHROPIC_API_KEY.",
             AgentKind::Codex => "Run /login to authenticate, or set OPENAI_API_KEY.",
             AgentKind::Gemini => "Run /login for instructions, or set GOOGLE_API_KEY.",
+            AgentKind::OpenCode => "Run /login or `opencode auth login` to configure a provider.",
         }
     }
 
@@ -232,6 +253,7 @@ impl AgentKind {
             "claude-code" | "claude" | "claude-acp" | "claude-4.5" => Some(AgentKind::ClaudeCode),
             "codex" | "codex-acp" => Some(AgentKind::Codex),
             "gemini" | "gemini-acp" | "gemini-2.5-flash" => Some(AgentKind::Gemini),
+            "opencode" | "opencode-acp" => Some(AgentKind::OpenCode),
             _ => None,
         }
     }
@@ -278,6 +300,7 @@ impl AgentKind {
                     label: "Gemini 3.5 Flash-Lite",
                 },
             ],
+            AgentKind::OpenCode => &[],
         }
     }
 }
@@ -297,6 +320,8 @@ pub enum Provider {
     OpenAI,
     /// Google
     Google,
+    /// OpenCode can connect to several providers.
+    OpenCode,
 }
 
 impl Provider {
@@ -306,6 +331,7 @@ impl Provider {
             Provider::Anthropic => "anthropic",
             Provider::OpenAI => "openai",
             Provider::Google => "google",
+            Provider::OpenCode => "opencode",
         }
     }
 
@@ -315,6 +341,7 @@ impl Provider {
             Provider::Anthropic => "Anthropic",
             Provider::OpenAI => "OpenAI",
             Provider::Google => "Google",
+            Provider::OpenCode => "OpenCode",
         }
     }
 }
@@ -390,7 +417,7 @@ pub struct RegisteredAgent {
 /// Global agent registry. Protected by RwLock so tests can reset it.
 static AGENT_REGISTRY: RwLock<Option<Vec<RegisteredAgent>>> = RwLock::new(None);
 
-/// Build the three default (built-in) agents.
+/// Build the default built-in agents.
 pub fn build_default_agents() -> Vec<RegisteredAgent> {
     AgentKind::all()
         .iter()
@@ -507,7 +534,8 @@ impl AcpAgentInfo {
     /// Create agent info from an AgentKind enum
     pub fn from_agent(agent: AgentKind) -> Self {
         // A built-in agent that runs inside Nori has no CLI to find, so it counts as installed.
-        let in_process = native_name(agent).is_some_and(crate::in_process::in_process_available);
+        let in_process = native_name(agent).is_some_and(crate::in_process::in_process_available)
+            && (agent != AgentKind::OpenCode || which::which("opencode").is_ok());
         let (is_installed, managed_by) = if in_process {
             (true, None)
         } else {
@@ -574,6 +602,7 @@ fn detect_agent_installation_uncached(agent: AgentKind) -> (bool, Option<Package
         AgentKind::ClaudeCode => "claude",
         AgentKind::Codex => "codex",
         AgentKind::Gemini => "gemini",
+        AgentKind::OpenCode => "opencode",
     };
 
     // Look the binary up in PATH in-process: a `which` process per agent would hold up everything
@@ -898,6 +927,7 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
                 agent: agent.clone(),
                 home: home.clone(),
                 config: config.clone(),
+                environment: HashMap::new(),
             }),
             _ => None,
         };
@@ -948,14 +978,12 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
                 package_manager.command().to_string(),
                 vec![agent.acp_package().to_string()],
             ),
-            // Gemini has native ACP support via --experimental-acp flag
+            // Gemini starts its ACP agent with --acp.
             AgentKind::Gemini => (
                 package_manager.command().to_string(),
-                vec![
-                    agent.acp_package().to_string(),
-                    "--experimental-acp".to_string(),
-                ],
+                vec![agent.acp_package().to_string(), "--acp".to_string()],
             ),
+            AgentKind::OpenCode => ("opencode".to_string(), vec!["acp".to_string()]),
         };
 
         // Workaround: the v0.30.0+ Claude ACP adapter resolves its native
@@ -977,7 +1005,7 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
             let ambient_config = std::env::var("CODEX_CONFIG").ok();
             env.insert(
                 "CODEX_CONFIG".to_string(),
-                codex_config_with_native_goals_disabled(ambient_config.as_deref())?,
+                codex_config_for_nori(ambient_config.as_deref())?,
             );
         }
 
@@ -1004,6 +1032,7 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
                     agent: name.to_string(),
                     home: None,
                     config: Vec::new(),
+                    environment: HashMap::new(),
                 }),
         });
     }
@@ -1017,6 +1046,7 @@ fn native_name(agent: AgentKind) -> Option<&'static str> {
         AgentKind::ClaudeCode => Some("claude"),
         AgentKind::Codex => Some("codex"),
         AgentKind::Gemini => None,
+        AgentKind::OpenCode => Some("opencode"),
     }
 }
 
@@ -1181,6 +1211,7 @@ fn get_mock_agent_config(normalized: &str) -> Option<AcpAgentConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use serial_test::serial;
 
     #[test]
@@ -1188,6 +1219,7 @@ mod tests {
         assert_eq!(AgentKind::ClaudeCode.slug(), "claude-code");
         assert_eq!(AgentKind::Codex.slug(), "codex");
         assert_eq!(AgentKind::Gemini.slug(), "gemini");
+        assert_eq!(AgentKind::OpenCode.slug(), "opencode");
     }
 
     #[test]
@@ -1195,6 +1227,7 @@ mod tests {
         assert_eq!(Provider::Anthropic.slug(), "anthropic");
         assert_eq!(Provider::OpenAI.slug(), "openai");
         assert_eq!(Provider::Google.slug(), "google");
+        assert_eq!(Provider::OpenCode.slug(), "opencode");
     }
 
     #[test]
@@ -1322,13 +1355,27 @@ mod tests {
             .and_then(|config| serde_json::from_str::<serde_json::Value>(config).ok())
             .expect("Codex config should be valid JSON");
         assert_eq!(codex_config["features"]["goals"], false);
+        assert_eq!(codex_config["approval_policy"], "never");
+        assert_eq!(codex_config["sandbox_mode"], "danger-full-access");
         assert_eq!(config.provider_info.name, "Codex ACP");
     }
 
     #[test]
+    #[serial]
+    fn opencode_uses_its_own_identity_and_upstream_fallback() {
+        reset_registry();
+        let config = get_agent_config("opencode").expect("OpenCode config");
+        assert_eq!(config.agent, AgentKind::OpenCode);
+        assert_eq!(config.display_name, "OpenCode");
+        assert_eq!(config.command, "opencode");
+        assert_eq!(config.args, vec!["acp"]);
+        assert_eq!(config.model_injection, ModelInjection::None);
+    }
+
+    #[test]
     fn codex_config_preserves_existing_settings_while_disabling_native_goals() {
-        let config = codex_config_with_native_goals_disabled(Some(
-            r#"{"model":"gpt-test","features":{"goals":true,"other":true}}"#,
+        let config = codex_config_for_nori(Some(
+            r#"{"model":"gpt-test","approval_policy":"on-request","sandbox_mode":"read-only","default_permissions":"custom","features":{"goals":true,"other":true}}"#,
         ))
         .expect("valid CODEX_CONFIG should merge");
 
@@ -1336,6 +1383,8 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&config).expect("merged JSON"),
             serde_json::json!({
                 "model": "gpt-test",
+                "approval_policy": "never",
+                "sandbox_mode": "danger-full-access",
                 "features": {
                     "goals": false,
                     "other": true
@@ -1346,7 +1395,7 @@ mod tests {
 
     #[test]
     fn codex_config_rejects_invalid_ambient_json() {
-        let error = codex_config_with_native_goals_disabled(Some("not-json"))
+        let error = codex_config_for_nori(Some("not-json"))
             .expect_err("invalid CODEX_CONFIG should remain visible");
 
         assert!(
@@ -1546,8 +1595,7 @@ mod tests {
             "Command should be npx or bunx, got: {}",
             config.command
         );
-        assert!(config.args.contains(&"@google/gemini-cli".to_string()));
-        assert!(config.args.contains(&"--experimental-acp".to_string()));
+        assert_eq!(config.args, ["@google/gemini-cli", "--acp"]);
         assert_eq!(config.provider_info.name, "Gemini ACP");
     }
 
@@ -1610,8 +1658,7 @@ mod tests {
     fn test_list_available_agents_debug_build() {
         reset_registry();
         let agents = list_available_agents();
-        // Debug build should have 5 agents: mock, mock-alt, claude-code, codex, gemini
-        assert_eq!(agents.len(), 5, "Debug build should have 5 agents");
+        assert_eq!(agents.len(), 6, "Debug build should have six agents");
 
         let names: Vec<&str> = agents.iter().map(|a| a.display_name.as_str()).collect();
         assert!(names.contains(&"Mock ACP"), "Should have Mock ACP");
@@ -1619,6 +1666,7 @@ mod tests {
         assert!(names.contains(&"Claude Code"), "Should have Claude Code");
         assert!(names.contains(&"Codex"), "Should have Codex");
         assert!(names.contains(&"Gemini"), "Should have Gemini");
+        assert!(names.contains(&"OpenCode"), "Should have OpenCode");
     }
 
     #[test]
@@ -1678,13 +1726,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_default_agents_returns_three_builtins() {
+    fn test_build_default_agents_returns_four_builtins() {
         let agents = build_default_agents();
-        assert_eq!(agents.len(), 3);
+        assert_eq!(agents.len(), 4);
         let slugs: Vec<&str> = agents.iter().map(|a| a.slug.as_str()).collect();
         assert!(slugs.contains(&"claude-code"));
         assert!(slugs.contains(&"codex"));
         assert!(slugs.contains(&"gemini"));
+        assert!(slugs.contains(&"opencode"));
     }
 
     #[test]
@@ -1713,7 +1762,7 @@ mod tests {
     #[test]
     fn test_build_registry_with_no_custom_agents() {
         let registry = build_registry(vec![]).unwrap();
-        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.len(), 4);
     }
 
     #[test]
@@ -1737,7 +1786,7 @@ mod tests {
             model_override: None,
         };
         let registry = build_registry(vec![custom]).unwrap();
-        assert_eq!(registry.len(), 4);
+        assert_eq!(registry.len(), 5);
         let kimi = registry.iter().find(|a| a.slug == "kimi").unwrap();
         assert_eq!(kimi.name, "Kimi");
         assert!(kimi.kind.is_none());
@@ -1765,8 +1814,8 @@ mod tests {
             model_override: None,
         };
         let registry = build_registry(vec![custom_claude]).unwrap();
-        // Should still be 3 agents (override, not add)
-        assert_eq!(registry.len(), 3);
+        // The override replaces the built-in entry rather than adding another.
+        assert_eq!(registry.len(), 4);
         let claude = registry.iter().find(|a| a.slug == "claude-code").unwrap();
         assert_eq!(claude.name, "My Claude");
         assert_eq!(claude.context_window_size, Some(300_000));

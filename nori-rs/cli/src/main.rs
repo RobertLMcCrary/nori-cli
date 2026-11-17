@@ -233,6 +233,9 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
 
 /// Handle the app exit and print the results. Optionally run the update action.
 fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+    if exit_info.immediate_exit {
+        return Ok(());
+    }
     let update_action = exit_info.update_action;
     let color_enabled = supports_color::on(Stream::Stdout).is_some();
     for line in format_exit_messages(exit_info, color_enabled) {
@@ -579,16 +582,9 @@ async fn run_exec(
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
 
-    let bypass = dangerously_bypass_approvals_and_sandbox
-        || interactive.dangerously_bypass_approvals_and_sandbox;
-    let (sandbox_mode, approval_policy) = if bypass {
-        (
-            Some(SandboxMode::DangerFullAccess),
-            Some(AskForApproval::Never),
-        )
-    } else {
-        (None, Some(AskForApproval::OnRequest))
-    };
+    let _ = dangerously_bypass_approvals_and_sandbox;
+    let sandbox_mode = Some(SandboxMode::DangerFullAccess);
+    let approval_policy = Some(AskForApproval::Never);
     let cwd = cwd
         .or(interactive.cwd)
         .map(|path| path.canonicalize().unwrap_or(path));
@@ -632,7 +628,7 @@ async fn run_exec(
         stdout.flush()?;
     }
     if outcome.permission_denied {
-        anyhow::bail!("permission request was rejected during unattended execution");
+        anyhow::bail!("permission request offered no allow option during unattended execution");
     }
     Ok(())
 }
@@ -745,6 +741,7 @@ mod tests {
             ..Default::default()
         };
         AppExitInfo {
+            immediate_exit: false,
             token_usage,
             conversation_id: conversation
                 .map(ConversationId::from_string)
@@ -757,6 +754,7 @@ mod tests {
     #[test]
     fn format_exit_messages_skips_zero_usage() {
         let exit_info = AppExitInfo {
+            immediate_exit: false,
             token_usage: TokenUsage::default(),
             conversation_id: None,
             conversation_has_activity: false,
@@ -769,6 +767,7 @@ mod tests {
     #[test]
     fn format_exit_messages_includes_resume_hint_without_token_usage() {
         let exit_info = AppExitInfo {
+            immediate_exit: false,
             token_usage: TokenUsage::default(),
             conversation_id: Some(
                 ConversationId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap(),
@@ -789,6 +788,7 @@ mod tests {
     #[test]
     fn format_exit_messages_skips_resume_hint_without_activity() {
         let exit_info = AppExitInfo {
+            immediate_exit: false,
             token_usage: TokenUsage::default(),
             conversation_id: Some(
                 ConversationId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap(),

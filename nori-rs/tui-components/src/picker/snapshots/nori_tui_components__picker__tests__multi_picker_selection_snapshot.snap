@@ -1,17 +1,18 @@
 ---
 source: tui-components/src/picker/tests.rs
+assertion_line: 417
 expression: "snapshot(&state, 86, 13)"
 ---
 "                                                                                      "
 "  Resume a session                                                                    "
 "  Search ACP sessions or start fresh                                                  "
 "  All  Local  Cloud                                                                   "
+"  ⌕  Title, project, or session id                                                    "
 "                                                                                      "
 "    Session                              Project             Updated     Turn         "
 "  ● Fix parser recovery (current)        nori-cli            2m ago      working      "
 "    Codex is implementing parser recovery                                             "
 "  ◉ Improve Markdown tables              codex               18m ago     waiting      "
 "    Waiting for user input                                                            "
-"                                                                                      "
 "  ↑↓/j/k move  / search  enter toggle  esc close                                      "
 "                                                                                      "

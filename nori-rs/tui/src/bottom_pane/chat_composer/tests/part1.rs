@@ -37,15 +37,11 @@ fn shortcut_hint_is_placeholder_only_until_shortcut_overlay_opens() {
 }
 
 #[test]
-fn shortcut_overlay_still_renders_below_prompt_when_requested() {
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyModifiers;
-
+fn question_mark_is_text_and_does_not_open_shortcut_overlay() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(true, sender, false, "? for shortcuts".to_string(), false);
-    let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    type_chars_humanlike(&mut composer, &['?']);
 
     let area = Rect::new(0, 0, 80, 10);
     let mut buf = Buffer::empty(area);
@@ -59,10 +55,8 @@ fn shortcut_overlay_still_renders_below_prompt_when_requested() {
         })
         .collect::<Vec<_>>();
 
-    assert!(
-        rendered.iter().any(|row| row.contains("newline")),
-        "shortcut overlay should still render below the prompt: {rendered:?}",
-    );
+    assert_eq!(composer.current_text(), "?");
+    assert!(rendered.iter().all(|row| !row.contains("newline")));
 }
 
 #[test]
@@ -167,69 +161,34 @@ fn clear_for_ctrl_c_records_cleared_draft() {
 }
 
 #[test]
-fn question_mark_only_toggles_on_first_char() {
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyModifiers;
-
+fn question_mark_is_literal_at_the_start_and_within_a_draft() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
-    let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(
         true,
-        sender,
+        AppEventSender::new(tx),
         false,
         "Ask Nori to do anything".to_string(),
         false,
     );
-
-    let (result, needs_redraw) =
-        composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-    assert_eq!(result, InputResult::None);
-    assert!(needs_redraw, "toggling overlay should request redraw");
-    assert_eq!(composer.footer_mode, FooterMode::ShortcutOverlay);
-
-    // Toggle back to prompt mode so subsequent typing captures characters.
-    let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-    assert_eq!(composer.footer_mode, FooterMode::ShortcutSummary);
-
-    type_chars_humanlike(&mut composer, &['h']);
-    assert_eq!(composer.textarea.text(), "h");
-    assert_eq!(composer.footer_mode(), FooterMode::ContextOnly);
-
-    let (result, needs_redraw) =
-        composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-    assert_eq!(result, InputResult::None);
-    assert!(needs_redraw, "typing should still mark the view dirty");
-    std::thread::sleep(ChatComposer::recommended_paste_flush_delay());
-    let _ = composer.flush_paste_burst_if_due();
-    assert_eq!(composer.textarea.text(), "h?");
-    assert_eq!(composer.footer_mode, FooterMode::ShortcutSummary);
-    assert_eq!(composer.footer_mode(), FooterMode::ContextOnly);
+    type_chars_humanlike(&mut composer, &['?', 'h', '?']);
+    assert_eq!(composer.current_text(), "?h?");
+    assert_ne!(composer.footer_mode(), FooterMode::ShortcutOverlay);
 }
 
 #[test]
-fn shortcut_overlay_persists_while_task_running() {
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyModifiers;
-
+fn question_mark_remains_literal_while_task_is_running() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
-    let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(
         true,
-        sender,
+        AppEventSender::new(tx),
         false,
         "Ask Nori to do anything".to_string(),
         false,
     );
-
-    let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-    assert_eq!(composer.footer_mode, FooterMode::ShortcutOverlay);
-
     composer.set_task_running(true);
-
-    assert_eq!(composer.footer_mode, FooterMode::ShortcutOverlay);
-    assert_eq!(composer.footer_mode(), FooterMode::ShortcutOverlay);
+    type_chars_humanlike(&mut composer, &['?']);
+    assert_eq!(composer.current_text(), "?");
+    assert_ne!(composer.footer_mode(), FooterMode::ShortcutOverlay);
 }
 
 #[test]

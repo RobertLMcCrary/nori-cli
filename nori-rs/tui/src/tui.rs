@@ -23,8 +23,6 @@ use crossterm::event::PopKeyboardEnhancementFlags;
 use crossterm::event::PushKeyboardEnhancementFlags;
 use crossterm::terminal::BeginSynchronizedUpdate;
 use crossterm::terminal::EndSynchronizedUpdate;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
 use crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::execute;
@@ -65,57 +63,17 @@ pub fn set_modes() -> Result<()> {
     // gracefully if unsupported.
     let _ = execute!(
         stdout(),
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-        )
+        PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
     );
 
     let _ = execute!(stdout(), EnableFocusChange);
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EnableAlternateScroll;
-
-impl Command for EnableAlternateScroll {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b[?1007h")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> Result<()> {
-        Err(std::io::Error::other(
-            "tried to execute EnableAlternateScroll using WinAPI; use ANSI instead",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DisableAlternateScroll;
-
-impl Command for DisableAlternateScroll {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b[?1007l")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> Result<()> {
-        Err(std::io::Error::other(
-            "tried to execute DisableAlternateScroll using WinAPI; use ANSI instead",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
 /// Restore the terminal to its original state.
@@ -128,7 +86,11 @@ pub fn restore() -> Result<()> {
     // Captured only while the transcript overlay is open, which an exit may cut short.
     let _ = execute!(stdout(), crossterm::event::DisableMouseCapture);
     disable_raw_mode()?;
-    let _ = execute!(stdout(), crossterm::cursor::Show);
+    let _ = execute!(
+        stdout(),
+        crossterm::cursor::SetCursorStyle::DefaultUserShape,
+        crossterm::cursor::Show
+    );
     Ok(())
 }
 
@@ -189,7 +151,7 @@ fn set_panic_hook() {
 pub enum TuiEvent {
     Key(KeyEvent),
     Paste(String),
-    /// Clicks and the wheel, reported only while an overlay captures the mouse.
+    /// Clicks and the wheel, reported while mouse capture is enabled.
     Mouse(crossterm::event::MouseEvent),
     Draw,
 }
@@ -204,6 +166,8 @@ pub struct Tui {
     toasts_drawn: bool,
     /// The next draw repaints the whole (alternate) screen.
     full_repaint: bool,
+    /// Any resize can damage terminal contents, even if a burst ends at the original size.
+    resize_pending: Arc<AtomicBool>,
     /// Whether a frame was drawn yet, for the startup trace.
     first_frame_drawn: bool,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
@@ -214,6 +178,7 @@ pub struct Tui {
     // True when terminal/tab is focused; updated internally from crossterm events
     terminal_focused: Arc<AtomicBool>,
     enhanced_keys_supported: bool,
+    mouse_capture: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +235,7 @@ impl Tui {
             toasts: toast::Toasts::default(),
             toasts_drawn: false,
             full_repaint: false,
+            resize_pending: Arc::new(AtomicBool::new(false)),
             first_frame_drawn: false,
             alt_saved_viewport: None,
             #[cfg(unix)]
@@ -277,6 +243,7 @@ impl Tui {
             alt_screen_active: Arc::new(AtomicBool::new(false)),
             terminal_focused: Arc::new(AtomicBool::new(true)),
             enhanced_keys_supported,
+            mouse_capture: false,
         }
     }
 
@@ -306,6 +273,8 @@ impl Tui {
 
         let mut crossterm_events = crossterm::event::EventStream::new();
         let mut draw_rx = self.draw_tx.subscribe();
+        let resize_frame = self.frame_requester();
+        let resize_pending = self.resize_pending.clone();
 
         // State for tracking how we should resume from ^Z suspend.
         #[cfg(unix)]
@@ -342,7 +311,9 @@ impl Tui {
                                 yield TuiEvent::Key(key_event);
                             }
                             Event::Resize(_, _) => {
-                                yield TuiEvent::Draw;
+                                // The scheduler coalesces bursts; draw reads the latest PTY size.
+                                resize_pending.store(true, Ordering::Relaxed);
+                                resize_frame.schedule_frame();
                             }
                             Event::Paste(pasted) => {
                                 yield TuiEvent::Paste(pasted);
@@ -380,31 +351,22 @@ impl Tui {
         Box::pin(event_stream)
     }
 
-    /// Enter alternate screen and expand the viewport to full terminal size, saving the current
-    /// inline viewport for restoration when leaving.
-    pub fn enter_alt_screen(&mut self) -> Result<()> {
+    /// Set the caret shape for the active editor or restore the terminal default.
+    pub(crate) fn set_cursor_style(
+        &mut self,
+        style: crossterm::cursor::SetCursorStyle,
+    ) -> Result<()> {
         self.terminal.backend_mut().writer_mut().begin_frame();
-        let _ = queue!(self.terminal.backend_mut(), EnterAlternateScreen);
-        // Enable "alternate scroll" so terminals may translate wheel to arrows
-        let _ = queue!(self.terminal.backend_mut(), EnableAlternateScroll);
-        if let Ok(size) = self.terminal.size() {
-            self.alt_saved_viewport = Some(self.terminal.viewport_area);
-            self.terminal.set_viewport_area(ratatui::layout::Rect::new(
-                0,
-                0,
-                size.width,
-                size.height,
-            ));
-            let _ = self.terminal.clear();
-        }
-        self.alt_screen_active.store(true, Ordering::Relaxed);
+        queue!(self.terminal.backend_mut(), style)?;
         self.terminal.backend_mut().writer_mut().end_frame()
     }
 
     /// Report clicks and the wheel as [`TuiEvent::Mouse`] while `capture` is set. The terminal
-    /// then selects text only with a modifier (Shift on most), so it is set only for the
-    /// transcript overlay.
+    /// then selects text only with a modifier (Shift on most).
     pub fn set_mouse_capture(&mut self, capture: bool) -> Result<()> {
+        if self.mouse_capture == capture {
+            return Ok(());
+        }
         self.terminal.backend_mut().writer_mut().begin_frame();
         let _ = if capture {
             queue!(
@@ -417,20 +379,9 @@ impl Tui {
                 crossterm::event::DisableMouseCapture
             )
         };
-        self.terminal.backend_mut().writer_mut().end_frame()
-    }
-
-    /// Leave alternate screen and restore the previously saved inline viewport, if any.
-    pub fn leave_alt_screen(&mut self) -> Result<()> {
-        // Disable alternate scroll when leaving alt-screen
-        self.terminal.backend_mut().writer_mut().begin_frame();
-        let _ = queue!(self.terminal.backend_mut(), DisableAlternateScroll);
-        let _ = queue!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        if let Some(saved) = self.alt_saved_viewport.take() {
-            self.terminal.set_viewport_area(saved);
-        }
-        self.alt_screen_active.store(false, Ordering::Relaxed);
-        self.terminal.backend_mut().writer_mut().end_frame()
+        self.terminal.backend_mut().writer_mut().end_frame()?;
+        self.mouse_capture = capture;
+        Ok(())
     }
 
     pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -438,8 +389,36 @@ impl Tui {
         self.frame_requester().schedule_frame();
     }
 
+    pub(crate) fn has_pending_history(&self) -> bool {
+        self.history.has_pending_lines()
+    }
+
+    pub(crate) fn pending_history_line_count(&self) -> usize {
+        self.history.pending_line_count()
+    }
+
+    /// Draw a transient view over primary-screen history without scrolling it away.
+    pub fn draw_overlay(
+        &mut self,
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+    ) -> Result<()> {
+        let height = self.terminal.size()?.height.saturating_sub(2).max(1);
+        let base = self
+            .history
+            .base_height(self.terminal.viewport_area.height)
+            .max(1)
+            .min(height);
+        self.draw(height, height.saturating_sub(base), draw_fn)
+    }
+
     pub(crate) fn clear_pending_history_lines(&mut self) {
         self.history.clear();
+    }
+
+    /// Whether Ctrl+L has hidden the transcript above the inline prompt. Resize reflow must
+    /// preserve this user-visible state instead of replaying the transcript into the viewport.
+    pub(crate) fn transcript_is_hidden(&self) -> bool {
+        self.history.above_hidden()
     }
 
     pub(crate) fn is_alt_screen_active(&self) -> bool {
@@ -461,6 +440,11 @@ impl Tui {
         popup_rows: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
+        let resize_event = self.resize_pending.swap(false, Ordering::Relaxed);
+        if resize_event {
+            self.terminal.invalidate();
+            self.history.note_projection_resize();
+        }
         // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
         // in the synchronized update.
         #[cfg(unix)]
@@ -475,9 +459,24 @@ impl Tui {
             let terminal = &mut self.terminal;
             let screen_size = terminal.size()?;
             let last_known_screen_size = terminal.last_known_screen_size;
-            if screen_size != last_known_screen_size
-                && let Ok(cursor_pos) = terminal.get_cursor_position()
-            {
+            let resized = screen_size != last_known_screen_size;
+            if resize_event && !resized {
+                // A burst can end at its original size after the terminal has already
+                // discarded clipped rows. Restore the visible history and viewport.
+                self.history.request_repaint();
+            }
+            if resized {
+                self.history.note_resize();
+            }
+            let alt_screen = self.alt_screen_active.load(Ordering::Relaxed);
+            if alt_screen {
+                // Alternate-screen views own the whole canvas, including rows and columns added
+                // after entry. Terminal::autoresize only updates its size metadata.
+                let area = ratatui::layout::Rect::new(0, 0, screen_size.width, screen_size.height);
+                if terminal.viewport_area != area {
+                    pending_viewport_area = Some(area);
+                }
+            } else if resized && let Ok(cursor_pos) = terminal.get_cursor_position() {
                 let last_known_cursor_pos = terminal.last_known_cursor_pos;
                 // If we resized AND the cursor moved, we adjust the viewport area to keep the
                 // cursor in the same position. This is a heuristic that seems to work well
@@ -540,12 +539,17 @@ impl Tui {
         // rows back: it erases the toasts, and keeps new history from scrolling their marks up.
         let toasts_expired = self.toasts.expire(Instant::now());
         if self.toasts_drawn || toasts_expired {
-            self.history.request_repaint();
+            if self.alt_screen_active.load(Ordering::Relaxed) {
+                self.terminal.invalidate();
+            } else {
+                self.history.request_repaint();
+            }
         }
         let terminal = &mut self.terminal;
-        if self
-            .history
-            .write_frame_with_popup(terminal, height, popup_rows)?
+        if !self.alt_screen_active.load(Ordering::Relaxed)
+            && self
+                .history
+                .write_frame_with_popup(terminal, height, popup_rows)?
         {
             self.frame_requester().schedule_frame();
         }
@@ -569,8 +573,19 @@ impl Tui {
             draw_fn(frame);
         })?;
 
-        let rows = u16::try_from(terminal.owned_history_rows()).unwrap_or(u16::MAX);
-        let first_row = terminal.viewport_area.top().saturating_sub(rows);
+        let alt_screen = self.alt_screen_active.load(Ordering::Relaxed);
+        let history_rows = u16::try_from(terminal.owned_history_rows()).unwrap_or(u16::MAX);
+        let over_viewport = alt_screen || history_rows == 0;
+        let rows = if over_viewport {
+            terminal.viewport_area.height
+        } else {
+            history_rows
+        };
+        let first_row = if over_viewport {
+            terminal.viewport_area.top()
+        } else {
+            terminal.viewport_area.top().saturating_sub(rows)
+        };
         let width = terminal.viewport_area.width;
         self.toasts_drawn = !self.toasts.is_empty() && rows > 0;
         if self.toasts_drawn {

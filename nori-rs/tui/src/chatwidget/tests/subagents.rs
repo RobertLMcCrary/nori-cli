@@ -69,7 +69,6 @@ fn block_lines(chat: &ChatWidget, width: u16) -> Vec<String> {
             tree: &chat.subagents,
             now: Instant::now(),
             screen_rows: 0,
-            stoppable: chat.subagents_stoppable(),
         }
         .lines(width),
     )
@@ -250,7 +249,7 @@ fn a_childs_permission_request_names_the_child() {
 }
 
 #[test]
-fn subagents_left_running_by_an_idle_agent_can_be_stopped_with_esc() {
+fn legacy_subagent_block_omits_keyboard_hints() {
     let (root, events) = replay_events("claude_subagents.jsonl");
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
     let generation = chat.session_generation;
@@ -263,7 +262,7 @@ fn subagents_left_running_by_an_idle_agent_can_be_stopped_with_esc() {
         chat.handle_session_event(generation, event);
     }
 
-    // While the agent works, Esc interrupts its turn, and the block says nothing of it.
+    // The block does not show keyboard help while the parent is working.
     chat.bottom_pane.set_task_running(true);
     assert!(!chat.subagents_stoppable());
     let working = block_lines(&chat, 80);
@@ -272,13 +271,412 @@ fn subagents_left_running_by_an_idle_agent_can_be_stopped_with_esc() {
         "{working:#?}"
     );
 
-    // Once its turn is over the subagents run on, and Esc is what stops them.
+    // The block stays free of keyboard help when its parent becomes idle.
     chat.bottom_pane.set_task_running(false);
     assert!(chat.subagents_stoppable());
     let idle = block_lines(&chat, 80);
-    assert_eq!(
-        idle.last().map(String::as_str),
-        Some("  esc to stop subagents"),
+    assert!(
+        !idle.iter().any(|line| line.contains("esc to stop")),
         "{idle:#?}"
     );
+}
+
+#[test]
+fn running_subagent_rows_below_composer_are_clickable() {
+    use crate::render::renderable::Renderable;
+    use crate::subagent_switcher::Target;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let (root, events) = replay_events("claude_subagents.jsonl");
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("Ask Nori to do anything");
+    let generation = chat.session_generation;
+    chat.subagents.set_root(acp::SessionId::new(root));
+    let both_running = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Acp(AcpEvent::ChildNotification(_))))
+        .unwrap();
+    for event in events[..both_running].iter().cloned() {
+        chat.handle_session_event(generation, event);
+    }
+    chat.set_screen_rows(30);
+    let area = Rect::new(0, 3, 80, chat.desired_height(80));
+    let mut buffer = Buffer::empty(area);
+    chat.render(area, &mut buffer);
+    let block = chat.subagent_strip_area().expect("strip rendered");
+    let rendered = (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rendered = rendered
+        .chars()
+        .map(|ch| {
+            if "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch) {
+                '•'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    insta::assert_snapshot!("subagents_below_composer", rendered);
+    let first = chat.subagent_at(block.x + 1, block.y).expect("first card");
+    let second = chat
+        .subagent_at(block.x + 19, block.y)
+        .expect("second card");
+    assert_ne!(first, second);
+    assert_eq!(chat.subagent_at(block.x + 1, block.y + 1), None);
+    let (entries, _) = chat.subagents.entries(Instant::now());
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.target == Target::Subagent(first))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.target == Target::Subagent(second))
+    );
+    assert_eq!(chat.subagent_at(block.x, block.y - 1), None);
+    assert_eq!(chat.subagent_at(block.right(), block.y), None);
+}
+
+#[test]
+fn response_and_prompt_focus_keep_the_composer_in_place() {
+    use crate::render::renderable::Renderable;
+    use pretty_assertions::assert_eq;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.set_screen_rows(20);
+    chat.set_composer_text("unfinished draft".to_owned());
+    let area = Rect::new(0, 0, 29, 20);
+    let mut buffer = Buffer::empty(area);
+    chat.render(area, &mut buffer);
+    let normal = (
+        chat.desired_height(area.width),
+        chat.cursor_pos(area).expect("composer cursor"),
+    );
+    chat.set_response_focus(true);
+    chat.render(area, &mut buffer);
+    assert_eq!(
+        (
+            chat.desired_height(area.width),
+            chat.cursor_pos(area).expect("composer cursor")
+        ),
+        normal
+    );
+    chat.set_response_focus_prompt(true);
+    chat.render(area, &mut buffer);
+    assert_eq!(
+        (
+            chat.desired_height(area.width),
+            chat.cursor_pos(area).expect("composer cursor")
+        ),
+        normal
+    );
+    chat.set_response_focus(false);
+    chat.render(area, &mut buffer);
+    assert_eq!(
+        (
+            chat.desired_height(area.width),
+            chat.cursor_pos(area).expect("composer cursor")
+        ),
+        normal
+    );
+    assert_eq!(chat.composer_text(), "unfinished draft");
+}
+
+#[test]
+fn focused_child_uses_the_shared_conversation_and_composer() {
+    use crate::render::renderable::Renderable;
+    use crate::subagent_switcher::SubagentKey;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("Ask Nori to do anything");
+    chat.set_screen_rows(16);
+    chat.set_focused_subagent_view(
+        Some(SubagentKey(1)),
+        vec![
+            Line::from("Investigate build · running"),
+            Line::from("› Please inspect the build"),
+            Line::from("I found the failing dependency."),
+            Line::from("Failed to load session sample: not found"),
+        ],
+        0,
+    );
+    let area = Rect::new(0, 0, 80, 16);
+    let mut buffer = Buffer::empty(area);
+    chat.render(area, &mut buffer);
+    let rendered = (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!("focused_child_shared_conversation", rendered);
+}
+
+#[test]
+fn child_login_uses_the_announced_agent_and_never_falls_back_to_main() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let root = acp::SessionId::new("root");
+    chat.subagents.set_root(root.clone());
+    chat.subagents.on_update(
+        nori_protocol::SubagentUpdate {
+            parent_session_id: root,
+            session_id: acp::SessionId::new("child"),
+            title: nori_protocol::Patch::Keep,
+            description: nori_protocol::Patch::Keep,
+            agent: nori_protocol::Patch::Set("unknown-child-provider".to_owned()),
+            state: nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle),
+        },
+        Instant::now(),
+    );
+    chat.set_focused_subagent_view(
+        Some(crate::subagent_switcher::SubagentKey(1)),
+        Vec::new(),
+        0,
+    );
+    while rx.try_recv().is_ok() {}
+    chat.handle_login_command();
+    assert!(
+        matches!(rx.try_recv(), Ok(AppEvent::ChildSessionOutput { key: crate::subagent_switcher::SubagentKey(1), text }) if text.contains("unknown-child-provider"))
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn child_login_refuses_missing_agent_identity() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.set_focused_subagent_view(
+        Some(crate::subagent_switcher::SubagentKey(7)),
+        Vec::new(),
+        0,
+    );
+    while rx.try_recv().is_ok() {}
+    chat.handle_login_command();
+    assert!(
+        matches!(rx.try_recv(), Ok(AppEvent::TransientNotice(message)) if message.contains("does not identify its provider"))
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn narrow_child_view_keeps_prompt_and_clickable_subagent_rows() {
+    use crate::render::renderable::Renderable;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+
+    let (root, events) = replay_events("claude_subagents.jsonl");
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("Ask Nori to do anything");
+    let generation = chat.session_generation;
+    chat.subagents.set_root(acp::SessionId::new(root));
+    let both_running = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Acp(AcpEvent::ChildNotification(_))))
+        .unwrap();
+    for event in events[..both_running].iter().cloned() {
+        chat.handle_session_event(generation, event);
+    }
+    chat.set_screen_rows(25);
+    chat.set_focused_subagent_view(
+        Some(crate::subagent_switcher::SubagentKey(1)),
+        vec![
+            Line::from("Research task · running"),
+            Line::from("I found the failure."),
+        ],
+        0,
+    );
+    let area = Rect::new(0, 0, 30, 25);
+    let mut buffer = Buffer::empty(area);
+    chat.render(area, &mut buffer);
+    let rendered = (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rendered = rendered
+        .chars()
+        .map(|ch| {
+            if "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch) {
+                '•'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    insta::assert_snapshot!("narrow_child_conversation", rendered);
+    let block = chat.subagent_strip_area().expect("subagent rows rendered");
+    assert!(chat.subagent_at(block.x + 1, block.y).is_some());
+    assert!(rendered.contains('›'), "{rendered}");
+}
+
+#[test]
+fn narrow_main_history_scroll_keeps_the_shared_prompt() {
+    use crate::render::renderable::Renderable;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("Ask Nori to do anything");
+    chat.set_screen_rows(25);
+    chat.set_main_history_view(
+        vec![
+            Line::from("Earlier user request"),
+            Line::from("Earlier agent response"),
+            Line::from("Latest response"),
+        ],
+        1,
+    );
+    let area = Rect::new(0, 0, 30, 25);
+    let mut buffer = Buffer::empty(area);
+    chat.render(area, &mut buffer);
+    let rendered = (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!("narrow_main_history_scroll", rendered);
+    assert!(rendered.contains('›'), "{rendered}");
+}
+
+#[test]
+fn narrow_strip_keeps_idle_and_completed_children_clickable() {
+    use crate::render::renderable::Renderable;
+    use crate::subagent_switcher::SubagentKey;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("Ask Nori to do anything");
+    let root = acp::SessionId::new("root");
+    chat.subagents.set_root(root.clone());
+    for (session, title, state) in [
+        ("idle", "Research", nori_protocol::SubagentState::Idle),
+        (
+            "done",
+            "Review",
+            nori_protocol::SubagentState::Ended(nori_protocol::SubagentOutcome::Completed {
+                stop_reason: None,
+            }),
+        ),
+    ] {
+        chat.subagents.on_update(
+            nori_protocol::SubagentUpdate {
+                parent_session_id: root.clone(),
+                session_id: acp::SessionId::new(session),
+                agent: nori_protocol::Patch::Keep,
+                title: nori_protocol::Patch::Set(title.to_owned()),
+                description: nori_protocol::Patch::Keep,
+                state: nori_protocol::Patch::Set(state),
+            },
+            Instant::now(),
+        );
+    }
+    chat.set_screen_rows(25);
+    let area = Rect::new(0, 0, 30, 25);
+    let mut buffer = Buffer::empty(area);
+    chat.render(area, &mut buffer);
+    let rendered = (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!("narrow_idle_completed_strip", rendered);
+    let block = chat.subagent_strip_area().expect("subagent strip rendered");
+    let first = chat.subagent_at(block.x + 1, block.y).expect("first card");
+    let second = chat
+        .subagent_at(block.x + 15, block.y)
+        .expect("second card");
+    assert_ne!(first, second);
+    assert!([SubagentKey(1), SubagentKey(2)].contains(&first));
+    assert!([SubagentKey(1), SubagentKey(2)].contains(&second));
+    assert_eq!(chat.subagents.running_count(), 0);
+}
+
+#[test]
+fn child_queue_updates_do_not_replace_the_main_queue() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let root = acp::SessionId::new("root");
+    let child = acp::SessionId::new("child");
+    chat.subagents.set_root(root.clone());
+    chat.subagents.on_update(
+        nori_protocol::SubagentUpdate {
+            parent_session_id: root,
+            session_id: child.clone(),
+            agent: nori_protocol::Patch::Keep,
+            title: nori_protocol::Patch::Keep,
+            description: nori_protocol::Patch::Keep,
+            state: nori_protocol::Patch::Set(nori_protocol::SubagentState::Running),
+        },
+        Instant::now(),
+    );
+    let generation = chat.session_generation;
+    chat.handle_session_event(
+        generation,
+        SessionEvent::Nori(NoriEvent::QueueChanged(nori_protocol::QueueSnapshot {
+            prompts: vec!["main".to_owned()],
+        })),
+    );
+    chat.handle_session_event(
+        generation,
+        SessionEvent::Nori(NoriEvent::SubagentQueueChanged {
+            session_id: child,
+            prompts: vec!["child".to_owned()],
+        }),
+    );
+    assert_eq!(chat.main_queued_prompts, vec!["main".to_owned()]);
+    chat.set_focused_subagent_view(
+        Some(crate::subagent_switcher::SubagentKey(1)),
+        Vec::new(),
+        0,
+    );
+    assert!(chat.bottom_pane.has_queued_user_messages());
+    chat.handle_session_event(
+        generation,
+        SessionEvent::Nori(NoriEvent::QueueChanged(nori_protocol::QueueSnapshot {
+            prompts: Vec::new(),
+        })),
+    );
+    assert!(chat.bottom_pane.has_queued_user_messages());
+    chat.set_focused_subagent_view(None, Vec::new(), 0);
+    assert!(!chat.bottom_pane.has_queued_user_messages());
 }

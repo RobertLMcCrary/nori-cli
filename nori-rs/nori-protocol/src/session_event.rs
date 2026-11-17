@@ -46,9 +46,18 @@ pub enum AcpEvent {
 #[serde(tag = "event_type", content = "event", rename_all = "snake_case")]
 pub enum NoriEvent {
     SessionStarted(SessionStarted),
+    /// Initial replay has finished for this agent session, including when there was no replay.
+    SessionReady(acp::v1::SessionId),
+    /// Canonical inclusive record range for a completed assistant response.
+    ConversationResponseBoundary(ConversationResponseBoundary),
     SessionPhaseChanged(SessionPhase),
     SessionEnded(SessionEnded),
     QueueChanged(QueueSnapshot),
+    /// The queued user prompts for one child, keyed by its public session ID.
+    SubagentQueueChanged {
+        session_id: acp::v1::SessionId,
+        prompts: Vec<String>,
+    },
     ReplayStarted(ReplayStarted),
     ReplayFinished,
     ContextCompacted(ContextCompactedEvent),
@@ -61,6 +70,8 @@ pub enum NoriEvent {
     PromptSummaryUpdated(PromptSummary),
     Notice(Notice),
     RequestFailed(RequestFailure),
+    /// An explicitly exhausted provider may be replaced using the workflow policy.
+    SubscriptionExhausted(SubscriptionExhausted),
     /// A subagent session was announced, changed state, or exchanged a message.
     Subagent(SubagentWire),
     /// The results of tasks the session delegated were handed to its agent in a turn of
@@ -69,6 +80,17 @@ pub enum NoriEvent {
     /// A request the client was asked to answer no longer needs an answer, such as a delegated
     /// task's permission request after the task ended.
     RequestWithdrawn(RequestId),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubscriptionExhausted {
+    pub request_id: RequestId,
+    pub echo_id: Option<String>,
+    pub models: Vec<String>,
+    pub ranked: bool,
+    pub content: Vec<acp::v1::ContentBlock>,
+    pub context: Option<String>,
+    pub original_error: String,
 }
 
 /// Results of delegated tasks, handed to the agent that delegated them.
@@ -83,6 +105,14 @@ pub struct DeliveredTask {
     pub title: String,
     /// The display name of the agent the task ran on.
     pub agent: String,
+}
+
+/// Record identities in the source transcript, not presentation-cell indices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationResponseBoundary {
+    pub transcript_id: String,
+    pub start: i64,
+    pub end: i64,
 }
 
 /// Persistent and agent-side identities established for a harness session.
@@ -271,4 +301,29 @@ pub struct RequestFailure {
 pub enum RequestFailureKind {
     Retryable,
     Fatal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn child_queue_is_scoped_and_root_queue_remains_compatible() {
+        let child = NoriEvent::SubagentQueueChanged {
+            session_id: acp::v1::SessionId::new("child"),
+            prompts: vec!["first".into(), "second".into()],
+        };
+        let encoded = json!({"event_type":"subagent_queue_changed", "event":{"session_id":"child", "prompts":["first","second"]}});
+        assert_eq!(serde_json::to_value(&child).unwrap(), encoded);
+        assert_eq!(serde_json::from_value::<NoriEvent>(encoded).unwrap(), child);
+        let previous = json!({"event_type":"queue_changed", "event":{"prompts":["root"]}});
+        assert_eq!(
+            serde_json::from_value::<NoriEvent>(previous).unwrap(),
+            NoriEvent::QueueChanged(QueueSnapshot {
+                prompts: vec!["root".into()]
+            })
+        );
+    }
 }

@@ -1,4 +1,4 @@
-//! Drawing the switcher: rail, query, list, divider, preview and key hints.
+//! Drawing conversation search, its list, preview, and result count.
 
 use nori_config::HotkeyBinding;
 use ratatui::buffer::Buffer;
@@ -17,10 +17,10 @@ use super::switcher::PREVIEW_PAD;
 use super::switcher::Switcher;
 use super::switcher::layout;
 
-const EMPTY_HINT: &str = "no subagents yet; agents delegate with delegate_task";
+const EMPTY_HINT: &str = "No child conversations";
 
 impl Switcher {
-    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, toggle: &HotkeyBinding) {
+    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, _toggle: &HotkeyBinding) {
         Clear.render(area, buf);
         let parts = layout(area);
         render_rail(parts.header, buf);
@@ -42,7 +42,7 @@ impl Switcher {
                 self.animations,
             );
         }
-        self.render_footer(parts.footer, buf, toggle);
+        self.render_footer(parts.footer, buf);
     }
 
     fn render_query(&self, area: Rect, buf: &mut Buffer) {
@@ -50,7 +50,7 @@ impl Switcher {
         let mut spans: Vec<Span<'static>> = vec!["› ".bold()];
         if query.is_empty() {
             spans.push("│".dim());
-            spans.push(" type to filter subagents".dim());
+            spans.push(" Search conversations".dim());
         } else {
             spans.push(query.to_owned().into());
             spans.push("│".dim());
@@ -94,35 +94,44 @@ impl Switcher {
         Paragraph::new(lines).render(area, buf);
     }
 
-    fn render_footer(&self, area: Rect, buf: &mut Buffer, toggle: &HotkeyBinding) {
+    fn render_footer(&self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 {
             return;
         }
-        let mut hints = String::from(" ↑↓ move · enter switch · esc close");
-        if !toggle.is_none() {
-            hints = format!("{hints} · {} close", toggle.as_str());
+        Line::from("─".repeat(usize::from(area.width)))
+            .dim()
+            .render(area, buf);
+        "╰".dim().render(Rect::new(area.x, area.y, 1, 1), buf);
+        if area.width > 1 {
+            "╯"
+                .dim()
+                .render(Rect::new(area.right() - 1, area.y, 1, 1), buf);
         }
-        Line::from(hints).dim().render(area, buf);
         let count = match self.list.selected_index() {
-            Some(index) => format!("{}/{} ", index + 1, self.list.rows().len()),
-            None => "0/0 ".to_owned(),
+            Some(index) => format!(" {}/{} ", index + 1, self.list.rows().len()),
+            None => " 0/0 ".to_owned(),
         };
         let width = u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0);
-        if width < area.width {
+        if width.saturating_add(1) < area.width {
             count
                 .dim()
-                .render(Rect::new(area.right() - width, area.y, width, 1), buf);
+                .render(Rect::new(area.right() - width - 1, area.y, width, 1), buf);
         }
     }
 }
 
-/// The dotted rail the pagers draw across their top row, with the title over it.
+/// Conversation search uses the same quiet borders as the command pickers.
 pub(crate) fn render_rail(area: Rect, buf: &mut Buffer) {
-    if area.height == 0 {
+    if area.is_empty() {
         return;
     }
-    Span::from("/ ".repeat(usize::from(area.width) / 2))
+    Line::from("─".repeat(usize::from(area.width)))
         .dim()
         .render(area, buf);
-    "/ S U B A G E N T S".dim().render(area, buf);
+    "╭─ ◇ Conversations ".cyan().bold().render(area, buf);
+    if area.width > 1 {
+        "╮"
+            .dim()
+            .render(Rect::new(area.right() - 1, area.y, 1, 1), buf);
+    }
 }

@@ -41,9 +41,11 @@ dirs = { workspace = true }
 diffy = { workspace = true }
 nori-acp-host = { workspace = true }
 nori-config = { workspace = true }
+nori-conversation = { workspace = true }
 nori-forge = { workspace = true }
 nori-host-tools = { workspace = true }
-nori-script = { workspace = true }
+nori-workflow = { workspace = true }
+nori-pkl = { workspace = true }
 notify-rust = { workspace = true }
 regex = { workspace = true }
 shlex = { workspace = true }

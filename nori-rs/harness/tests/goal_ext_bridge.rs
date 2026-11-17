@@ -19,6 +19,7 @@ use nori_harness::runtime::SessionLaunchSpec;
 use nori_harness::runtime::SessionStart;
 use nori_harness::runtime::launch_session;
 use nori_harness::runtime::prepare_agent;
+use nori_protocol::AcpEvent;
 use nori_protocol::NoriEvent;
 use nori_protocol::SessionEvent;
 use nori_protocol::ThreadGoal;
@@ -57,6 +58,7 @@ async fn launch_with_wire_log(cwd: &Path, wire_log_dir: &Path) -> LaunchedSessio
         ..Default::default()
     };
     let agent = prepare_agent(AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: "goal-ext-bridge-test".to_string(),
         session_context: None,
@@ -166,6 +168,64 @@ fn temp_dirs() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("create session directory");
     let wire_log_dir = temp.path().join("wire-logs");
     (temp, wire_log_dir)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn goal_changes_reach_next_prompt_once_without_polling() {
+    let _mcp = set_mock_env("MOCK_AGENT_MCP_HTTP");
+    let (temp, wire_log_dir) = temp_dirs();
+    let mut session = launch_with_wire_log(temp.path(), &wire_log_dir).await;
+    wait_for_started(&mut session).await;
+    session
+        .handle
+        .set_goal("ship it".into(), Some(ThreadGoalStatus::Paused))
+        .await
+        .unwrap();
+    for index in 0..4 {
+        if index == 2 {
+            session
+                .handle
+                .set_goal_status(ThreadGoalStatus::Blocked)
+                .await
+                .unwrap();
+        } else if index == 3 {
+            session.handle.clear_goal().await.unwrap();
+        }
+        let id = session
+            .handle
+            .prompt(vec![nori_protocol::acp::v1::ContentBlock::Text(
+                nori_protocol::acp::v1::TextContent::new(format!("prompt {index}")),
+            )])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(SessionEvent::Acp(AcpEvent::Response {
+                    request_id,
+                    response,
+                })) = session.events.recv().await
+                    && request_id == id
+                {
+                    response.expect("mock prompt response");
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("prompt should complete");
+    }
+    let prompts = recorded_prompts(&wire_log_dir);
+    let texts: Vec<_> = prompts
+        .iter()
+        .map(|prompt| prompt["prompt"].to_string())
+        .collect();
+    assert_eq!(texts.len(), 4);
+    assert!(texts[0].contains("Revision: 1") && texts[0].contains("ship it"));
+    assert!(!texts[1].contains("<goal_context>"));
+    assert!(texts[2].contains("Revision: 2") && texts[2].contains("blocked"));
+    assert!(texts[3].contains("Revision: 3") && texts[3].contains("Goal: cleared"));
+    session.handle.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

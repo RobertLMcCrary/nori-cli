@@ -207,7 +207,7 @@ The application event loop matches `SessionEvent::Acp` and
   marks the live attachment as follow-only. The chat widget keeps typing
   enabled, but ordinary submission restores the text to the composer without
   draining attachments or emitting a prompt or session action. Slash-command
-  dispatch remains active so `/agent`, `/new`, and `/resume` can leave the
+  dispatch remains active so `/providers`, `/new`, and `/resume` can leave the
   attachment; local input handlers also run before a centralized user-message
   guard suppresses every path that would submit an ACP prompt, including
   prompt-generating commands and programmatic callers. Every later initialize
@@ -364,6 +364,17 @@ the active session. The remaining picker entries are the earlier user messages
 and drive the unchanged rewind-to-message local fork path; agents without fork
 support see only those.
 
+Ctrl+H or Ctrl+L focuses the latest response in the
+shared chat view. The selected response is highlighted in the scrollable
+conversation; Ctrl+H/L move through responses
+and then to the latest sent prompt. The draft remains in the composer. On a
+response, Enter rolls back through it and Space forks a subagent from it; Esc
+cancels. The sent prompt is read-only in this navigation. Nori captures mouse
+input in the chat; desktop terminal text selection generally uses Shift-drag.
+The same controls apply to a focused child with a conversation journal. A child
+without one shows a notice in its chat. Rollback requires the recorded response
+boundary and does not silently substitute a different action when it is absent.
+
 The transcript overlay (Ctrl+T) captures the mouse while it is open
 (`Tui::set_mouse_capture`, released when it closes and by `tui::restore`), so
 the wheel scrolls it and clicks reach it; the terminal then selects text only
@@ -406,8 +417,8 @@ by `AgentConfigState` (`@/nori-rs/tui/src/nori/agent_config_state.rs`).
 `ConfigOptionUpdate` announcements, explicit `session/get_config` snapshots, and
 the options a successful `set_session_config_option` echoes back. That one state
 drives the `/config` and model pickers (which open from it instead of
-re-fetching), the mode cycle behind the footer label and Shift+Tab, the
-configuration history lines, and the status card — so every surface reports the
+re-fetching), the mode cycle behind the footer label and Shift+Tab, and the
+status card — so every surface reports the
 same values with the agent's own labels and order.
 
 The `/settings` picker (TUI config, in `@/nori-rs/tui/src/nori/config_picker.rs`)
@@ -423,16 +434,15 @@ That return belongs to the panel only. A value picker opened for a single
 setting, such as `/model`, closes once its value is applied: every value
 picker carries a `ConfigPickerOrigin` (`Panel` or `Direct`) from where it was
 opened through the custom-model input to the set request, and only `Panel`
-reopens `/config`. Switching agents with `/agent` skips the resume picker when
-the new agent lists no sessions and starts a session at once.
+reopens `/config`. Selecting another provider's model starts a candidate session and applies the selected model before replacing the current session.
 
 The Next and Previous Effort Level hotkeys (default `ctrl+j` and `ctrl+k`) step the agent's
 effort option (the one it declares as its thought level, or named for effort or reasoning)
 through the same path, and the footer's model segment shows both (`Sonnet 5.5 · High`).
 `ctrl+shift+n` and `ctrl+shift+p` remain aliases where the terminal reports Shift; some
 terminals fold it into the letter and report plain ctrl+n, which is indistinguishable from
-Next Model. Models are stepped through, and listed by `/model`, in the agent's order except
-that the Fable family comes last (`agent_config_state::sort_models`).
+Next Model. Recognized models are ranked by the configured model ordering;
+unrecognized models retain their advertised order (`agent_config_state::sort_models`).
 
 The Next Model and Previous Model hotkeys (default `ctrl+n` and `ctrl+p`) step
 through the models the agent offers without a picker (`chatwidget/model_cycle.rs`,
@@ -551,40 +561,37 @@ terminal before the UI starts. This matters to every child the TUI spawns with
 inherited stdin -- the external editor and the file browser -- which would
 otherwise be handed an EOF'd pipe and exit immediately.
 
-#### Inline transcript reflow
+#### Native terminal scrollback
 
-In inline mode, terminal width changes rebuild the visible transcript at the
-new width. Completed assistant messages retain their raw Markdown source, so
-replay reruns Markdown layout instead of wrapping already-rendered lines.
-Streaming output remains transient and is consolidated into one source-backed
-assistant cell when the message finishes; user, tool, event, and assistant
-cells otherwise keep their semantic order.
+Nori stays on the terminal's primary screen throughout startup, conversation
+navigation, search, response focus, suspend/resume, and shutdown. It never
+enters the alternate screen. Completed main-conversation output is written
+once into native terminal scrollback; resizing does not clear or replay that
+history. The terminal owns scrolling and reflow of the rows already written.
 
-Reflow is width-only. The first width change after a quiet spell is reflowed
-in the frame that sees it; changes that follow within 75 ms of the previous one
-(dragging a window edge) are trailing-debounced by 75 ms, so a drag costs two
-reflows, its first and its last. It waits while a popup, transcript overlay,
-alternate screen, or assistant stream owns presentation, then runs once that
-boundary closes. The replay retains at most the newest 1,000 semantic cells and
-10,000 physical rows, truncating from the oldest edge and prefixing
-`… history truncated` plus a blank line when either limit applies. These bounds
-limit terminal output, not the in-memory transcript. The rows go out through
-the history queue, which writes a bounded batch per frame (see below), so a
-large reflow streams over consecutive frames instead of one synchronized update
-of megabytes.
+The composer and single-row child strip remain in a bounded live viewport.
+Child conversations and temporary search or response views reuse that primary
+screen viewport. Closing them restores the main composer without copying
+child history into the main conversation's scrollback. Per-cell layout caches
+and a cumulative row index bound the work needed for visible history; a cold
+deep jump or a very large single cell can still require extra layout work.
 
-Reflow deliberately erases, before replaying the bounded history: the whole
-visible screen (`ESC[2J`, which some terminals, such as iTerm2 with "save lines
-to scrollback when an app clears the screen", copy into scrollback first), and
-then the terminal's entire native scrollback buffer (`ESC[3J`). That is
-everything the terminal window or multiplexer pane holds: the shell prompts and
-command output from before Nori started, output other programs wrote to the
-same terminal, and Nori's own history beyond the replay's bounds. It does not
-attempt to discover or preserve a scrollback origin. The behavior is enabled by
-default and can be toggled through `/settings` or `[tui] resize_reflow` in
-`config.toml`; disabling it cancels any pending replay.
+Resize events are coalesced into the next draw, including a burst that returns
+to the original dimensions. Live text is laid out at the current width;
+composer drafts, cursor positions, selections, and queued messages remain
+scoped to their conversations.
+
+Native wheel scrolling takes priority on the main conversation. Terminal mouse
+reporting consumes wheel events as well as clicks, so it is enabled only for
+focused child and overlay views. Use conversation search or Ctrl+Tab to enter
+a child, and Tab to return to its parent. Main-screen child cards remain
+visible while the terminal handles scrolling.
 
 #### Startup
+
+Unversioned development builds (`0.0.0`) skip the release-update modal so the
+composer opens directly. The startup card omits optional installer advertising;
+system metadata remains available through `/status`.
 
 Nothing before the first frame starts a process or waits on the network. Git
 facts for the footer and for project trust come from `nori_config::GitFacts`,
@@ -614,13 +621,15 @@ costs its length in total, and at most 400 of its lines a frame, so a burst of
 thousands is on screen from its first frame. A turn that ends with such a burst
 still unrendered leaves the rest to the frames that follow (`stream_ending`)
 rather than rendering it in one stall; anything shown after it waits for it.
-A paragraph line too long for 16 rows is wrapped first-fit, not optimally, in
-the stream and in the one-shot render alike, and while it is being typed each of
-its rows goes to the scrollback once the first word of the next row is complete
-and nothing before it can still be restyled (`markdown_stream/long_line.rs`), so
-only the last few rows of a one-paragraph answer are live. Streamed lines equal
-the one-shot render, styles included, which the property tests in
-`markdown_stream/incremental_tests.rs` check.
+The width-aware live renderer keeps only the newest rows of a very long
+unfinished paragraph active. A separate unwrapped collector writes completed
+logical lines into native scrollback without inserting hard line breaks, so the
+terminal can reflow them after a resize. For an unusually long unfinished
+paragraph, earlier rows enter scrollback when the paragraph completes; the
+bounded live tail remains visible as it streams. Structured cells retain their
+own width-aware layouts. On exit, an exceptionally large unfinished line is
+abbreviated in terminal output to keep shutdown responsive; its recorded source
+remains in the conversation journal.
 
 History reaches the terminal through `tui/history_queue.rs`, which writes at
 most 2,000 lines or about 256 KB a frame and asks for the next frame at once
@@ -639,7 +648,7 @@ synchronized update. The prompt sits at the bottom of the screen: the first fram
 moves what is on screen down with it (blank rows fall in at the top, and only
 blank rows below the viewport fall off), and nothing moves the screen down
 again, because doing so each time the prompt shrinks would put blank rows into
-the middle of the scrollback. The Redraw hotkey (default `ctrl+l`) hides
+the middle of the scrollback. The Redraw hotkey (default `ctrl+shift+l`) hides
 everything above the prompt: the next frame scrolls the rows above the viewport
 up into the scrollback, which stays whole (`ESC[2J` and `ESC[3J` are never
 sent), leaves the screen above the prompt empty, and places the prompt at the
@@ -677,59 +686,37 @@ by a blank line, as every block is.
 
 #### Subagents
 
-Child sessions never reach the root conversation. The harness delivers a
-child's updates as `AcpEvent::ChildNotification` and announcements as
-`NoriEvent::Subagent`; for agents that do not announce children, root updates
-tagged with `_meta.claudeCode.parentToolUseId` and the `Agent`/`Task` launcher
-calls stand in. `chatwidget/subagents/` keeps one node per running child in a
-tree keyed by `NodeId`; a child that ends leaves the tree as a
-`FinishedSubagent` (whose `SubagentOutcome` cannot be "running") and becomes
-one summary cell in the scrollback, with its full detail in the transcript
-overlay. The live block above the composer shows a header and an activity row
-per running child, capped at a third of the screen with a `+N more` row; a
-frame visits only the rows it shows. Permission requests from a child carry
-its label. Delegated tasks run on after the turn that started them ends; while
-the agent is idle and children still run, the block ends with "esc to stop
-subagents", and Esc (with an empty composer) cancels them, taking precedence
-over Esc-Esc to edit the previous message.
+Child sessions use the same conversation canvas and composer as the root.
+The harness routes child-scoped ACP updates separately from parent output and
+preserves immediate parent IDs for nested children. Nori task tools and native
+provider children share this presentation.
 
-The Switch Subagent hotkey (default `ctrl+space`, config key `switch_subagent`
-under `[tui.hotkeys]`; terminals that send NUL for it are accepted) opens the
-subagent switcher (`subagent_switcher/`) from the composer, while the agent
-runs or not. It is an alternate-screen overlay listing the main session, then
-every running subagent (as first seen, most recently active first; later
-activity never reorders rows), then finished ones (most recently ended first).
-A finished child stays listed: the tree keeps it as an `EndedRecord` (the
-newest 256). The query line fuzzy-matches each whitespace-separated word
-against title, parent, agent, model and status, ranks title matches first, and
-bolds the matched characters. The selection is a `Target`, not an index, so
-rows that appear, end or are replaced (a launcher call becoming its session)
-leave it on the same subagent. At 100 columns or more the right 55% previews
-the selected row: a header, then the tail of its conversation laid out like
-the transcript overlay and cut from the end, so it costs the rows shown, not
-the transcript. The overlay holds snapshots only (`Roster`, `Body`); before a
-frame the app (`app/subagent_overlay.rs`) refreshes the roster and fetches the
-body the overlay reports missing, so an unchanged frame fetches nothing. Enter
-on a subagent opens a pager view of its whole conversation that follows new
-output while scrolled to the end, and keeps showing a child that finishes
-(Esc returns to the chat, the hotkey returns to the list); Enter on `main`
-closes the overlay.
+The child strip beneath the composer occupies one row. Bordered icon pills
+stay horizontal at every width; horizontal scrolling and chevrons reveal more
+cards. Actual work orders cards by recency. Idle and completed children remain
+reachable without extra status text or elapsed-time rows. Tapping a card opens
+its conversation; a swipe scrolls without selecting it.
 
-Tasks an agent delegates through Nori's own task tools are shown the same
-way: each task is a subagent labelled with its title and its agent and model
-(`Codex · GPT-5.1`). The parent's calls to those tools are recognised whatever
-the agent names them (`presentation/delegation.rs`, `Invocation::Delegation`)
-and read as sentences ("Delegated to codex: Review the parser",
-"task-1 running in the background") instead of raw JSON. A completion wake
-adds one info line naming the tasks whose results were handed over.
+Ctrl+Tab cycles recently visited conversations. Tab moves to the focused
+conversation's parent. Escape stops work in the focused conversation. Each
+conversation retains its own draft, attachments, selection, cursor, undo state,
+and queue. Enter queues a follow-up, Shift+Enter steers, Alt+Enter inserts a
+newline, and empty Enter promotes the next queued message. A closed provider
+session is distinct from a canceled turn in an otherwise usable session.
 
-Text a tool returns is plain unless its source says otherwise
-(`presentation::TextFormat`). An embedded resource whose MIME type is
-`text/markdown` (or `text/x-markdown`, with or without parameters), or which
-has no MIME type and a `.md`, `.markdown`, or `.mdx` URI, is markdown: the tool
-cell renders it with the markdown renderer, its first 12 rows collapsed and
-all of it in the transcript. In an agent message, a markdown resource joins
-the message, and any other text resource is shown in a code block.
+Ctrl+Space opens fuzzy child search with a conversation preview. Selection is
+bound to a conversation ID rather than its changing row position. Enter opens
+the selected conversation in the shared canvas. `/reference` searches locally
+recorded conversations for the current project; selecting one inserts a bounded
+excerpt and its identifiers into the draft.
+
+Completed tool calls fold into compact summaries. Expanding a read shows its
+file path, line count, and readable content; execution shows the command or
+source, and edits show colored diffs. Unknown structured results use labeled
+fields and lists rather than serialized JSON. Ctrl+E toggles tool details. Expansion is
+scoped to the conversation, and pointer release must match the original target
+so scrolling does not accidentally toggle a tool. The presentation does not
+replace the canonical rich tool result passed through the harness.
 
 #### File-change diffs
 
@@ -804,10 +791,9 @@ uses `session/load` on that same connection without issuing `session/list` or
 the candidate uncommitted; it never creates a replacement session.
 
 When ordinary agent startup fails, the handler records the complete failure in
-history and opens the agent picker as the recovery action. Because that
+history and opens the provider picker as the recovery action. Because that
 full-height picker can place the history cell outside the viewport, the same
-spawn error is also its subtitle; the ordinary `/agent` command retains the
-generic new-conversation subtitle. This recovery path is assembled by
+spawn error is also its subtitle; the `/providers` command instead offers connection and sign-in actions. This recovery path is assembled by
 [`ChatWidget`](src/chatwidget/pickers.rs) and the shared picker parameters in
 [`agent_picker.rs`](src/nori/agent_picker.rs), without changing the error value
 or treating it as picker state.
@@ -881,24 +867,18 @@ the switch. On `SessionStarted`, only the active-agent identity is committed
 into `App`, so other current settings are never overwritten by candidate-era
 state.
 
-Agent switching takes no time. Choosing an `/agent` row replaces the conversation
-at once with an empty one for the new agent (`App::switch_agent`): the choice is
-persisted, the widget is the same sessionless one a launch starts with, and the agent's
-connection is prepared behind it. What is typed meanwhile is queued until the connection
-is ready, as at startup (`PendingSessionActivation::New`), and a failure to prepare
-reports the error and opens the agent picker again. The picker makes the wait
-vanish when it can: a cursor that rests on a row for 250 ms starts warming that agent
-as a *speculative* candidate (`HighlightAgentCandidate` -> `WarmAgentCandidate`; the
-component picker fires a row's `on_highlight` when the selection changes). A warmed
-candidate that becomes ready only waits; choosing its row hands the connection to the
-new conversation (`prepared_agent`, then `NewSession`), so the first prompt needs no
-preparation at all. Moving to another row replaces the warm candidate, and closing the
-picker without a choice (`DiscardWarmAgentCandidate`) shuts it down. A warming failure
-is silent, since choosing the agent prepares it again and reports what goes wrong. The
-agent's own session list is not offered on a switch; `/resume` lists it.
-
-The candidate machinery below (preparing, picker-ready, and activating phases that keep
-the current widget until `SessionStarted`) remains for the flows that still use it.
+`/model` combines the active session's advertised models with models cached from
+available providers. It shows clean model names, combining equivalent versioned
+model IDs into a row while retaining their distinct routes. Matching unversioned
+aliases share a floating model intent, while explicit versions remain distinct. When
+available, the model family's native agent is tried first; an explicit authentication,
+quota, or unavailable-model failure
+tries another route for the same model. A route using another provider prepares a
+candidate, checks the model against its advertised options, and applies it before
+committing the switch. A failed candidate leaves the active conversation in place.
+`/providers` offers the existing sign-in flows; ACP does not consistently report
+authentication status. Highlighting a model whose preferred route uses another
+agent can prepare that candidate in the background; dismissing discards it.
 
 Candidate activation classifies hidden candidate events in
 [`App`](src/app/event_handling.rs) before they reach the candidate widget. An
@@ -925,6 +905,13 @@ with a `nori_home` fallback), not `nori_home`. This matches where the codex-acp
 subprocess actually reads `auth.json`, since that subprocess is spawned with
 `CODEX_HOME` stripped (see `@/nori-rs/acp-host/docs.md`). The resolver
 deliberately ignores `$CODEX_HOME` because the subprocess ignores it too.
+
+Claude Code `/login` runs the installed official CLI's `claude auth login
+--claudeai` command in Nori's in-app PTY. The CLI owns the subscription OAuth
+flow and writes its credentials to its normal Claude home; Nori does not read
+or copy those credentials. When authentication completes for the active Claude
+agent before a session exists, Nori starts a fresh session so the agent uses
+the saved login.
 
 The app-owned `HarnessRemoteHost` follows the same commit boundary. `App`
 attaches the stable host only after the active widget publishes
@@ -1098,13 +1085,13 @@ simultaneous local and remote input is deliberately deferred by the spec.
 #### Footer configuration
 
 The shipped default is a quiet shell. An idle local session shows the agent
-mode on the textarea's top-right corner, above the prompt, and right-aligns
-branch, worktree, and context on the footer row beneath it:
+model and mode on the textarea's top-right corner, and branch, worktree, and
+context on its top-left corner. The rows below the prompt remain available for
+subagent navigation:
 
 ```
-                                                              [ Plan ]
+⎇ branch · 44% / 272k                                          [ Plan ]
 › Ask Nori to do anything
-                                                ⎇ branch · 44% / 272k
 ```
 
 `footer_left` holds only self-hiding state — the cloud session id when attached
@@ -1212,6 +1199,11 @@ into `SessionInfoState`, so the session title keeps reaching the footer and the
 
 #### Status card
 
+On a fresh Nori home, startup opens the shared composer immediately. The ordinary
+header provides the branding; the first-launch welcome screen does not gate
+input or rewrite the user's configuration. The separate trust flow remains
+available when the resolved policy requires it.
+
 The startup status block is an unbordered two-row summary beneath a green
 prompt marker: system context on one row and agent identity on the next. The
 system row is the location (directory, or the cloud session id and title) and
@@ -1230,9 +1222,8 @@ auto-activates the session, but the welcome card is still emitted immediately so
 it shows while the agent resolves its configuration rather than blanking until
 activation commits. `App::run` calls `ChatWidget::emit_welcome_card` once
 everything local is configured; the agent row is the provider name alone at that
-point, and when the session does start `on_session_started` announces the model
-and options the agent resolved on their own history line (the same cell a
-`session/update` config announcement uses) rather than writing a second card.
+point, and when the session does start `on_session_started` updates the live
+footer with the model and options without adding a history notice or second card.
 Two entries keep writing the card at session start instead: a cloud session,
 whose card names a broker session it only learns about once attached, and the
 agent-switch candidate, which is hidden until it publishes `SessionStarted`.
@@ -1321,3 +1312,32 @@ part of the public harness protocol.
   outright.
 
 Created and maintained by Nori.
+
+
+Ctrl+H opens response navigation at the latest answer while preserving the
+composer draft. Ctrl+H and Ctrl+L move between answers; moving forward past
+the latest answer focuses the latest sent prompt. Enter rewinds the visible conversation
+through the selected answer and starts a fresh agent session from that history.
+Space starts a background subagent from the selected history while the main
+session remains active. For responses with canonical event boundaries, the log
+retains the original events and records the rewind or fork by those boundaries.
+A response without a usable recorded boundary reports that limitation instead
+of silently substituting a different action. The agent receives reconstructed
+history rather than its former hidden state. Esc
+cancels the selection.
+
+### Selection-first prompt editing
+
+The prompt uses a selection-first editor by default. Its Kakoune-based engine
+supports the Helix-compatible keys below; `editor_mode = "helix"` selects the
+same engine. It starts in INSERT mode so
+text can be typed immediately. Press Escape for NORMAL mode. Use `h`, `j`, `k`,
+`l` to move, `v` followed by motion keys to extend the selection, `x` to select
+a line, `d` to delete, `c` to change the selection, and `i` or `a` to insert.
+The prompt bar shows the current mode. Enter queues the prompt; Shift+Enter
+steers the active turn, and Alt+Enter inserts a newline. Press Enter with an
+empty composer to promote the next queued prompt.
+
+To use a different editor, set `editor_mode = "vim"` or
+`editor_mode = "standard"` under `[tui]` in `config.toml`. Existing explicit
+`vim_mode` settings continue to select Vim or the standard editor.

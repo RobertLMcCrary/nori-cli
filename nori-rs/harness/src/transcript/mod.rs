@@ -15,6 +15,7 @@
 //! ```
 
 mod context_timeline;
+pub(crate) mod fork_context;
 mod loader;
 mod parse;
 mod project;
@@ -60,7 +61,6 @@ pub(crate) use types::SessionEventEntry;
 pub(crate) use types::ToolCallEntry;
 #[cfg(test)]
 pub(crate) use types::ToolResultEntry;
-#[cfg(test)]
 pub(crate) use types::TranscriptLine;
 #[cfg(test)]
 pub(crate) use types::UserEntry;

@@ -42,6 +42,8 @@ pub use picker::PickerColumn;
 pub use picker::PickerColumnWidth;
 pub use picker::PickerDensity;
 pub use picker::PickerDetail;
+pub use picker::PickerHit;
+pub use picker::PickerHitTarget;
 pub use picker::PickerItem;
 pub use picker::PickerLoadState;
 pub use picker::PickerMode;

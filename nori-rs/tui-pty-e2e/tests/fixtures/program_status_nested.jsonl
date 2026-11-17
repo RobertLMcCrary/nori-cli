@@ -1,0 +1,4 @@
+{"t_ms":0,"update":{"sessionUpdate":"subagent_spawned","subagentSessionId":"child","name":"First child","task":"Parent task"}}
+{"t_ms":0,"session":"child","update":{"sessionUpdate":"subagent_spawned","subagentSessionId":"grandchild","name":"Second child","task":"Nested task"}}
+{"t_ms":0,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Root work complete"}}}
+{"t_ms":3000,"after_response":true,"update":{"sessionUpdate":"subagent_state_update","subagentSessionId":"child","state":"closed"}}

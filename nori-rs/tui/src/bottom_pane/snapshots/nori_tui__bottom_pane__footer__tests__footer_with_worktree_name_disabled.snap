@@ -2,4 +2,4 @@
 source: tui/src/bottom_pane/footer.rs
 expression: terminal.backend()
 ---
-"  Skillset: clifford                                                                        ⎇ auto/fix-auth-bug-20260205"
+"  Skillset: clifford                                                                      git auto/fix-auth-bug-20260205"

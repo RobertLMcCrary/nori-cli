@@ -499,19 +499,19 @@ fn shell_mode_renders_bang_prefix() {
 }
 
 #[test]
-fn shortcut_mode_prompt_uses_gray_question_mark_without_duplicate_prefix() {
+fn question_mark_is_rendered_as_input_without_shortcut_help() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(true, sender, false, "? for shortcuts".to_string(), false);
 
-    let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    type_chars_humanlike(&mut composer, &['?']);
 
     let buf = render_composer(&composer);
-    assert_eq!(buf[(0, 1)].symbol(), "?");
-    assert_eq!(buf[(0, 1)].fg, Color::DarkGray);
+    assert_eq!(composer.current_text(), "?");
+    assert_eq!(buf[(0, 1)].symbol(), "›");
     assert!(
-        input_row(&buf).starts_with("? for shortcuts"),
-        "shortcut prompt should not duplicate the placeholder sigil: {:?}",
+        input_row(&buf).contains('?'),
+        "the typed question mark should remain visible: {:?}",
         input_row(&buf)
     );
 }

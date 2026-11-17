@@ -1,6 +1,6 @@
-//! Hiding everything above the prompt (Ctrl+L), and the repaint the tests exercise.
+//! Hiding everything above the prompt, and the repaint the tests exercise.
 //!
-//! Ctrl+L scrolls the rows above the viewport up into the scrollback, which is left whole, and
+//! The clear-screen action scrolls rows above the viewport into scrollback, which is left whole, and
 //! leaves the screen above the prompt empty. A full clear is not used: `ESC[2J` pushes the screen
 //! into scrollback on some terminals and `ESC[3J` deletes scrollback on all of them.
 //!
@@ -21,7 +21,7 @@ impl Tui {
         self.frame_requester().schedule_frame();
     }
 
-    /// Repaint the whole alternate screen (a pager overlay owns all of it) on the next draw.
+    /// Repaint the current viewport on the next draw.
     pub(crate) fn request_full_repaint(&mut self) {
         self.terminal.invalidate();
         self.full_repaint = true;

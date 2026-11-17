@@ -36,6 +36,7 @@ mod remote_control_ext;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptAdmission {
     Queue,
+    Steer,
     RejectIfBusy,
 }
 
@@ -144,6 +145,8 @@ pub fn enhance_agent_error(
 /// avoiding a direct dependency on codex_core.
 #[derive(Debug, Clone)]
 pub struct AcpBackendConfig {
+    /// Shared conversation recorder for provider handoff.
+    pub handoff: Option<Arc<crate::transcript::TranscriptRecorder>>,
     /// Agent name used to look up agent in registry
     pub agent: String,
     /// Working directory for the session
@@ -253,6 +256,7 @@ pub struct AcpBackend {
     cwd: PathBuf,
     /// Pending approval requests waiting for user decision
     pending_approvals: Arc<Mutex<Vec<PendingApprovalRequest>>>,
+    withdrawn_questions: Arc<Mutex<std::collections::HashSet<(String, String, String)>>>,
     /// Typed prompt callers waiting for the ACP transport request ID.
     pending_prompt_submissions:
         Arc<Mutex<HashMap<String, oneshot::Sender<Result<acp::RequestId>>>>>,
@@ -310,10 +314,16 @@ pub struct AcpBackend {
     is_first_prompt: Arc<Mutex<bool>>,
     /// The session's workflow, from the user's and the project's scripts.
     workflow: Arc<Mutex<workflow::WorkflowState>>,
+    /// Machine metrics captured once for Pkl evaluation and replayed from the transcript.
+    machine_snapshot: Arc<tokio::sync::OnceCell<nori_pkl::machine::MachineSnapshot>>,
+    workflow_ready: tokio::sync::watch::Sender<bool>,
+    /// Excludes conversation rewinds while a Pkl effect is in progress.
+    program_effects: Arc<tokio::sync::RwLock<()>>,
     /// Whether the first prompt should be summarized for the footer.
     prompt_summary_enabled: bool,
     /// Agent name stored for spawning summarization connection
     agent_name: String,
+    handoff_candidate: bool,
     /// CLI version recorded in transcript metadata (including forked transcripts)
     cli_version: String,
     /// Auto-worktree mode (whether a worktree was created at startup)
@@ -356,9 +366,16 @@ pub struct AcpBackend {
     relay_task_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     /// The tasks this session delegated to child sessions.
     orchestrator: orchestrator::Orchestrator,
+    native_children: Arc<native_child_sessions::NativeChildren>,
 }
 
 impl AcpBackend {
+    pub(crate) fn is_handoff(&self) -> bool {
+        self.handoff_candidate
+    }
+    pub(crate) fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
     /// The shared cell holding the active transcript recorder.
     ///
     /// The event-forwarding task holds this cell and re-reads the recorder per
@@ -390,20 +407,30 @@ fn session_context_for_connection(
 pub mod browser_profile;
 #[cfg(unix)]
 pub mod browser_session;
+mod child_control;
 mod ci_watch;
+mod continuation_guard;
 mod forge_tools;
 mod git_tools;
 mod goal_ext;
 mod host_tools;
+mod native_child_history;
+mod native_child_restore;
+mod native_child_sessions;
 mod nori_client_context;
 mod nori_client_mcp;
 pub(crate) mod orchestrator;
 mod prewarm;
+mod subagent_identity;
 mod workflow;
 pub use nori_client_mcp::set_stdio_bridge;
+pub use orchestrator::CachedAgentModel;
+pub use orchestrator::cached_agent_models;
 pub use orchestrator::refresh_agent_catalog;
+pub use orchestrator::refresh_agent_catalog_except;
 pub mod prepared;
 mod replay_timing;
+mod rewind;
 mod session;
 mod session_defaults;
 pub(crate) mod session_reducer;
@@ -414,8 +441,10 @@ mod submit_and_ops;
 mod thread_goal;
 mod transcript;
 mod user_input;
+mod user_question;
 mod user_shell;
 pub use transcript::client_events_to_replay_client_events;
+pub(crate) use transcript::transcript_to_child_replay_session_events;
 pub use transcript::transcript_to_replay_client_events;
 pub use transcript::transcript_to_replay_session_events;
 pub use transcript::transcript_to_summary;

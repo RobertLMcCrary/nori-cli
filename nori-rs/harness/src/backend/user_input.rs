@@ -8,6 +8,7 @@ impl AcpBackend {
         id: &str,
         mut prompt_meta: Option<acp::Meta>,
         admission: PromptAdmission,
+        mut cancellation: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         let prompt_text = content
             .iter()
@@ -24,7 +25,21 @@ impl AcpBackend {
             });
 
         // Inline workflow clauses are for Nori, not the agent: the text goes on without them.
-        let (workflow_text, workflow_rules) = self.workflow_for_prompt(&prompt_text).await;
+        let (workflow_text, workflow_rules) = {
+            let workflow = self.workflow_for_prompt(&prompt_text);
+            tokio::pin!(workflow);
+            tokio::select! {
+                biased;
+                _ = async {
+                    while !*cancellation.borrow_and_update() {
+                        if cancellation.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                } => anyhow::bail!("prompt admission was canceled while waiting for policy"),
+                result = &mut workflow => result,
+            }
+        };
         let (prompt_text, content) = if workflow_text == prompt_text {
             (prompt_text, content)
         } else {
@@ -133,16 +148,17 @@ impl AcpBackend {
         } else {
             prompt_text.clone()
         };
-        let prompt_with_goal_context = self
-            .prepend_goal_context_to_prompt(prompt_with_context)
-            .await;
         let prompt_with_goal_context = match workflow_rules {
-            Some(rules) => format!("{rules}\n\n{prompt_with_goal_context}"),
-            None => prompt_with_goal_context,
+            Some(rules) => format!("{rules}\n\n{prompt_with_context}"),
+            None => prompt_with_context,
         };
 
         // A compaction, fork, or resume leaves a checkpoint for the first prompt to open with.
-        let pending_checkpoint = self.pending_compact_summary.lock().await.take();
+        let mut pending_checkpoint = self.pending_compact_summary.lock().await.take();
+        let historical_content = pending_checkpoint
+            .as_mut()
+            .map(crate::transcript::fork_context::take_typed_history)
+            .unwrap_or_default();
         let final_prompt_text = if let Some(checkpoint) = pending_checkpoint {
             format!("{checkpoint}\n\n{prompt_with_goal_context}")
         } else {
@@ -163,6 +179,7 @@ impl AcpBackend {
         );
         let original_content = content.clone();
         let mut final_content = content;
+        final_content.splice(0..0, historical_content);
         if final_prompt_text != prompt_text {
             let injected_prefix = final_prompt_text
                 .strip_suffix(&prompt_text)
@@ -207,6 +224,7 @@ impl AcpBackend {
         };
         let event = match admission {
             PromptAdmission::Queue => session_reducer::InboundEvent::PromptSubmit(prompt),
+            PromptAdmission::Steer => session_reducer::InboundEvent::PromptSteer(prompt),
             PromptAdmission::RejectIfBusy => {
                 session_reducer::InboundEvent::PromptSubmitIfIdle(prompt)
             }

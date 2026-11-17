@@ -8,6 +8,8 @@ pub enum Key {
     Right,
     Backspace,
     Tab,
+    ShiftEnter,
+    AltEnter,
     Ctrl(char),
     Char(char),
 }
@@ -23,6 +25,8 @@ impl Key {
             Key::Left => vec![0x1b, b'[', b'D'],
             Key::Backspace => vec![0x7f],
             Key::Tab => vec![b'\t'],
+            Key::ShiftEnter => b"\x1b[13;2u".to_vec(),
+            Key::AltEnter => b"\x1b[13;3u".to_vec(),
             Key::Ctrl(c) => vec![(*c as u8) & 0x1f],
             Key::Char(c) => c.to_string().into_bytes(),
         }

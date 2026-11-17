@@ -88,10 +88,7 @@ fn a_refused_switch_brings_the_earlier_model_back() {
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect();
-    assert!(
-        history.contains("Couldn't switch models: not on this plan"),
-        "{history}"
-    );
+    assert_eq!(history, "");
 }
 
 #[test]
@@ -108,14 +105,9 @@ fn an_agent_without_a_choice_of_model_says_so() {
     )
     .category(acp::SessionConfigOptionCategory::Mode)]);
     chat.cycle_model(ModelStep::Next);
-    let history: String = drain_insert_history(&mut rx)
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect();
-    assert!(
-        history.contains("doesn't offer a choice of model"),
-        "{history}"
-    );
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+        event, AppEvent::TransientNotice(message) if message.contains("doesn't offer a choice of model")
+    )));
 }
 
 #[test]
@@ -245,7 +237,7 @@ fn ctrl_j_and_k_step_the_effort() {
 }
 
 #[test]
-fn the_models_step_with_fable_last() {
+fn the_models_step_in_intelligence_order() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
     chat.sync_acp_session_config_snapshot(&[acp::SessionConfigOption::select(
         "model",
@@ -271,11 +263,11 @@ fn the_models_step_with_fable_last() {
     assert_eq!(
         seen,
         [
+            "claude-fable-5-2",
             "opus",
             "sonnet",
-            "haiku",
-            "claude-fable-5-2",
             "fable",
+            "haiku",
             "default"
         ]
     );
@@ -349,4 +341,71 @@ async fn presses_during_a_switch_send_only_the_last() {
     assert_eq!(requested, vec![after_one, target.clone()]);
     assert_eq!(current_model(&chat), target);
     let _ = session.handle.shutdown().await;
+}
+
+#[test]
+fn model_picker_shows_advertised_models_across_providers() {
+    let home = tempfile::tempdir().expect("temporary Nori home");
+    std::fs::write(
+        home.path().join("agent-models.json"),
+        r#"{"mock-model-alt":{"models":[{"value":"fast","name":"Fast"}],"settings":[],"refreshed_at":1}}"#,
+    ).expect("cached advertised model");
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("! for shell commands");
+    chat.config.nori_home = home.path().to_path_buf();
+    chat.config.active_agent = "mock-model".to_string();
+    chat.sync_acp_session_config_snapshot(&models("sonnet"));
+    chat.open_model_popup();
+    let rendered = screen(&chat)
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Fast"), "{rendered}");
+    assert!(!rendered.contains("Mock ACP Alt"), "{rendered}");
+    assert!(!rendered.contains("Use custom model"), "{rendered}");
+    insta::assert_snapshot!("unified_provider_model_picker", rendered);
+}
+
+#[test]
+fn opencode_model_picker_shows_clean_model_names() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("! for shell commands");
+    chat.config.active_agent = "opencode".to_string();
+    chat.sync_acp_session_config_snapshot(&[acp::SessionConfigOption::select(
+        "model",
+        "Model",
+        "opencode/big-pickle",
+        vec![
+            acp::SessionConfigSelectOption::new("opencode/big-pickle", "opencode/Big Pickle"),
+            acp::SessionConfigSelectOption::new("local/coder", "local/Coder"),
+        ],
+    )
+    .category(acp::SessionConfigOptionCategory::Model)]);
+    chat.open_model_popup();
+    let rendered = screen(&chat);
+    let popup = rendered.split('╰').next().unwrap_or(&rendered);
+    assert!(popup.contains("Big Pickle"), "{rendered}");
+    assert!(popup.contains("Coder"), "{rendered}");
+    assert!(!popup.contains("opencode/"), "{rendered}");
+    assert!(!popup.contains("local/"), "{rendered}");
+    insta::assert_snapshot!("opencode_model_picker", rendered);
+}
+
+#[test]
+fn provider_picker_shows_opencode_identity() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("! for shell commands");
+    let mut params = crate::nori::agent_picker::provider_picker_params();
+    params.items.retain(|item| item.name == "OpenCode");
+    assert_eq!(params.items.len(), 1);
+    params.items[0].description =
+        Some("Available · sign-in status unknown · select to connect".to_string());
+    chat.bottom_pane.show_selection_view(params);
+    let rendered = screen(&chat);
+    assert!(rendered.contains("OpenCode"), "{rendered}");
+    insta::assert_snapshot!("opencode_provider_picker", rendered);
 }

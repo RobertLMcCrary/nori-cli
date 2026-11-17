@@ -1,280 +1,178 @@
 # Workflows
 
-A **workflow** says how an **agent** behaves in a **session**: how many
-**prompt turns** it may run on its own, what Nori prompts it with at session
-events, and the rules its commits and pull requests follow. Workflows are
-written in a small Scheme vocabulary, `nori/workflow`, evaluated by an embedded
-and sandboxed [Steel](https://github.com/mattwparas/steel) engine (crate
-`nori-script`). The result is plain data; nothing outside `nori-script` sees
-Scheme. Terms follow [glossary.md](glossary.md).
+A workflow configures follow-up prompts, commit and pull request guidance, and
+fallback models for an ACP session. Workflow policy files are Pkl modules; they
+return data for the harness to apply. Evaluating policy does not dispatch agent
+messages or repeat conversation effects. Terms follow [glossary.md](glossary.md).
 
-## Where workflows come from
+## Policy sources
 
-| Source | Path | Loaded |
+| Source | Path | When it loads |
 | --- | --- | --- |
-| Global script | `$NORI_HOME/init.scm` | Always, when present |
-| Project script | `<repo>/.nori/nori.scm` | Only when the directory is trusted |
-| Inline DSL | The user's prompt | Per prompt, against the loaded scripts |
+| Built-in defaults | `nori-rs/pkl/default.pkl` | First |
+| User policy | `$NORI_HOME/init.pkl` | Every session, when present |
+| Project policy | `<repo>/.nori/nori.pkl` | After user policy, only in a trusted directory |
 
-The layout follows Helix's Steel plugin system (`~/.config/helix/init.scm` plus
-`helix.scm`, with builtin `helix/...` modules). Nori's builtin module is
-`nori/workflow`, and it is already loaded: scripts do not `require` it.
+Policies apply in that order. Later modules override fields they set. The built-in
+policy is compiled into Nori, so a session with no custom policy does not start
+Pkl; a test compares that value with `default.pkl`. A missing file is skipped. User policy modules have normal Pkl file and environment
+resource access, so they can use Pkl imports and reads directly.
 
-The global script runs first and the project script second, in one engine. The
-project script sees every global definition and overrides it:
+The `nori-script` Steel interface remains only for compatibility with legacy
+code; ACP policy loading uses Pkl and shared `nori-workflow` data types.
 
-- Registering a workflow under an existing name replaces it.
-- The last `default-workflow` wins.
-- `(define-workflow land (use 'land) (turns 1))` derives from the global
-  `land`. Quote the name: while `land` is being redefined, the bare variable
-  `land` does not hold the old workflow yet.
+A policy module returns top-level values. Unset values keep those from the
+previous source. For example, a project policy can replace `fallback_models`
+without replacing the global policy's hooks. The nested `commit`, `pr`, `hooks`,
+`instructions`, and `fallback_models` values are replaced as whole values when
+set. Unknown policy fields are errors.
 
-A missing file is skipped. With no script and no inline DSL, no engine is
-created.
+## Policy fields
 
-Creating a Steel engine dominates the cost of loading: about 100 ms in an
-optimized build (2 to 3 s in a debug build), against about 1 ms to run a
-typical script. `nori_script::ScriptHost` therefore loads on its own thread as
-soon as it is spawned, off the session's start-up path, and keeps that engine
-for inline DSL, which then costs under 1 ms per prompt.
-`Loaded::apply_inline` builds a fresh engine on every call; use it only where
-that cost is acceptable.
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | `String` | Workflow name. |
+| `max_turns` | `Int` | Maximum hidden hook turns after a user turn. Omit it for no policy cap; `0` disables hook turns. Negative values are invalid. |
+| `instructions` | `List<String>` | Standing instructions included with workflow prompts. |
+| `hooks` | `List<Dynamic>` | Ordered `{ event, prompt }` rules. Events: `on-change`, `on-turn`, `on-commit`, `on-pr`, `on-stop`, `on-ci-fail`, `on-ci-pass`. |
+| `fallback_models` | `List<String>` | Candidate model IDs, in order, for subscription quota exhaustion. |
+| `fallback_ranked` | `Boolean` | Choose fallback candidates from the advertised model catalog. |
+| `commit` | `Dynamic` | Commit style and batching options. |
+| `commit_reviewer` | `Dynamic` or `null` | Agent and optional model for background commit review. |
+| `pr` | `Dynamic` | Pull request content and upstream policy. |
+| `tools` | `Dynamic` | Session selection, descriptions, and instructions for Nori-owned host tools. |
 
-The project script comes from a repository, so Nori loads it only for a
-trusted directory. The sandbox below bounds what any script can do, but trust
-is the gate.
+The built-in policy selects ranked fallback models and leaves `max_turns`
+unset. There is no default hook-turn budget. A `max_turns` value is an explicit
+policy cap; it does not cap a normal model turn or its final answer.
 
-## Vocabulary
+When an ACP agent reports structured usage or billing quota exhaustion, Nori
+first tries known equivalent routes for the current versioned model, including
+different provider routes exposed by one ACP agent, then tries the configured
+models in order while skipping providers already exhausted in the conversation.
+Ranked candidates come from the cached advertised models and
+use the same ordering as `/model`. The selected provider opens a fresh ACP
+session with a checkpoint of the visible conversation and retries the prompt.
+The conversation keeps its canonical journal and identity; private provider
+session state cannot be transferred. Temporary rate limits and unrelated errors
+do not trigger fallback. If no candidate succeeds, Nori shows the original
+error. For OpenCode, Nori reads explicit provider codes from the structured
+HTTP error body; a generic HTTP 429 or a transient rate-limit code does not
+mark the provider exhausted.
 
-Every clause takes a workflow first and returns a new one, so clauses chain:
-inside `define-workflow`, with Steel's thread-first macro `~>` (or its alias
-`->`), and in inline DSL. Workflow values are immutable.
+### Nori host tools
 
-### Defining workflows
+The optional `tools` object selects Nori-owned host tools before the ACP agent
+receives its catalog. It does not alter the agent's built-in tools or other MCP
+servers. `enabled`, when present, is an allowlist (an empty list selects none);
+`disabled` removes names from that list or from the default catalog.
+`descriptions` overrides model-facing descriptions by name, and `instructions`
+appends model-facing guidance to the generated list of selected tools. Later
+policy sources replace each supplied field independently.
 
-| Form | Meaning |
+```pkl
+tools = new Dynamic {
+  enabled = List("get_goal", "git_status")
+  disabled = List("git_status")
+  descriptions = new Mapping { ["get_goal"] = "Read the current goal" }
+  instructions = List("Check the goal before reporting completion.")
+}
+```
+
+Only selected tools are advertised and callable. If `get_goal` or `update_goal`
+is disabled, Nori disables its `/goal` command and goal continuations unless
+the agent provides its own goal extension. A customized catalog cannot
+reuse a Claude process prewarmed with a different catalog. Nori loads policy
+once before creating the agent session when it can receive Nori tools, and uses that same policy and captured
+machine snapshot for its prompts and tools. Agents without Nori tools can start
+while the policy loads; prompt admission waits for it.
+
+### Commit options
+
+`commit` may set `style` (`plain` or `conventional`), `max_files`,
+`max_subject`, `atomic`, `batch` (`per-change`, `per-turn`, or `per-task`),
+`require_body`, and `agent` (`{ agent, model? }`). The `agent` field delegates
+commit writing to that configured ACP agent.
+
+### Pull request options
+
+`pr` may set `title`, `sections`, `max_lines`, `max_files`, `base`, `draft`, and
+`upstream`. The upstream value is `never`, `ask`, `tests-pass`, or `done`.
+
+## Machine properties
+
+Pkl modules can read the machine snapshot passed by Nori through external
+properties:
+
+| Property | Value |
 | --- | --- |
-| `(workflow "name")` | An empty workflow. The name may be a string or a symbol. |
-| `(define-workflow name clause ...)` | Defines `name` as `(~> (workflow 'name) clause ...)` and registers it. |
-| `(register-workflow w)` | Registers `w` under its name and returns it. Use it with `~>` chains. |
-| `(default-workflow w)` | Registers `w` and makes it the session default. Also accepts a registered name. |
-| `(workflow? x)` | Whether `x` is a workflow. |
+| `machine.cpu.available_parallelism` | Logical CPUs available to the process. |
+| `machine.cpu.load_average.one_minute` | One-minute system load average. |
+| `machine.cpu.load_average.five_minutes` | Five-minute system load average. |
+| `machine.cpu.load_average.fifteen_minutes` | Fifteen-minute system load average. |
+| `machine.memory.total_bytes` | Total visible memory, in bytes. |
+| `machine.memory.available_bytes` | Available memory, in bytes. |
 
-### Clauses
+Read a property with Pkl's `read("prop:<name>")`; values are strings, so parse
+numeric readings with `toInt()` or `toFloat()`. Unsupported readings are the
+literal string `unsupported`, rather than zero. For example:
 
-| Clause | Meaning |
-| --- | --- |
-| `(turns n)` | The agent may run up to `n` prompt turns on its own before the user takes over. `0` stops after every turn. |
-| `(on-change "prompt")` | Sent after a prompt turn that changed files. Alias: `hook-after-change`. |
-| `(on-turn "prompt")` | Sent after every prompt turn. Alias: `hook-after-turn`. |
-| `(on-commit "prompt")` | Sent after the agent creates a commit. Alias: `hook-after-commit`. |
-| `(on-pr "prompt")` | Given to the agent by the `pull_request` tool before it opens or updates a pull request. Alias: `hook-before-pr`. |
-| `(on-stop "prompt")` | Sent before the agent hands control back to the user. Alias: `hook-before-stop`. |
-| `(on-ci-fail "prompt")` | Sent when a check fails on a commit the agent pushed, after a report of what failed. Alias: `hook-after-ci-fail`. |
-| `(on-ci-pass "prompt")` | Sent when every check passes on a commit the agent pushed. Alias: `hook-after-ci-pass`. |
-| `(instruct "text")` | A standing instruction, given to the agent verbatim. |
-| `(commit-style style option ...)` | What commits look like and when they are made. |
-| `(commit-agent 'agent #:model "model")` | The agent, and optionally the model, that writes and batches the commits instead of the session's agent. |
-| `(pr option ...)` | What a pull request contains and when work is upstreamed. |
-| `(use w)` | Replaces everything but the name with `w`'s settings. `w` may also be a registered name, `(use 'land)`, which is how a workflow redefines itself on top of an earlier definition. |
+```pkl
+local available = read("prop:machine.memory.available_bytes")
+local enoughMemory = available != "unsupported" && available.toInt() > 8_000_000_000
 
-Hooks accumulate; several hooks for one event are sent in order. `commit-style`
-and `pr` merge: an option left out keeps its current value, so
-`(pr #:max-lines 200)` tightens one limit of an inherited workflow.
+name = "memory-aware"
+instructions = if (enoughMemory) List("Run the full test suite") else List("Run focused tests")
+```
 
-`commit-style` takes an optional style, then options:
+Memory values are the system values reported by sysinfo; they may not reflect a
+container's memory limit. CPU availability uses Rust's process-available
+parallelism estimate.
 
-| Option | Value | Meaning |
-| --- | --- | --- |
-| style | `'conventional` or `'plain` | `type(scope): summary`, or a plain imperative summary. |
-| `#:max-files` | integer, at least 1 | Most files one commit may touch. |
-| `#:max-subject` | integer, at least 20 | Longest subject line, in characters. |
-| `#:atomic` | `#t` or `#f` | One logical change per commit that builds and passes tests on its own. |
-| `#:batch` | `'per-change`, `'per-turn`, or `'per-task` | Commit each change when complete, at the end of each turn that changed files, or once when the task is done. |
-| `#:require-body` | `#t` or `#f` | Every commit body explains why. |
-
-`pr` options:
-
-| Option | Value | Meaning |
-| --- | --- | --- |
-| `#:title` | string | Title template, such as `"<type>(<scope>): <summary>"`. |
-| `#:sections` | list of strings | Required description sections, in order. |
-| `#:max-lines` | integer, at least 1 | Largest diff in changed lines before the work is split into several pull requests. |
-| `#:max-files` | integer, at least 1 | Most files one pull request may touch. |
-| `#:base` | string | The branch pull requests target. |
-| `#:draft` | `#t` or `#f` | Open pull requests as drafts. |
-| `#:upstream-when` | `'never`, `'ask`, `'tests-pass`, or `'done` | Never push; ask first; push and open the pull request once tests pass; or do so when the task is complete. `pull_request` refuses under `'never`, asks the user under `'ask`, and does not ask under the other two. |
-
-An unknown option, a repeated option, or a value of the wrong type is an error
-that names the form and shows the value it got.
+Nori captures one snapshot before evaluating policy, journals its serialized
+value, and passes the same values to both workflow and fallback policy loads.
+When resuming a recorded session, it reuses that snapshot instead of reading
+machine state again. Replaying the conversation reduces recorded data and never
+evaluates policy modules or repeats effects.
 
 ## Example
 
-```scheme
-;; $NORI_HOME/init.scm
-(define-workflow land
-  (turns 3)
-  (on-change "Commit what you just changed as focused commits; explain the why.")
-  (on-stop "Run the tests that cover what you changed, and fix what fails.")
-  (on-pr "Check that the description lists every user-visible change.")
-  (on-ci-fail "Fix what CI reports, push, and say what broke.")
-  (commit-style 'conventional #:max-files 8 #:max-subject 72 #:atomic #t
-                #:batch 'per-change #:require-body #t)
-  (commit-agent 'claude #:model "haiku")
-  (pr #:title "<type>(<scope>): <summary>"
-      #:sections '("Why" "What" "Testing")
-      #:max-lines 400
-      #:base "main"
-      #:upstream-when 'tests-pass))
+`$NORI_HOME/init.pkl`:
 
-;; The same style as a chain, like `.turns(1).hook_before_stop(...)`.
-(define hotfix
-  (~> (workflow "hotfix")
-      (use land)
-      (turns 1)
-      (hook-before-stop "Say what you did not verify.")
-      (pr #:max-lines 50 #:draft #t)))
-(register-workflow hotfix)
-
-(default-workflow land)
+```pkl
+name = "standard"
+fallback_ranked = false
+fallback_models = List("provider/preferred-model", "provider/backup-model")
+instructions = List("Run the tests that cover each change")
+hooks = new Listing {
+  new Dynamic { event = "on-stop"; prompt = "Summarize the work and remaining risks" }
+  new Dynamic { event = "on-change"; prompt = "Review the diff and commit focused changes" }
+}
+commit = new Dynamic {
+  style = "conventional"
+  batch = "per-change"
+  atomic = true
+}
+pr = new Dynamic {
+  sections = List("Why", "What", "Testing")
+  base = "main"
+  upstream = "ask"
+}
 ```
 
-```scheme
-;; <repo>/.nori/nori.scm: this repository lands smaller pull requests.
-(define-workflow land (use 'land) (pr #:max-lines 200))
+Replace illustrative model IDs with models advertised by the candidate agent.
+A structured subscription quota error triggers fallback in order; unrelated
+errors and short-term rate limits do not. A fallback starts a new provider
+session with the failed prompt and a checkpoint of visible conversation
+context. It cannot inherit provider-private session state.
+
+A commit reviewer can be selected with:
+
+```pkl
+commit_reviewer = new Dynamic { agent = "claude"; model = "haiku" }
 ```
 
-## Inline DSL
-
-A prompt can adjust the session's workflow. Two spellings are recognized;
-neither occurs in ordinary prose or code:
-
-- A fenced block whose info string is exactly `nori`.
-- A line that starts at column 0 with `,(`, outside any other fenced block.
-  An indented `,(` and a `,(` inside a ```` ```scheme ```` block are left
-  alone.
-
-````text
-Fix the flaky login test.
-,(turns 5)
-```nori
-(on-stop "Run the login tests ten times.")
-(use 'hotfix)
-```
-````
-
-The DSL is removed from the prompt before it is sent. Inline forms are clauses
-only: they apply, in order, to the default workflow (or to an empty workflow
-named `prompt` when there is none), as if written inside
-`(~> default-workflow ...)`. The definitions from the loaded scripts are in
-scope, so `(use 'hotfix)` and helper functions such as
-`(define (careful w) (~> w (on-stop "Run the tests.")))` work; a bare helper
-name is a clause too (`careful`). Inline DSL cannot use `define`, `set!`,
-`define-workflow`, `register-workflow`, or `default-workflow`, and it leaves
-the loaded definitions unchanged.
-
-## What the agent is told
-
-A workflow renders as concise rules for the agent's first prompt, for example:
-
-```text
-Follow the "land" workflow:
-- You may run up to 3 prompt turns on your own before the user takes over.
-- Commit messages follow Conventional Commits: `type(scope): summary`. Keep the subject line within 72 characters. Every commit has a body that explains why the change was made.
-- Keep commits atomic: one logical change per commit that builds and passes tests on its own. A commit touches at most 8 files. Commit each logical change as soon as it is complete.
-- Do not run `git commit` yourself: Nori's commit agent, claude (haiku), writes and batches the commits by these rules.
-- Pull request titles follow `<type>(<scope>): <summary>`. The description has these sections, in order: "Why", "What", "Testing". Keep each pull request within 400 changed lines; split larger work into a series of pull requests.
-- Target the `main` branch. Once the tests pass, push the branch and open the pull request.
-- After a turn that changes files, Nori will tell you: Commit what you just changed as focused commits; explain the why.
-- Before you open a pull request, Nori will tell you: Check that the description lists every user-visible change.
-- Before you stop, Nori will tell you: Run the tests that cover what you changed, and fix what fails.
-- When CI fails on a commit you pushed, Nori will tell you: Fix what CI reports, push, and say what broke.
-```
-
-Hooks are listed so the agent expects them. Nori still sends each hook's prompt
-when its event happens.
-
-## In a session
-
-The harness (`nori-rs/harness/src/backend/workflow.rs`) applies the active
-workflow:
-
-- **Loading.** When a root session starts and a script exists, a
-  `ScriptHost` loads it in the background; a prompt sent before it is ready
-  runs without a workflow. A script error is shown once as a notice. Delegated
-  children load nothing: their task carries what they need.
-- **Telling.** The first user prompt after a workflow comes into force carries
-  its rules in a leading `<workflow>` block, the same way goal context does.
-  An inline clause that changes the workflow tells the agent again.
-- **Inline DSL.** Nori removes the clauses from the prompt before the agent
-  sees it. A prompt that was only clauses changes the workflow and sends
-  nothing.
-- **Hooks.** After a prompt turn that ended normally, Nori compares the working
-  tree and `HEAD` with how they were when the user's turn started, and sends
-  the first hook whose event happened, as a hidden turn wrapped in
-  `<workflow_hook event="on-change">`, with an info line naming it. Without a
-  snapshot from the turn's start (the scripts loaded during the turn) nothing
-  counts as changed:
-  - after a user turn: `on-change` (files changed), then `on-commit` (`HEAD`
-    moved), then `on-turn`, then `on-stop`;
-  - after a hook turn: only `on-commit` and `on-stop`, so a hook's own edits
-    never start another round;
-  - `on-stop` fires at most once per user turn.
-  - `on-pr` comes from the `pull_request` tool, which holds once per commit to
-    give it, and `on-ci-fail` and `on-ci-pass` from Nori's watch of the
-    pushed commit's checks. See [forge.md](forge.md).
-- **Budget.** At most `turns` hook turns follow one user turn (3 when the
-  workflow does not say). A hook is only sent when the session is idle; the
-  goal loop continues after it.
-- **Commit agent.** With `commit-agent`, the `on-change` work goes to that
-  agent and model as a delegated task in the background, and the session's
-  agent keeps going. It shows up as a subagent.
-
-## Sandbox
-
-Scripts may use the `nori/workflow` forms and pure Steel: arithmetic, strings,
-lists, hash maps, `define`, `lambda`, `let`, `cond`, and the prelude's macros
-such as `~>`. Nothing else is available:
-
-- No files, processes, network, environment variables, or terminal I/O
-  (`display` and `read-line` are denied too: the terminal belongs to the TUI).
-- No `require`, `require-builtin`, `eval`, or `load`.
-- No macro definitions (`define-syntax`, `syntax-rules`, `defmacro`). Steel
-  expands macros inside its compiler, where the time budget cannot reach, so a
-  self-referential macro would hang Nori or overflow its stack. Write a
-  function instead: `(define (strict w) (~> w (turns 1)))`.
-- Names starting with `%` or `#%`, and `Engine::...`, are Steel internals and
-  are denied.
-- No threads, sleeping, or blocking.
-- A script is at most 256 KiB and nests forms at most 64 levels deep.
-- Each file, and each inline block or line, runs for at most 500 ms
-  (`nori_script::TIME_BUDGET`) before it is stopped.
-
-The checks are layered:
-
-1. Before Steel sees a script, a scan with Steel's own lexer rejects denied
-   names, `require`, macro definitions, and oversized or deeply nested sources.
-2. The engine also rebinds every denied global to a function that raises the
-   same error.
-3. The dangerous builtin modules are replaced with empty ones.
-4. A watchdog interrupts evaluation past the time budget, and a panic inside
-   Steel becomes an error.
-
-The sandbox bounds time, not memory: a script that allocates without limit can
-exhaust memory within its time budget. Do not load untrusted scripts; that is
-why the project script requires a trusted directory.
-
-## Errors
-
-Every error names its origin (the file path, or `prompt`), a 1-based line and
-column when Steel reports a position, and a message that names the form, for
-example:
-
-```text
-/repo/.nori/nori.scm:2:3: turns: the turn count must be a whole number of at least 0, got 'many
-```
-
-Errors have a kind: `Io` (the file exists but cannot be read), `Syntax`,
-`Sandbox`, `Eval` (unknown names, wrong arguments), or `Timeout`. A script
-that fails to load contributes no workflows; Nori reports the error and
-continues without them.
+The reviewer runs as a background subagent after a changed user turn. It is
+asked to review staged, unstaged, and untracked changes and suggest commit
+messages without modifying files or committing. The working tree may contain
+older changes; this instruction is not a read-only sandbox.

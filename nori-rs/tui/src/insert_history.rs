@@ -6,11 +6,7 @@ use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::line_contains_url_like;
 use crate::wrapping::line_has_mixed_url_and_non_url_tokens;
 use crossterm::Command;
-use crossterm::cursor::MoveDown;
 use crossterm::cursor::MoveTo;
-use crossterm::cursor::MoveToColumn;
-use crossterm::cursor::RestorePosition;
-use crossterm::cursor::SavePosition;
 use crossterm::queue;
 use crossterm::style::Color as CColor;
 use crossterm::style::Print;
@@ -56,7 +52,7 @@ pub(crate) fn wrap_history_lines_for_width(lines: &[Line<'_>], width: u16) -> Ve
 }
 
 fn physical_row_count(line: &Line<'_>, width: usize) -> usize {
-    line.width().max(1).div_ceil(width.max(1))
+    crate::native_history::physical_rows(line, width)
 }
 
 /// Insert `lines` above the viewport using the terminal's backend writer
@@ -80,17 +76,14 @@ where
     let writer = terminal.backend_mut();
 
     let wrap_width = area.width.max(1) as usize;
-    let mut wrapped = Vec::new();
-    let mut wrapped_rows = 0usize;
-    for line in lines {
-        let line_wrapped = wrap_history_line(line, wrap_width);
-        wrapped_rows += line_wrapped
-            .iter()
-            .map(|line| physical_row_count(line, wrap_width))
-            .sum::<usize>();
-        wrapped.extend(line_wrapped);
-    }
-    let wrapped_lines = wrapped_rows as u16;
+    // Keep each logical line whole: the terminal marks wrapped rows as soft
+    // continuations and can reflow them when its width changes.
+    let wrapped = lines;
+    let wrapped_rows = wrapped
+        .iter()
+        .map(|line| physical_row_count(line, wrap_width))
+        .sum::<usize>();
+    let wrapped_lines = u16::try_from(wrapped_rows).unwrap_or(u16::MAX);
     let cursor_top = if area.bottom() < screen_size.height {
         // If the viewport is not at the bottom of the screen, scroll it down to make room.
         // Don't scroll it past the bottom of the screen.
@@ -163,17 +156,8 @@ where
     // fetch/restore the cursor position. insert_history_lines should be cursor-position-neutral :)
     queue!(writer, MoveTo(0, cursor_top))?;
 
-    for line in &wrapped {
+    for line in wrapped {
         queue!(writer, Print("\r\n"))?;
-        let physical_rows = physical_row_count(line, wrap_width);
-        if physical_rows > 1 {
-            queue!(writer, SavePosition)?;
-            for _ in 1..physical_rows {
-                queue!(writer, MoveDown(1), MoveToColumn(0))?;
-                queue!(writer, Clear(ClearType::UntilNewLine))?;
-            }
-            queue!(writer, RestorePosition)?;
-        }
         queue_colors(
             writer,
             line.style.fg.unwrap_or(Color::Reset),
@@ -196,7 +180,7 @@ where
     }
     terminal
         .written_history
-        .record(&wrapped, area.width, usize::from(screen_size.height));
+        .record(wrapped, area.width, usize::from(screen_size.height));
 
     Ok(true)
 }
@@ -230,13 +214,8 @@ where
     let mut total_rows: u16 = 0;
     let mut lines_consumed: usize = 0;
     for line in lines.iter() {
-        let wrapped_count = wrap_history_line(line, width)
-            .iter()
-            .map(|line| physical_row_count(line, width))
-            .sum::<usize>()
-            .try_into()
-            .unwrap_or(u16::MAX);
-        if total_rows + wrapped_count > available_rows {
+        let wrapped_count = u16::try_from(physical_row_count(line, width)).unwrap_or(u16::MAX);
+        if total_rows.saturating_add(wrapped_count) > available_rows {
             break;
         }
         total_rows += wrapped_count;
@@ -247,13 +226,8 @@ where
         return Ok(0);
     }
 
-    // Drain consumed lines and wrap them for writing.
+    // Preserve the original logical lines for the terminal's soft wrapping.
     let consumed: Vec<Line<'static>> = lines.drain(..lines_consumed).collect();
-    let wrapped = consumed
-        .iter()
-        .flat_map(|line| wrap_history_line(line, width))
-        .collect::<Vec<_>>();
-
     // Bottom-align: start writing from (available_rows - total_rows).
     let start_row = available_rows - total_rows;
 
@@ -266,14 +240,14 @@ where
         queue!(writer, MoveTo(0, row))?;
         queue!(writer, Clear(ClearType::UntilNewLine))?;
     }
-    write_lines_at(writer, &wrapped, start_row, width)?;
+    write_lines_at(writer, &consumed, start_row, width)?;
 
     // Restore cursor position.
     queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
     // Everything above the viewport was cleared or written just now.
     terminal.written_history.clear();
     terminal.written_history.record(
-        &wrapped,
+        &consumed,
         terminal.viewport_area.width,
         usize::from(screen_rows),
     );
@@ -487,6 +461,51 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Color;
 
+    #[test]
+    fn native_paragraph_keeps_styles_and_terminal_soft_wraps() {
+        use ratatui::style::Stylize;
+        let width = 20;
+        let backend = VT100Backend::new(width, 10);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        term.set_viewport_area(Rect::new(0, 9, width, 1));
+        let line = Line::from(vec![
+            "prefix ".into(),
+            "bold café 界".bold(),
+            " and trailing words continue".into(),
+        ]);
+        insert_history_lines(&mut term, &[line]).expect("write paragraph");
+        let screen = term.backend().vt100().screen();
+        let rows = screen.rows(0, width).collect::<Vec<_>>();
+        let start = rows
+            .iter()
+            .position(|row| row.starts_with("prefix "))
+            .expect("paragraph");
+        assert!(screen.row_wrapped(start as u16));
+        assert!(screen.cell(start as u16, 7).expect("bold cell").bold());
+        assert!(
+            rows.join("")
+                .contains("bold café 界 and trailing words continue")
+        );
+    }
+
+    #[test]
+    fn a_paragraph_taller_than_the_history_region_keeps_the_prompt_intact() {
+        let width = 20;
+        let backend = VT100Backend::new(width, 10);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        term.set_viewport_area(Rect::new(0, 7, width, 3));
+        queue!(term.backend_mut(), MoveTo(0, 8), Print("PROMPT")).expect("paint prompt");
+        insert_history_lines(&mut term, &[Line::from("long paragraph ".repeat(30))])
+            .expect("write history");
+        let rows = term
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect::<Vec<_>>();
+        assert!(rows[8].starts_with("PROMPT"), "{rows:?}");
+    }
+
     /// The spans of `line` with the line-level style merged in, as they are written.
     fn merged_line_spans(line: &Line<'_>) -> Vec<Span<'static>> {
         line.spans
@@ -670,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_url_history_wraps_prose_before_the_url() {
+    fn mixed_url_history_uses_terminal_soft_wrapping() {
         let width: u16 = 20;
         let height: u16 = 10;
         let backend = VT100Backend::new(width, height);
@@ -690,13 +709,18 @@ mod tests {
             .map(|row| row.trim_end().to_string())
             .collect::<Vec<_>>();
 
+        let first = rows
+            .iter()
+            .position(|row| row.starts_with("see phrase before"))
+            .expect("paragraph starts on screen");
         assert!(
-            rows.iter().any(|row| row == "see phrase before"),
-            "prose should wrap at a word boundary before the URL: {rows:?}",
+            term.backend().vt100().screen().row_wrapped(first as u16),
+            "{rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.starts_with("https://")),
-            "URL should begin as an intact token: {rows:?}",
+            rows.join("")
+                .contains("https://example.test/abcdefghijklmnopqrstuvwxyz"),
+            "{rows:?}"
         );
     }
 

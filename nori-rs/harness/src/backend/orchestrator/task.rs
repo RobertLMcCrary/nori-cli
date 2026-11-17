@@ -6,10 +6,6 @@ use nori_protocol::SubagentOutcome;
 use nori_protocol::acp::v1 as acp;
 use serde::Serialize;
 
-/// The final message of a task is returned whole up to this size; beyond it the start is kept and
-/// the rest is cut with a note, so one verbose child cannot fill the parent's context.
-pub(super) const MAX_RESULT_BYTES: usize = 48 * 1024;
-
 /// A task's id as the parent agent sees it: `task-1`, `task-2`, ... in the order they were
 /// delegated. Unique within one parent session.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -96,6 +92,8 @@ pub(super) enum Wake {
     Always,
     /// Only if the call waiting on it gave up first: a wait that returns the result delivers it.
     IfUnwaited,
+    /// A user-created history fork does not send its result to the parent.
+    Never,
     /// Held by the user stopping the parent; owed again once the user's next turn ends.
     AfterNextTurn,
 }
@@ -116,10 +114,14 @@ pub(super) type SharedProgress = std::sync::Arc<std::sync::Mutex<Progress>>;
 #[derive(Debug)]
 pub(super) struct TaskRecord {
     pub(super) id: TaskId,
+    /// An idle adopted session needs a follow-up anchor, but is not an agent task.
+    pub(super) adoption_anchor: bool,
     /// The child session the task runs on; follow-ups reuse it.
     pub(super) child: super::ChildKey,
     /// The session id the user's view shows this task under, unique to the task.
     pub(super) view_id: acp::SessionId,
+    /// The visible parent when a native child owns this fork.
+    pub(super) parent_view: Option<acp::SessionId>,
     pub(super) agent: String,
     pub(super) agent_name: String,
     pub(super) model: Option<String>,
@@ -146,8 +148,10 @@ impl TaskRecord {
     pub(super) fn follow_up(&self, view_id: acp::SessionId) -> Self {
         Self {
             id: self.id.clone(),
+            adoption_anchor: false,
             child: self.child,
             view_id,
+            parent_view: self.parent_view.clone(),
             agent: self.agent.clone(),
             agent_name: self.agent_name.clone(),
             model: self.model.clone(),
@@ -281,38 +285,5 @@ pub(super) fn stop_reason_label(reason: acp::StopReason) -> &'static str {
         acp::StopReason::Cancelled => "cancelled",
         // The schema's stop reasons are not exhaustive.
         _ => "other",
-    }
-}
-
-/// Keep at most [`MAX_RESULT_BYTES`] of `text`, cut on a character boundary, with a note saying
-/// how much was left out.
-pub(super) fn bounded_result(text: &str) -> String {
-    let text = text.trim();
-    if text.len() <= MAX_RESULT_BYTES {
-        return text.to_owned();
-    }
-    let mut end = MAX_RESULT_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n\n[… {} more bytes of the child's final message were cut]",
-        &text[..end],
-        text.len() - end
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn long_results_are_cut_on_a_character_boundary_with_a_note() {
-        let text = "é".repeat(MAX_RESULT_BYTES);
-        let bounded = bounded_result(&text);
-        assert!(bounded.starts_with(&"é".repeat(MAX_RESULT_BYTES / 2)));
-        assert!(bounded.ends_with("more bytes of the child's final message were cut]"));
-        assert_eq!(bounded_result("  short  "), "short");
     }
 }

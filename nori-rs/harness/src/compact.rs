@@ -297,7 +297,13 @@ mod tests {
                 ),
             )
         }));
-        Transcript { meta, entries }
+        Transcript {
+            meta,
+            entries,
+            backend_binding: None,
+            requires_fresh_binding: false,
+            event_ids: Vec::new(),
+        }
     }
 
     fn user(text: &str) -> SessionEvent {

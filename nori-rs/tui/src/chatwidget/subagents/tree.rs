@@ -46,6 +46,11 @@ pub(crate) struct FinishedSubagent {
 /// A child that finished, kept so the subagent switcher can still show what it did.
 #[derive(Debug)]
 pub(super) struct EndedRecord {
+    pub(super) session_id: Option<SessionId>,
+    pub(super) agent: Option<String>,
+    pub(super) work_at: Instant,
+    pub(super) history_parent: Option<NodeId>,
+    pub(super) revision: i64,
     pub(super) finished: FinishedSubagent,
     /// The label of the running subagent that started it, when it had one.
     pub(super) parent: Option<String>,
@@ -77,6 +82,7 @@ pub(crate) enum ChildTarget<'a> {
 pub(crate) struct SubagentTree {
     /// Running subagents by id, so iteration is in the order they appeared.
     pub(super) live: BTreeMap<NodeId, Node>,
+    idle_count: i64,
     by_session: HashMap<SessionId, Link>,
     by_launcher: HashMap<String, Link>,
     root_session_id: Option<SessionId>,
@@ -97,6 +103,7 @@ impl SubagentTree {
     pub(crate) fn new(cwd: std::path::PathBuf, animations: bool) -> Self {
         Self {
             live: BTreeMap::new(),
+            idle_count: 0,
             by_session: HashMap::new(),
             by_launcher: HashMap::new(),
             root_session_id: None,
@@ -128,11 +135,17 @@ impl SubagentTree {
     }
 
     pub(crate) fn running_count(&self) -> usize {
-        self.live.len()
+        self.live
+            .len()
+            .saturating_sub(usize::try_from(self.idle_count).unwrap_or(0))
     }
 
     pub(crate) fn has_running(&self) -> bool {
-        !self.live.is_empty()
+        self.running_count() > 0
+    }
+
+    pub(crate) fn visible_count(&self) -> usize {
+        self.live.len() + self.ended.len()
     }
 
     /// Children that finished since the last call, in completion order.
@@ -207,6 +220,7 @@ impl SubagentTree {
             return;
         }
         node.parent = Some(parent);
+        node.history_parent = Some(parent);
         if let Some(parent) = self.live.get_mut(&parent) {
             parent.children.insert(child);
         }
@@ -219,19 +233,33 @@ impl SubagentTree {
         };
         if let Some(Link::Live(parent)) = self.by_session.get(&update.parent_session_id).copied() {
             self.adopt(parent, id);
+        } else if let Some(parent) = self.ended.iter().find_map(|(parent, record)| {
+            (record.session_id.as_ref() == Some(&update.parent_session_id)).then_some(*parent)
+        }) && let Some(node) = self.live.get_mut(&id)
+        {
+            node.history_parent = Some(parent);
         }
         if let Some(node) = self.live.get_mut(&id) {
             update.title.apply_to(&mut node.title);
             update.description.apply_to(&mut node.description);
+            update.agent.apply_to(&mut node.agent);
             node.touch();
         }
         match update.state {
             nori_protocol::Patch::Set(SubagentState::Ended(outcome)) => {
                 self.finish(id, outcome, None, now);
             }
-            nori_protocol::Patch::Set(SubagentState::Running)
-            | nori_protocol::Patch::Keep
-            | nori_protocol::Patch::Clear => {}
+            nori_protocol::Patch::Set(state @ (SubagentState::Running | SubagentState::Idle)) => {
+                if let Some(node) = self.live.get_mut(&id) {
+                    let idle = matches!(state, SubagentState::Idle);
+                    if idle != node.idle {
+                        self.idle_count += if idle { 1 } else { -1 };
+                        node.idle = idle;
+                        node.touch();
+                    }
+                }
+            }
+            nori_protocol::Patch::Keep | nori_protocol::Patch::Clear => {}
         }
     }
 
@@ -279,6 +307,7 @@ impl SubagentTree {
         if let Some(node) = self.live.get_mut(&child) {
             node.launcher_call_id = Some(call_id.to_owned());
             node.started_at = stand_in.started_at.min(node.started_at);
+            node.work_at = node.work_at.max(stand_in.work_at);
             node.tool_count += stand_in.tool_count;
             if node.description.is_none() {
                 node.description = stand_in.description;
@@ -359,6 +388,15 @@ impl SubagentTree {
             ChildTarget::Launcher(call_id) => self.node_for_launcher(call_id, now),
         };
         if let Some(node) = id.and_then(|id| self.live.get_mut(&id)) {
+            if matches!(
+                update,
+                acp::SessionUpdate::UserMessageChunk(_)
+                    | acp::SessionUpdate::AgentMessageChunk(_)
+                    | acp::SessionUpdate::ToolCall(_)
+                    | acp::SessionUpdate::ToolCallUpdate(_)
+            ) {
+                node.work_at = now;
+            }
             node.apply(update, &self.context.cwd, self.context.animations);
         }
     }
@@ -378,8 +416,12 @@ impl SubagentTree {
         let Some(mut node) = self.live.remove(&id) else {
             return;
         };
-        if let Some(session_id) = node.session_id.take() {
-            self.by_session.insert(session_id, Link::Ended);
+        if node.idle {
+            self.idle_count -= 1;
+        }
+        let session_id = node.session_id.take();
+        if let Some(session_id) = &session_id {
+            self.by_session.insert(session_id.clone(), Link::Ended);
         }
         if let Some(call_id) = node.launcher_call_id.take() {
             self.by_launcher.insert(call_id, Link::Ended);
@@ -408,6 +450,11 @@ impl SubagentTree {
         self.ended.insert(
             id,
             EndedRecord {
+                session_id,
+                agent: node.agent.clone(),
+                work_at: node.work_at,
+                history_parent: node.history_parent,
+                revision: i64::MIN,
                 finished: finished.clone(),
                 parent: parent_label,
                 ended_at: now,
@@ -443,7 +490,7 @@ impl SubagentTree {
         let ending: Vec<NodeId> = self
             .live
             .iter()
-            .filter(|(_, node)| cancelled || node.session_id.is_none())
+            .filter(|(_, node)| !node.idle && (cancelled || node.session_id.is_none()))
             .map(|(id, _)| *id)
             .collect();
         for id in ending {
@@ -456,10 +503,10 @@ impl SubagentTree {
         }
     }
 
-    /// Running nodes in display order, each with its depth: a child follows its parent, children
+    /// Live nodes in display order, each with its depth: a child follows its parent, children
     /// in the order they appeared. Stops after `limit` nodes, so a frame visits only the nodes it
     /// shows.
-    pub(super) fn display_order(&self, limit: usize) -> Vec<(&Node, usize)> {
+    pub(super) fn display_order(&self, limit: usize) -> Vec<(NodeId, &Node, usize)> {
         let mut out = Vec::new();
         let mut stack: Vec<(NodeId, usize)> = Vec::new();
         for (id, node) in &self.live {
@@ -474,8 +521,14 @@ impl SubagentTree {
                 let Some(node) = self.live.get(&id) else {
                     continue;
                 };
-                out.push((node, depth));
-                stack.extend(node.children.iter().rev().map(|child| (*child, depth + 1)));
+                out.push((id, node, depth));
+                let child_depth = depth + 1;
+                stack.extend(
+                    node.children
+                        .iter()
+                        .rev()
+                        .map(|child| (*child, child_depth)),
+                );
             }
         }
         out

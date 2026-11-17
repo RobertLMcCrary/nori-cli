@@ -8,7 +8,6 @@ use crate::AskForApproval;
 use crate::McpServerConfig;
 use crate::SandboxMode;
 use crate::SandboxPolicy;
-use crate::TrustLevel;
 use crate::git_root::resolve_root_git_project_for_trust;
 use anyhow::Context;
 use anyhow::Result;
@@ -91,6 +90,25 @@ impl NoriConfig {
             raw_overrides: _,
         } = overrides;
 
+        let (vim_mode, kakoune_mode) = match toml.tui.editor_mode.as_deref() {
+            Some("kakoune" | "helix") => (super::types::VimEnterBehavior::Off, true),
+            Some("standard") => (super::types::VimEnterBehavior::Off, false),
+            Some("vim") => (
+                toml.tui
+                    .vim_mode
+                    .filter(super::types::VimEnterBehavior::is_enabled)
+                    .unwrap_or(super::types::VimEnterBehavior::Submit),
+                false,
+            ),
+            Some(other) => anyhow::bail!(
+                "unknown [tui] editor_mode {other:?}; expected kakoune, helix, vim, or standard"
+            ),
+            None => (
+                toml.tui.vim_mode.unwrap_or_default(),
+                toml.tui.vim_mode.is_none(),
+            ),
+        };
+
         let process_cwd = std::env::current_dir().unwrap_or_default();
         let cwd = resolve_path(cwd.unwrap_or_else(|| process_cwd.clone()), &process_cwd);
         let active_project = toml
@@ -107,7 +125,7 @@ impl NoriConfig {
             .unwrap_or_default();
         let sandbox_mode = sandbox_mode_override
             .or(toml.sandbox_mode)
-            .unwrap_or(SandboxMode::WorkspaceWrite);
+            .unwrap_or(SandboxMode::DangerFullAccess);
         let mut sandbox_policy = match sandbox_mode {
             SandboxMode::ReadOnly => SandboxPolicy::new_read_only_policy(),
             SandboxMode::WorkspaceWrite => toml
@@ -130,12 +148,9 @@ impl NoriConfig {
                 }
             }
         }
-        let approval_policy = approval_policy_override.or(toml.approval_policy).unwrap_or(
-            match active_project.trust_level {
-                Some(TrustLevel::Untrusted) => AskForApproval::UnlessTrusted,
-                Some(TrustLevel::Trusted) | None => AskForApproval::OnRequest,
-            },
-        );
+        let approval_policy = approval_policy_override
+            .or(toml.approval_policy)
+            .unwrap_or(AskForApproval::Never);
 
         // Resolve MCP servers
         let mcp_servers = resolve_mcp_servers(toml.mcp_servers)?;
@@ -222,7 +237,8 @@ impl NoriConfig {
                 .tui
                 .notify_after_idle
                 .unwrap_or(super::types::NotifyAfterIdle::FiveSeconds),
-            vim_mode: toml.tui.vim_mode.unwrap_or_default(),
+            vim_mode,
+            kakoune_mode,
             hotkeys: super::types::HotkeyConfig::from_toml(&toml.tui.hotkeys),
             script_timeout: toml.tui.script_timeout.unwrap_or_default(),
             loop_count: toml.tui.loop_count,
@@ -1262,6 +1278,82 @@ args = ["--acp"]
 
         let config = NoriConfig::load_from_path(&config_path).unwrap();
         assert!(config.agents.is_empty());
+    }
+
+    #[test]
+    fn loads_kakoune_editor_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join(CONFIG_FILE);
+        std::fs::write(&config_path, "[tui]\neditor_mode = \"kakoune\"\n").unwrap();
+        let config = NoriConfig::load_from_path(&config_path).unwrap();
+        assert!(config.kakoune_mode);
+    }
+
+    #[test]
+    fn defaults_to_selection_editor_and_respects_explicit_overrides() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        for (source, kakoune, vim) in [
+            ("", true, crate::VimEnterBehavior::Off),
+            (
+                "[tui]\neditor_mode = \"standard\"\n",
+                false,
+                crate::VimEnterBehavior::Off,
+            ),
+            (
+                "[tui]\neditor_mode = \"vim\"\n",
+                false,
+                crate::VimEnterBehavior::Submit,
+            ),
+            (
+                "[tui]\nvim_mode = true\n",
+                false,
+                crate::VimEnterBehavior::Submit,
+            ),
+            (
+                "[tui]\nvim_mode = false\n",
+                false,
+                crate::VimEnterBehavior::Off,
+            ),
+            (
+                "[tui]\neditor_mode = \"kakoune\"\nvim_mode = \"submit\"\n",
+                true,
+                crate::VimEnterBehavior::Off,
+            ),
+            (
+                "[tui]\neditor_mode = \"helix\"\nvim_mode = \"submit\"\n",
+                true,
+                crate::VimEnterBehavior::Off,
+            ),
+            (
+                "[tui]\neditor_mode = \"standard\"\nvim_mode = \"submit\"\n",
+                false,
+                crate::VimEnterBehavior::Off,
+            ),
+            (
+                "[tui]\neditor_mode = \"vim\"\nvim_mode = false\n",
+                false,
+                crate::VimEnterBehavior::Submit,
+            ),
+        ] {
+            std::fs::write(&path, source).unwrap();
+            let config = NoriConfig::load_from_path(&path).unwrap();
+            assert_eq!(
+                (config.kakoune_mode, config.vim_mode),
+                (kakoune, vim),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_editor_mode_has_an_actionable_error() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        std::fs::write(&path, "[tui]\neditor_mode = \"bogus\"\n").unwrap();
+        let error = NoriConfig::load_from_path(&path).unwrap_err().to_string();
+        assert!(error.contains("unknown [tui] editor_mode"));
+        assert!(error.contains("helix"));
     }
 
     #[test]

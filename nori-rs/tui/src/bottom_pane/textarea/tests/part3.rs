@@ -341,8 +341,8 @@ fn test_configurable_kill_and_yank() {
     let mut t = ta_with("hello world");
     t.set_hotkey_config(HotkeyConfig::default());
     t.set_cursor(5);
-    // Ctrl+K should kill to end of line
-    t.input(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    // Alt+K should kill to end of line
+    t.input(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
     pretty_assertions::assert_eq!(t.text(), "hello");
     pretty_assertions::assert_eq!(t.cursor(), 5);
     // Ctrl+Y should yank back

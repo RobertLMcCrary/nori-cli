@@ -18,6 +18,9 @@ use nori_harness::ConversationId;
 /// Aggregates all backtrack-related state used by the App.
 #[derive(Default)]
 pub(crate) struct BacktrackState {
+    pub(crate) response_focus: Option<crate::app::response_focus::ResponseFocus>,
+    pub(crate) pending_child_focus: Option<crate::app::child_navigation::PendingChildFocus>,
+    pub(crate) child_focus_sequence: i64,
     /// True when Esc has primed backtrack mode in the main view.
     pub(crate) primed: bool,
     /// Session id of the base conversation to fork from.
@@ -53,7 +56,12 @@ impl App {
                 ..
             })
         );
-        if menu_open || !is_esc {
+        let response_focus = matches!(&self.overlay, Some(Overlay::Transcript(transcript)) if transcript.is_response_focus());
+        if menu_open
+            || response_focus
+            || !is_esc
+            || self.session_view.focused() != crate::subagent_switcher::Target::Main
+        {
             self.overlay_forward_event(tui, event)?;
         } else if self.backtrack.overlay_preview_active {
             self.overlay_step_backtrack(tui, event)?;
@@ -106,9 +114,8 @@ impl App {
         }
     }
 
-    /// Open transcript overlay (enters alternate screen and shows full transcript).
+    /// Open the transcript overlay.
     pub(crate) fn open_transcript_overlay(&mut self, tui: &mut tui::Tui) {
-        let _ = tui.enter_alt_screen();
         // Clicks select messages and the wheel scrolls while it is open.
         let _ = tui.set_mouse_capture(true);
         self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
@@ -117,12 +124,17 @@ impl App {
 
     /// Close transcript overlay and restore normal UI.
     pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) {
+        if self.overlay.is_none() {
+            return;
+        }
         let _ = tui.set_mouse_capture(false);
-        let _ = tui.leave_alt_screen();
+        tui.request_full_repaint();
         let was_backtrack = self.backtrack.overlay_preview_active;
         if self.transcript_reflow.has_pending_reflow() {
             self.deferred_history_lines.clear();
-        } else if !self.deferred_history_lines.is_empty() {
+        } else if self.session_view.focused() == crate::subagent_switcher::Target::Main
+            && !self.deferred_history_lines.is_empty()
+        {
             let lines = std::mem::take(&mut self.deferred_history_lines);
             tui.insert_history_lines(lines);
         }
@@ -137,15 +149,9 @@ impl App {
         }
     }
 
-    /// Re-render the full transcript into the terminal scrollback in one call.
-    /// Useful when switching sessions to ensure prior history remains visible.
+    /// Refresh the active view without replaying native terminal history.
     pub(crate) fn render_transcript_once(&mut self, tui: &mut tui::Tui) {
-        if !self.transcript_cells.is_empty() {
-            let width = tui.terminal.last_known_screen_size.width;
-            for cell in &self.transcript_cells {
-                tui.insert_history_lines(cell.display_lines(width));
-            }
-        }
+        tui.frame_requester().schedule_frame();
     }
 
     /// Initialize backtrack state and show composer hint.
@@ -396,7 +402,11 @@ pub(crate) fn build_fork_summary(
         let any = cell.as_any();
         if let Some(user) = any.downcast_ref::<UserHistoryCell>() {
             summary.push_str(&format!("User: {}\n", user.message));
-        } else if any.downcast_ref::<AgentMessageCell>().is_some() {
+        } else if any.downcast_ref::<AgentMessageCell>().is_some()
+            || any
+                .downcast_ref::<crate::history_cell::AgentMarkdownCell>()
+                .is_some()
+        {
             // Extract plain text from the display lines
             let lines = cell.display_lines(u16::MAX);
             let text: String = lines

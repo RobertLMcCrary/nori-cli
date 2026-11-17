@@ -4,20 +4,39 @@ const AGENT_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// How long the agent picker's cursor stays on a row before that agent starts warming.
 const WARM_CANDIDATE_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 
+#[derive(Debug)]
+pub(super) struct AgentPreparationTimeout;
+
+impl std::fmt::Display for AgentPreparationTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "timed out preparing agent after {}s",
+            AGENT_PREPARATION_TIMEOUT.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for AgentPreparationTimeout {}
+
+pub(super) struct ManualModelHandoff {
+    pub(super) recorder: std::sync::Arc<nori_harness::transcript::TranscriptRecorder>,
+    pub(super) context: String,
+    pub(super) source_generation: crate::app_event::SessionGeneration,
+    pub(super) effort: Option<String>,
+}
+
 async fn prepare_agent_with_timeout(
     spec: nori_harness::runtime::AgentPrepareSpec,
-) -> Result<nori_harness::runtime::PreparedAgent, String> {
+) -> anyhow::Result<nori_harness::runtime::PreparedAgent> {
     match tokio::time::timeout(
         AGENT_PREPARATION_TIMEOUT,
         nori_harness::runtime::prepare_agent(spec),
     )
     .await
     {
-        Ok(result) => result.map_err(|error| format!("{error:#}")),
-        Err(_) => Err(format!(
-            "timed out preparing agent after {}s",
-            AGENT_PREPARATION_TIMEOUT.as_secs(),
-        )),
+        Ok(result) => result,
+        Err(_) => Err(anyhow::Error::new(AgentPreparationTimeout)),
     }
 }
 
@@ -136,66 +155,94 @@ impl App {
         Ok(Some(agent))
     }
 
-    /// Switch to `agent_name` now. The conversation is replaced at once by an empty one for the
-    /// new agent, whose connection is prepared behind it; what is typed meanwhile is queued
-    /// until it is ready, exactly as at startup. An agent already warmed for the picker row is
-    /// used as it is, and the switch takes no time at all.
-    pub(crate) async fn switch_agent(&mut self, tui: &mut crate::tui::Tui, agent_name: String) {
-        self.cancel_warm_pause();
-        let warm = match &self.candidate_agent {
-            Some(CandidateAgent::Prepared {
-                agent_name: warmed,
-                speculative: true,
-                ..
-            }) if *warmed == agent_name => match self.candidate_agent.take() {
-                Some(CandidateAgent::Prepared { agent, .. }) => Some(*agent),
-                _ => None,
-            },
-            _ => None,
-        };
-        self.discard_candidate();
-        self.cancel_primary_agent_preparation();
-        if let Some(stale) = self.prepared_agent.take() {
-            tokio::spawn(stale.shutdown());
-        }
-        self.prepared_agent_initial_context = None;
-
-        self.config.active_agent = agent_name.clone();
-        self.config.agent = agent_name.clone();
-        self.pending_session_activation = Some(PendingSessionActivation::New);
-        self.deferred_spawn_pending = false;
-        // The connection only needs the in-memory config, so it starts before
-        // anything else here; the rest of the switch overlaps the adapter's boot.
-        if warm.is_none() {
-            self.begin_agent_preparation(crate::app_event::AgentPrepareIntent::Idle);
-        }
-        // Writing the choice to disk is for the next launch, not this one.
-        let persist = ConfigEditsBuilder::new(&self.config.nori_home).set_agent(&agent_name);
-        tokio::spawn(async move {
-            if let Err(error) = persist.apply().await {
-                tracing::error!(%error, "failed to persist the selected agent");
+    pub(crate) async fn select_agent_model(
+        &mut self,
+        agent_name: String,
+        display_name: String,
+        model: String,
+    ) {
+        if self.fallback.is_none()
+            && self.manual_model_handoff.is_none()
+            && let Some(handle) = self.chat_widget.harness_handle()
+        {
+            if self.chat_widget.is_task_running() {
+                self.model_route_fallback = None;
+                self.app_event_tx.send(AppEvent::ShowToast(
+                    "Wait for the current response before switching models".to_owned(),
+                ));
+                return;
             }
-        });
-        let (initial_prompt, initial_images) = self.chat_widget.take_initial_input();
-        let composer_draft = self.chat_widget.take_composer_draft();
-        self.shutdown_current_conversation();
-        let init = self.chat_widget_init(
-            tui.frame_requester(),
-            initial_prompt,
-            initial_images,
-            None,
-            true,
-            None,
-        );
-        self.chat_widget = ChatWidget::new(init);
-        self.configure_new_chat_widget();
-        self.chat_widget.restore_composer_draft(composer_draft);
-        self.chat_widget.show_agent_in_footer();
-        if let Some(agent) = warm {
-            self.prepared_agent = Some(agent);
-            self.app_event_tx.send(AppEvent::NewSession);
+            let recorder = match handle.conversation_recorder().await {
+                Ok(Some(recorder)) => recorder,
+                Ok(None) => {
+                    self.model_route_fallback = None;
+                    self.app_event_tx.send(AppEvent::ShowToast(
+                        "Can't switch models without the conversation journal".to_owned(),
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    self.model_route_fallback = None;
+                    self.app_event_tx.send(AppEvent::ShowToast(format!(
+                        "Couldn't prepare model switch: {error}"
+                    )));
+                    return;
+                }
+            };
+            let context = match recorder.visible_context().await {
+                Ok(context) => context,
+                Err(error) => {
+                    self.model_route_fallback = None;
+                    self.app_event_tx.send(AppEvent::ShowToast(format!(
+                        "Couldn't read conversation: {error}"
+                    )));
+                    return;
+                }
+            };
+            let effort = self
+                .chat_widget
+                .agent_config()
+                .effort_option()
+                .and_then(|option| match &option.raw.kind {
+                    nori_protocol::acp::v1::SessionConfigKind::Select(select) => {
+                        Some(select.current_value.to_string())
+                    }
+                    _ => None,
+                });
+            self.manual_model_handoff = Some(ManualModelHandoff {
+                recorder,
+                context,
+                source_generation: self.chat_widget.session_generation(),
+                effort,
+            });
         }
-        tui.frame_requester().schedule_frame();
+        self.cancel_warm_pause();
+        // Activation refreshes context and recorder even for a warmed connection.
+        match self.candidate_agent.as_mut() {
+            Some(CandidateAgent::Preparing {
+                agent_name: warm,
+                speculative,
+                ..
+            }) if *warm == agent_name && *speculative => {
+                *speculative = false;
+                self.pending_candidate_model = Some((agent_name, model));
+                return;
+            }
+            Some(CandidateAgent::Prepared {
+                agent_name: warm,
+                speculative,
+                ..
+            }) if *warm == agent_name && *speculative => {
+                *speculative = false;
+                self.pending_candidate_model = Some((agent_name, model));
+                self.app_event_tx.send(AppEvent::NewSession);
+                return;
+            }
+            _ => {}
+        }
+        self.discard_candidate();
+        self.pending_candidate_model = Some((agent_name.clone(), model));
+        self.start_candidate_preparation(agent_name, display_name, false);
     }
 
     fn start_candidate_preparation(
@@ -205,8 +252,28 @@ impl App {
         speculative: bool,
     ) {
         let generation = crate::chatwidget::agent::next_session_generation();
-        let spec =
-            crate::chatwidget::agent::agent_prepare_spec(self.config_for_agent(&agent_name), None);
+        let initial_context = self
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.context.clone())
+            .or_else(|| {
+                self.manual_model_handoff
+                    .as_ref()
+                    .map(|handoff| handoff.context.clone())
+            });
+        let mut spec = crate::chatwidget::agent::agent_prepare_spec(
+            self.config_for_agent(&agent_name),
+            initial_context,
+        );
+        spec.handoff = self
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.recorder.clone())
+            .or_else(|| {
+                self.manual_model_handoff
+                    .as_ref()
+                    .map(|handoff| handoff.recorder.clone())
+            });
         let tx = self.app_event_tx.clone();
         let prepared_agent_name = agent_name.clone();
         let task = tokio::spawn(async move {
@@ -324,6 +391,7 @@ impl App {
     }
 
     pub(crate) fn discard_candidate(&mut self) {
+        self.pending_candidate_model = None;
         self.cancel_warm_pause();
         self.drop_candidate();
         self.chat_widget.set_login_agent_override(None);

@@ -141,6 +141,11 @@ async fn load_agent(
 
     let config_overrides = ConfigOverrides {
         codex_linux_sandbox_exe: codex_linux_sandbox_exe.clone(),
+        // Nori's ACP sessions always use its full-access, no-approval policy.
+        // Explicit harness overrides also take precedence over a resumed thread's saved profile.
+        approval_policy: host_tools.then_some(codex_protocol::protocol::AskForApproval::Never),
+        sandbox_mode: host_tools
+            .then_some(codex_protocol::config_types::SandboxMode::DangerFullAccess),
         ..ConfigOverrides::default()
     };
 

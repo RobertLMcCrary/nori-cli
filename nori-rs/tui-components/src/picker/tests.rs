@@ -435,7 +435,7 @@ fn fallback_theme_distinguishes_focused_and_unfocused_checked_rows() {
         PickerOutcome::Toggled { selected: true, .. }
     ));
 
-    let buffer = rendered_picker_buffer(&state, 48, 10);
+    let buffer = rendered_picker_buffer(&state, 48, 12);
     let first = find_ascii_text_at_or_below(&buffer, "First action", 2).expect("first row");
     let second = find_ascii_text_at_or_below(&buffer, "Second action", 2).expect("second row");
     assert_eq!(buffer[(2, first.1)].symbol(), "●");
@@ -457,7 +457,7 @@ fn picker_selection_rails_are_explicit_and_preserve_checked_state() {
         PickerOutcome::Toggled { selected: true, .. }
     ));
 
-    let default_buffer = rendered_picker_buffer(&state, 48, 10);
+    let default_buffer = rendered_picker_buffer(&state, 48, 12);
     let default_first =
         find_ascii_text_at_or_below(&default_buffer, "First action", 2).expect("default row");
     let default_description =
@@ -468,7 +468,7 @@ fn picker_selection_rails_are_explicit_and_preserve_checked_state() {
         assert_eq!(find_symbols_on_row(&default_buffer, y, "▕"), Vec::new());
     }
 
-    let rails_buffer = rendered_picker_buffer_with_rails(&state, 48, 10);
+    let rails_buffer = rendered_picker_buffer_with_rails(&state, 48, 12);
     let rails_first =
         find_ascii_text_at_or_below(&rails_buffer, "First action", 2).expect("railed row");
     let description = find_ascii_text_at_or_below(&rails_buffer, "First description", 2)
@@ -488,7 +488,7 @@ fn picker_selection_rails_are_explicit_and_preserve_checked_state() {
     assert_eq!(find_symbol_on_row(&rails_buffer, rails_first.1, "›"), None);
 
     state.handle(PickerAction::MoveDown);
-    let mixed_buffer = rendered_picker_buffer_with_rails(&state, 48, 10);
+    let mixed_buffer = rendered_picker_buffer_with_rails(&state, 48, 12);
     let first = find_ascii_text_at_or_below(&mixed_buffer, "First action", 2).expect("first row");
     let second =
         find_ascii_text_at_or_below(&mixed_buffer, "Second action", 2).expect("second row");

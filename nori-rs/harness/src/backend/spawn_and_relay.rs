@@ -54,6 +54,7 @@ pub(super) fn inject_default_model(
 async fn forward_setup_event(
     backend_event_tx: &mpsc::Sender<BackendEvent>,
     event: crate::connection::ConnectionEvent,
+    agent: &str,
 ) -> Result<bool> {
     match event {
         crate::connection::ConnectionEvent::Acp(event) => {
@@ -67,9 +68,15 @@ async fn forward_setup_event(
         crate::connection::ConnectionEvent::Subagent(wire) => {
             forward_public_session_events(
                 backend_event_tx,
-                [SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(wire))],
+                [SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(
+                    subagent_identity::native_child(wire, agent),
+                ))],
             )
             .await?;
+            Ok(false)
+        }
+        crate::connection::ConnectionEvent::Barrier(reply) => {
+            let _ = reply.send(());
             Ok(false)
         }
         crate::connection::ConnectionEvent::DelegatedRequest(request) => {
@@ -95,13 +102,14 @@ async fn forward_setup_event(
 async fn forward_setup_events_through_response(
     event_rx: &mut mpsc::Receiver<crate::connection::ConnectionEvent>,
     backend_event_tx: &mpsc::Sender<BackendEvent>,
+    agent: &str,
 ) -> Result<()> {
     loop {
         let event = event_rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("ACP bootstrap event stream closed"))?;
-        if forward_setup_event(backend_event_tx, event).await? {
+        if forward_setup_event(backend_event_tx, event, agent).await? {
             return Ok(());
         }
     }
@@ -110,9 +118,10 @@ async fn forward_setup_events_through_response(
 async fn forward_available_setup_events(
     event_rx: &mut mpsc::Receiver<crate::connection::ConnectionEvent>,
     backend_event_tx: &mpsc::Sender<BackendEvent>,
+    agent: &str,
 ) -> Result<()> {
     while let Ok(event) = event_rx.try_recv() {
-        forward_setup_event(backend_event_tx, event).await?;
+        forward_setup_event(backend_event_tx, event, agent).await?;
     }
     Ok(())
 }
@@ -167,7 +176,20 @@ impl AcpBackend {
         let thread_goal_state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
         let goal_mcp_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let goal_mcp_http_server = Arc::new(Mutex::new(None));
-        let workflow: Arc<Mutex<workflow::WorkflowState>> = Arc::default();
+        let policy_before_session =
+            super::host_tools::accepted_by(&connection) || nori_client_mcp::reachable(&connection);
+        let (workflow, machine_snapshot) = if policy_before_session {
+            workflow::prepare_workflow(
+                &config.nori_home,
+                &cwd,
+                orchestrator.project_trusted(),
+                orchestrator.is_child(),
+                None,
+            )
+            .await?
+        } else {
+            (Arc::default(), Arc::new(tokio::sync::OnceCell::new()))
+        };
 
         let mut mcp_servers = crate::connection::mcp::to_acp_mcp_servers(
             &config.mcp_servers,
@@ -202,7 +224,8 @@ impl AcpBackend {
             prewarm::others(config.agent.clone(), cwd.clone(), &servers);
         }
         let setup_forward_result =
-            forward_setup_events_through_response(&mut event_rx, &backend_event_tx).await;
+            forward_setup_events_through_response(&mut event_rx, &backend_event_tx, &config.agent)
+                .await;
         let session_id = match session_result {
             Ok(id) => {
                 setup_forward_result?;
@@ -222,10 +245,17 @@ impl AcpBackend {
         if let Some(ref default_model) = config.default_model {
             session_defaults::apply_default_model(&connection, &session_id, default_model).await;
         }
-        forward_available_setup_events(&mut event_rx, &backend_event_tx).await?;
+        forward_available_setup_events(&mut event_rx, &backend_event_tx, &config.agent).await?;
 
-        let capabilities_update =
-            nori_client_mcp::capabilities_update_for_session(&connection, &goal_mcp_connected);
+        let capabilities_update = nori_client_mcp::capabilities_update_for_session(
+            &connection,
+            &goal_mcp_connected,
+            goal_mcp_http_server
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(nori_client_mcp::NoriClient::has_goal_tools),
+        );
 
         let connection = Arc::new(connection);
         let pending_approvals = Arc::new(Mutex::new(Vec::new()));
@@ -247,27 +277,31 @@ impl AcpBackend {
         // Get history metadata
         let (history_log_id, history_entry_count) = history_task.await.unwrap_or_default();
 
-        // Initialize transcript recorder (non-fatal if it fails).
-        // A child keeps no transcript of its own: its parent's shows what it did.
-        let transcript_recorder = if config.delegation.is_child() {
+        // Initialize a canonical transcript for every session, including delegated children.
+        // The parent's separate transcript retains relayed child events for its own replay.
+        let transcript_recorder = if !config.delegation.record_transcript {
             None
+        } else if let Some(recorder) = &config.handoff {
+            Some(Arc::clone(recorder))
         } else {
-            match TranscriptRecorder::new(
-                &config.nori_home,
-                &cwd,
-                Some(config.agent.clone()),
-                &config.cli_version,
-                Some(session_id.to_string()),
-            )
-            .await
-            {
-                Ok(recorder) => Some(Arc::new(recorder)),
-                Err(e) => {
-                    warn!("Failed to initialize transcript recorder: {e}");
-                    None
-                }
-            }
+            Some(Arc::new(
+                TranscriptRecorder::new(
+                    &config.nori_home,
+                    &cwd,
+                    Some(config.agent.clone()),
+                    &config.cli_version,
+                    Some(session_id.to_string()),
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to initialize canonical transcript: {error}")
+                })?,
+            ))
         };
+        if policy_before_session {
+            workflow::record_prepared_snapshot(transcript_recorder.as_ref(), &machine_snapshot)
+                .await;
+        }
         let transcript_id = transcript_recorder
             .as_ref()
             .map(|recorder| recorder.session_id().to_string());
@@ -278,15 +312,48 @@ impl AcpBackend {
             .as_ref()
             .and_then(|recorder| ConversationId::from_string(recorder.session_id()).ok())
             .unwrap_or_default();
+        if config.handoff.is_none()
+            && let Some(recorder) = &transcript_recorder
+            && let Err(error) = recorder
+                .record_backend_bound(
+                    serde_json::json!({
+                        "agent": config.agent,
+                        "acp_session_id": session_id.to_string(),
+                    })
+                    .to_string(),
+                )
+                .await
+        {
+            warn!(%error, "Failed to record initial backend binding");
+        }
         let pending_hook_context = session_context_for_connection(config, &connection);
         let goal_ext_capability =
             goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta());
+        let transcript_recorder_cell = Arc::new(RwLock::new(transcript_recorder));
+        let native_children = Arc::new(super::native_child_sessions::NativeChildren::default());
+        if transcript_recorder_cell
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|recorder| recorder.has_conversation_log())
+        {
+            native_children
+                .configure_history(Arc::new(super::native_child_history::NativeHistory::new(
+                    config.nori_home.clone(),
+                    config.cwd.clone(),
+                    config.agent.clone(),
+                    config.cli_version.clone(),
+                    transcript_recorder_cell.clone(),
+                )))
+                .await;
+        }
         let backend = Self {
             connection,
             session_id: Arc::new(RwLock::new(session_id)),
             backend_event_tx: backend_event_tx.clone(),
             cwd: cwd.clone(),
             pending_approvals: Arc::clone(&pending_approvals),
+            withdrawn_questions: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_prompt_submissions: Arc::new(Mutex::new(HashMap::new())),
             user_notifier: Arc::clone(&user_notifier),
             idle_timer_abort: Arc::clone(&idle_timer_abort),
@@ -307,7 +374,7 @@ impl AcpBackend {
             goal_mcp_http_server,
             goal_ext_capability,
             pending_hook_context: Arc::new(Mutex::new(pending_hook_context)),
-            transcript_recorder: Arc::new(RwLock::new(transcript_recorder)),
+            transcript_recorder: transcript_recorder_cell,
             session_event_tx: session_event_tx.clone(),
             prompt_result_tx: prompt_result_tx.clone(),
             prompt_phase_gate: Arc::new(Mutex::new(None)),
@@ -315,8 +382,15 @@ impl AcpBackend {
             edit_journal: Arc::new(EditJournal::new()),
             is_first_prompt: Arc::new(Mutex::new(true)),
             workflow,
+            machine_snapshot,
+            workflow_ready: tokio::sync::watch::channel(
+                policy_before_session || config.delegation.is_child(),
+            )
+            .0,
+            program_effects: Arc::new(tokio::sync::RwLock::new(())),
             prompt_summary_enabled: config.prompt_summary_enabled,
             agent_name: config.agent.clone(),
+            handoff_candidate: config.handoff.is_some(),
             cli_version: config.cli_version.clone(),
             auto_worktree: config.auto_worktree,
             auto_worktree_repo_root: config.auto_worktree_repo_root.clone(),
@@ -338,8 +412,12 @@ impl AcpBackend {
             runtime_task_abort: Arc::new(Mutex::new(None)),
             relay_task_abort: Arc::new(Mutex::new(None)),
             orchestrator,
+            native_children,
         };
-        backend.load_workflow();
+
+        if !policy_before_session && !backend.orchestrator.is_child() {
+            backend.load_workflow_without_tools();
+        }
 
         let runtime_backend = backend.clone();
         let runtime_task = tokio::spawn(async move {
@@ -348,8 +426,19 @@ impl AcpBackend {
                     session_runtime_driver::SessionRuntimeInput::Reducer(event) => {
                         runtime_backend.apply_session_event(event).await;
                     }
+                    session_runtime_driver::SessionRuntimeInput::GuardedContinuation {
+                        generation,
+                        event,
+                    } => {
+                        runtime_backend
+                            .apply_guarded_continuation(generation, event)
+                            .await;
+                    }
                     session_runtime_driver::SessionRuntimeInput::Barrier { response_tx } => {
                         let _ = response_tx.send(());
+                    }
+                    session_runtime_driver::SessionRuntimeInput::QuestionCancelled(event) => {
+                        runtime_backend.withdraw_cancelled_question(&event).await;
                     }
                     session_runtime_driver::SessionRuntimeInput::PermissionRequest {
                         pending_request,
@@ -466,17 +555,23 @@ impl AcpBackend {
                                 .await;
                         }
                         Some(crate::connection::ConnectionEvent::Subagent(wire)) => {
+                            if !backend.native_children.observe(&backend.connection, &backend.backend_event_tx, &*backend.session_id.read().await, &wire).await { continue; }
                             backend.wait_for_prompt_phase().await;
                             let _ = backend
                                 .backend_event_tx
                                 .send(BackendEvent::Public(SessionEvent::Nori(
-                                    nori_protocol::NoriEvent::Subagent(wire),
+                                    nori_protocol::NoriEvent::Subagent(subagent_identity::native_child(wire, backend.agent_name())),
                                 )))
                                 .await;
                         }
                         Some(crate::connection::ConnectionEvent::Acp(event)) => {
+                            if super::user_question::is_question_cancellation(&event) {
+                                let _ = backend.session_event_tx.send(session_runtime_driver::SessionRuntimeInput::QuestionCancelled(event)).await;
+                                continue;
+                            }
                             backend.wait_for_prompt_phase().await;
                             if let nori_protocol::AcpEvent::ChildNotification(notification) = &*event {
+                                if !backend.native_children.observe_notification(notification).await { continue; }
                                 child_edits.observe(notification, &backend.edit_journal, &backend.cwd);
                             }
                             suppress_next_session_update = if let Some(chunk) =
@@ -500,6 +595,7 @@ impl AcpBackend {
                             }
                         }
                         Some(crate::connection::ConnectionEvent::SessionClosed) => {
+                            backend.withdraw_all_questions().await;
                             let _ = backend
                                 .backend_event_tx
                                 .send(BackendEvent::Public(SessionEvent::Nori(
@@ -513,6 +609,7 @@ impl AcpBackend {
                                 .await;
                             break;
                         }
+                        Some(crate::connection::ConnectionEvent::Barrier(reply)) => { let _ = reply.send(()); }
                         Some(crate::connection::ConnectionEvent::DelegatedRequest(request)) => {
                             backend.wait_for_prompt_phase().await;
                             relay_seq += 1;
@@ -540,6 +637,7 @@ impl AcpBackend {
                             status,
                             stderr_tail,
                         }) => {
+                            backend.withdraw_all_questions().await;
                             backend.wait_for_prompt_phase().await;
                             if !backend.is_shutting_down.load(Ordering::Relaxed) {
                                 let mut message = match status {
@@ -621,14 +719,21 @@ impl AcpBackend {
                             while let Some(event) = event_rx.recv().await {
                                 match event {
                                     crate::connection::ConnectionEvent::Subagent(wire) => {
+                                        if !backend.native_children.observe(&backend.connection, &backend.backend_event_tx, &*backend.session_id.read().await, &wire).await { continue; }
                                         let _ = backend
                                             .backend_event_tx
                                             .send(BackendEvent::Public(SessionEvent::Nori(
-                                                nori_protocol::NoriEvent::Subagent(wire),
+                                                nori_protocol::NoriEvent::Subagent(subagent_identity::native_child(wire, backend.agent_name())),
                                             )))
                                             .await;
                                     }
                                     crate::connection::ConnectionEvent::Acp(event) => {
+                                        if super::user_question::is_question_cancellation(&event) {
+                                let _ = backend.session_event_tx.send(session_runtime_driver::SessionRuntimeInput::QuestionCancelled(event)).await;
+                                continue;
+                            }
+                                        if let nori_protocol::AcpEvent::ChildNotification(notification) = &*event
+                                            && !backend.native_children.observe_notification(notification).await { continue; }
                                         suppress_next_session_update = if let Some(chunk) =
                                             user_message_chunk(&event)
                                         {
@@ -671,6 +776,7 @@ impl AcpBackend {
                                             .await;
                                     }
                                     crate::connection::ConnectionEvent::SessionClosed => {
+                                        backend.withdraw_all_questions().await;
                                         let _ = backend
                                             .backend_event_tx
                                             .send(BackendEvent::Public(SessionEvent::Nori(
@@ -688,7 +794,8 @@ impl AcpBackend {
                                     // (prompt channel closed); the exit was
                                     // either user-initiated or already
                                     // reported by the main relay arm.
-                                    crate::connection::ConnectionEvent::ChildExited { .. } => {}
+                                    crate::connection::ConnectionEvent::ChildExited { .. } => { backend.withdraw_all_questions().await; }
+                                    crate::connection::ConnectionEvent::Barrier(reply) => { let _ = reply.send(()); }
                                     crate::connection::ConnectionEvent::DelegatedRequest(request) => {
                                         relay_seq += 1;
                                         let current_policy = *approval_policy_rx.borrow();

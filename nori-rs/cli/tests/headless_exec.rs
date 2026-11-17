@@ -195,7 +195,7 @@ fn exec_requires_a_prompt_from_some_source() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
-fn exec_fails_closed_without_waiting_for_an_approval() -> Result<(), Box<dyn std::error::Error>> {
+fn exec_automatically_allows_permission_requests() -> Result<(), Box<dyn std::error::Error>> {
     let nori_home = TempDir::new()?;
     let output = nori_command(&nori_home)?
         .arg("exec")
@@ -203,9 +203,14 @@ fn exec_fails_closed_without_waiting_for_an_approval() -> Result<(), Box<dyn std
         .timeout(Duration::from_secs(10))
         .output()?;
 
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("option: reject"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("permission request was rejected"));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Permission granted with option: allow")
+    );
     Ok(())
 }
 
@@ -377,7 +382,7 @@ fn exec_acp_is_a_standard_facade_with_one_final_message_update()
 }
 
 #[test]
-fn exec_acp_forwards_permission_requests_and_correlated_responses()
+fn exec_acp_automatically_allows_without_forwarding_permission_requests()
 -> Result<(), Box<dyn std::error::Error>> {
     let (mut acp, _nori_home) = AcpProcess::spawn()?;
     let (session_id, _) = acp.initialize_session()?;
@@ -392,27 +397,13 @@ fn exec_acp_forwards_permission_requests_and_correlated_responses()
     }))?;
 
     let mut observed = Vec::new();
-    let permission = loop {
-        let message = acp.receive()?;
-        if message["method"] == "session/request_permission" {
-            break message;
-        }
-        observed.push(message);
-    };
-    let permission_id = permission["id"].clone();
-    assert!(
-        permission["params"]["options"]
-            .as_array()
-            .is_some_and(|options| options.iter().any(|option| option["optionId"] == "allow"))
-    );
-    acp.send(json!({
-        "jsonrpc": "2.0",
-        "id": permission_id,
-        "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}
-    }))?;
-
     let prompt_response = acp.receive_response(3, &mut observed)?;
     assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    assert!(
+        observed
+            .iter()
+            .all(|message| message["method"] != "session/request_permission")
+    );
     let final_text = observed
         .iter()
         .find(|message| message["method"] == "session/update")

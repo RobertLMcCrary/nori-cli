@@ -4,7 +4,7 @@
 //! The parent agent reaches this through the task tools of its `nori-client` MCP server. A task
 //! is one turn of work on a child session, and a child session is a full harness session of its
 //! own: its own agent process, approvals, and `nori-client` server, so a child can delegate in
-//! turn, up to the depth limit. The user sees children as the parent's subagents: a child's
+//! turn. The user sees children as the parent's subagents: a child's
 //! updates are relayed into the parent's event stream under a session id unique to the task, and
 //! its permission requests are asked in the parent conversation, named after the child.
 //!
@@ -19,10 +19,16 @@ mod brief;
 mod capabilities;
 mod catalog;
 mod child;
+mod child_control;
 mod launch;
+mod managed_journal;
 mod models;
+mod native_rebind;
+#[cfg(test)]
+mod native_rebind_nested_tests;
 mod parent;
 mod probe;
+mod program;
 mod task;
 #[cfg(test)]
 mod tests;
@@ -30,7 +36,10 @@ mod tools;
 mod wake;
 mod worktree;
 
+pub(crate) use native_rebind::NativeRebindSpec;
+
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
@@ -61,17 +70,11 @@ use task::Wake;
 pub(crate) use tools::INSTRUCTIONS as TASK_INSTRUCTIONS;
 pub(crate) use tools::always_load;
 
-/// Tasks running at once across a whole tree of delegations.
-const MAX_RUNNING_TASKS: i64 = 8;
-/// How deep delegations nest: the root's children are at depth 1, and a session at this depth
-/// cannot delegate.
-const MAX_DEPTH: i64 = 3;
 /// The longest a tool call blocks waiting on tasks. Agents drop MCP calls that stay silent much
 /// longer (Codex after 60 seconds); a longer task is delivered by the completion wake.
 const MAX_WAIT: Duration = Duration::from_secs(50);
+/// Default wait returns after this polling interval; the task continues and delivers its result.
 const DEFAULT_WAIT: Duration = Duration::from_secs(45);
-/// The most result text one `task_wait` answer carries.
-const MAX_RETURNED_BYTES: usize = 64 * 1024;
 
 /// Limits shared by every session in one tree of delegations.
 #[derive(Debug)]
@@ -87,6 +90,7 @@ pub(crate) struct Seed {
     pub(crate) cli_version: String,
     pub(crate) depth: i64,
     pub(crate) tree: Arc<Tree>,
+    pub(crate) record_transcript: bool,
 }
 
 impl Seed {
@@ -99,6 +103,7 @@ impl Seed {
             tree: Arc::new(Tree {
                 running: AtomicI64::new(0),
             }),
+            record_transcript: true,
         }
     }
 
@@ -107,13 +112,19 @@ impl Seed {
         Self {
             config,
             cli_version: self.cli_version.clone(),
-            depth: self.depth + 1,
+            depth: self.depth.saturating_add(1),
             tree: Arc::clone(&self.tree),
+            record_transcript: self.record_transcript,
         }
     }
 
-    /// Whether the session is a child, which keeps no transcript of its own: the parent's shows
-    /// what it did.
+    /// Mark a short-lived catalog probe as a session without a conversation log.
+    pub(crate) fn without_transcript(mut self) -> Self {
+        self.record_transcript = false;
+        self
+    }
+
+    /// Whether the session was started as a delegated child.
     pub(crate) fn is_child(&self) -> bool {
         self.depth > 0
     }
@@ -132,6 +143,40 @@ const CATALOG_FRESH_FOR: Duration = Duration::from_secs(600);
 /// ten minutes: called as the user starts typing, so delegation sees current models.
 pub fn refresh_agent_catalog(config: Arc<crate::config::NoriConfig>, cli_version: String) {
     tokio::spawn(probe::refresh(config, cli_version, CATALOG_FRESH_FOR));
+}
+
+/// Refresh installed agents except for the one whose primary startup session is being prepared.
+/// That session records its advertised configuration directly when it starts.
+pub fn refresh_agent_catalog_except(
+    config: Arc<crate::config::NoriConfig>,
+    cli_version: String,
+    excluded_agent: String,
+) {
+    tokio::spawn(probe::refresh_excluding(
+        config,
+        cli_version,
+        CATALOG_FRESH_FOR,
+        Some(excluded_agent),
+    ));
+}
+
+/// A model previously advertised by an agent in an ACP session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedAgentModel {
+    pub value: String,
+    pub name: String,
+}
+
+/// Return only models actually advertised by this agent in a previous session.
+pub fn cached_agent_models(home: &std::path::Path, agent: &str) -> Vec<CachedAgentModel> {
+    catalog::remembered(home, agent)
+        .models
+        .into_iter()
+        .map(|model| CachedAgentModel {
+            value: model.value,
+            name: model.name,
+        })
+        .collect()
 }
 
 /// What the orchestrator needs the parent's backend to do.
@@ -164,12 +209,22 @@ pub(super) struct ChildKey(i64);
 
 pub(super) struct Inner {
     seed: Seed,
+    program_backend: std::sync::OnceLock<std::sync::Weak<super::AcpBackend>>,
     events: mpsc::Sender<BackendEvent>,
     binding: std::sync::Mutex<Option<Binding>>,
     signals: std::sync::Mutex<Option<mpsc::UnboundedSender<Signal>>>,
     state: Mutex<State>,
+    admission: Mutex<()>,
+    generation: AtomicI64,
     /// Bumped whenever a task changes, for tool calls waiting on tasks.
     changed: watch::Sender<i64>,
+}
+
+/// Route a public descendant ID back to the session ID on its owning connection.
+#[derive(Clone)]
+pub(crate) struct DescendantRoute {
+    pub(crate) handle: crate::runtime::HarnessHandle,
+    pub(crate) session_id: acp::SessionId,
 }
 
 #[derive(Default)]
@@ -178,6 +233,10 @@ struct State {
     next_child: i64,
     tasks: Vec<TaskRecord>,
     children: HashMap<ChildKey, ChildSlot>,
+    /// The immediate child whose event stream announced each descendant view.
+    descendants: HashMap<acp::SessionId, DescendantRoute>,
+    /// Adopted view mappings kept inaccessible by the caller's gate until durability succeeds.
+    pending_adoptions: HashSet<acp::SessionId>,
     by_client_request: HashMap<String, TaskId>,
     shut_down: bool,
 }
@@ -188,6 +247,23 @@ enum ChildSlot {
 }
 
 impl Orchestrator {
+    pub(crate) async fn rewind_admission(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.admission.lock().await
+    }
+
+    pub(crate) async fn has_pending_work(&self) -> bool {
+        self.inner.state.lock().await.tasks.iter().any(|task| {
+            !task.status.is_ended() || (task.delivery == Delivery::Owed && task.wake != Wake::Never)
+        })
+    }
+
+    pub(crate) fn advance_generation(&self) {
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn admission_generation(&self) -> i64 {
+        self.inner.generation.load(Ordering::Acquire)
+    }
     /// The orchestrator of a session, and the signals its backend must act on.
     pub(crate) fn new(
         seed: Seed,
@@ -196,10 +272,13 @@ impl Orchestrator {
         let (signals_tx, signals_rx) = mpsc::unbounded_channel();
         let inner = Inner {
             seed,
+            program_backend: std::sync::OnceLock::new(),
             events,
             binding: std::sync::Mutex::new(None),
             signals: std::sync::Mutex::new(Some(signals_tx)),
             state: Mutex::new(State::default()),
+            admission: Mutex::new(()),
+            generation: AtomicI64::new(0),
             changed: watch::channel(0).0,
         };
         (
@@ -224,24 +303,151 @@ impl Orchestrator {
     /// how a workflow's commit agent writes the commits while the session's agent goes on.
     pub(crate) async fn delegate_background(
         &self,
+        generation: i64,
         title: String,
         task: String,
         agent: String,
         model: Option<String>,
+        review: bool,
     ) -> Result<(), String> {
+        let _admission = self.rewind_admission().await;
+        if generation != self.admission_generation() {
+            return Err("The conversation was rewound before the workflow task started".to_owned());
+        }
         self.inner
-            .delegate(launch::Delegation {
+            .delegate_locked(launch::Delegation {
                 task,
                 agent: Some(agent),
                 model,
                 title: Some(title),
-                role: Some(launch::Role::Implementation),
+                role: Some(if review {
+                    launch::Role::Review
+                } else {
+                    launch::Role::Implementation
+                }),
                 isolation: launch::Isolation::Shared,
                 mode: launch::Mode::Background,
                 timeout: None,
                 client_request_id: None,
                 options: Vec::new(),
+                fork_context: None,
+                fork_source: None,
+                fork_entries: Vec::new(),
+                parent_view: None,
             })
+            .await
+            .map(drop)
+    }
+
+    /// Continue a selected conversation prefix on a separate child session.
+    pub(crate) async fn fork_history(
+        &self,
+        context: String,
+        source: Option<(String, i64, i64)>,
+        entries: Vec<crate::transcript::TranscriptLine>,
+    ) -> Result<(), String> {
+        self.inner
+            .delegate_locked(launch::Delegation {
+                task: "Continue from the conversation above.".to_owned(),
+                agent: None,
+                model: None,
+                title: Some("History fork".to_owned()),
+                role: None,
+                isolation: launch::Isolation::Shared,
+                mode: launch::Mode::Background,
+                timeout: None,
+                client_request_id: None,
+                options: Vec::new(),
+                fork_context: Some(context),
+                fork_source: source,
+                fork_entries: entries,
+                parent_view: None,
+            })
+            .await
+            .map(drop)
+    }
+
+    pub(crate) async fn owns_view(&self, session_id: &acp::SessionId) -> bool {
+        let state = self.inner.state.lock().await;
+        !state.pending_adoptions.contains(session_id)
+            && state.tasks.iter().any(|task| &task.view_id == session_id)
+    }
+
+    /// Send a user's follow-up to an orchestrated child, queueing behind its active turn.
+    pub(crate) async fn send_user_content_message_locked(
+        &self,
+        session_id: acp::SessionId,
+        content: Vec<acp::ContentBlock>,
+    ) -> Result<(), String> {
+        self.send_user_content_locked(session_id, content, false)
+            .await
+    }
+
+    pub(crate) async fn steer_user_content_message_locked(
+        &self,
+        session_id: acp::SessionId,
+        content: Vec<acp::ContentBlock>,
+    ) -> Result<(), String> {
+        self.send_user_content_locked(session_id, content, true)
+            .await
+    }
+
+    async fn send_user_content_locked(
+        &self,
+        session_id: acp::SessionId,
+        content: Vec<acp::ContentBlock>,
+        steer: bool,
+    ) -> Result<(), String> {
+        let text = content
+            .iter()
+            .filter_map(|block| match block {
+                acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if text.trim().is_empty()
+            && content
+                .iter()
+                .any(|block| !matches!(block, acp::ContentBlock::Text(_)))
+        {
+            "Attachment".to_owned()
+        } else {
+            text
+        };
+        let mut changed = self.inner.changed.subscribe();
+        let previous = loop {
+            let state = self.inner.state.lock().await;
+            let task = state
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.view_id == session_id)
+                .ok_or_else(|| format!("No controlled child session {session_id}"))?;
+            match state.children.get(&task.child) {
+                Some(ChildSlot::Ready(_)) => break task.id.clone(),
+                Some(ChildSlot::Starting) => {}
+                None => return Err("The child session is no longer available".to_owned()),
+            }
+            drop(state);
+            changed
+                .changed()
+                .await
+                .map_err(|_| "The child session is no longer available".to_owned())?;
+        };
+        self.inner
+            .send_locked(
+                &previous,
+                text,
+                launch::Mode::Background,
+                None,
+                if steer {
+                    launch::FollowUp::Steer
+                } else {
+                    launch::FollowUp::User
+                },
+                Some(content),
+            )
             .await
             .map(drop)
     }
@@ -290,6 +496,7 @@ impl Orchestrator {
         self.stop().await;
         let children: Vec<child::Child> = {
             let mut state = self.inner.state.lock().await;
+            state.descendants.clear();
             state
                 .children
                 .drain()
@@ -335,6 +542,19 @@ impl Inner {
             .map(|binding| binding.session_id.clone())
     }
 
+    async fn parent_for_view(&self, view: &acp::SessionId) -> Option<acp::SessionId> {
+        let parent = self
+            .state
+            .lock()
+            .await
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| &task.view_id == view)
+            .and_then(|task| task.parent_view.clone());
+        parent.or_else(|| self.parent_session())
+    }
+
     /// The parent's approval policy now: a child never gets a broader one.
     fn approval_policy(&self) -> AskForApproval {
         self.binding
@@ -355,17 +575,20 @@ impl Inner {
     async fn announce(
         &self,
         view_id: &acp::SessionId,
+        parent_view: Option<acp::SessionId>,
+        agent: String,
         title: String,
         label: String,
         state: SubagentState,
     ) {
-        let Some(parent_session_id) = self.parent_session() else {
+        let Some(parent_session_id) = parent_view.or_else(|| self.parent_session()) else {
             return;
         };
         self.emit(SessionEvent::Nori(NoriEvent::Subagent(
             SubagentWire::Update(SubagentUpdate {
                 parent_session_id,
                 session_id: view_id.clone(),
+                agent: nori_protocol::Patch::Set(agent),
                 title: nori_protocol::Patch::Set(title),
                 description: nori_protocol::Patch::Set(label),
                 state: nori_protocol::Patch::Set(state),
@@ -382,6 +605,20 @@ impl Inner {
             .any(|task| &task.id == id && task.status.is_ended())
     }
 
+    /// A user interruption ends the current turn but keeps its child view available.
+    pub(super) async fn user_interrupted(&self, id: &TaskId) {
+        if let Some(task) = self
+            .state
+            .lock()
+            .await
+            .tasks
+            .iter_mut()
+            .find(|task| &task.id == id)
+        {
+            task.wake = Wake::Never;
+        }
+    }
+
     pub(super) async fn task_running(&self, id: &TaskId) {
         let mut state = self.state.lock().await;
         if let Some(task) = state.tasks.iter_mut().find(|task| &task.id == id)
@@ -390,12 +627,13 @@ impl Inner {
             task.status = TaskStatus::Running;
         }
         drop(state);
+        self.announce_task(id).await;
         self.touch();
     }
 
     /// Record how a task ended, tell the user's view, and owe the result to the parent.
     pub(super) async fn task_ended(&self, id: &TaskId, end: TaskEnd, final_text: String) {
-        let (view_id, title, label, outcome, wake, withdrawn) = {
+        let (view_id, parent_view, agent, title, label, outcome, wake, wake_never, withdrawn) = {
             let mut state = self.state.lock().await;
             let Some(task) = state.tasks.iter_mut().find(|task| &task.id == id) else {
                 return;
@@ -403,10 +641,11 @@ impl Inner {
             if task.status.is_ended() {
                 return;
             }
-            task.result = task::bounded_result(&final_text);
-            task.delivery = match end {
-                TaskEnd::Cancelled => Delivery::Waived,
-                TaskEnd::Completed { .. } | TaskEnd::Failed { .. } => Delivery::Owed,
+            task.result = final_text;
+            task.delivery = match (task.wake, &end) {
+                (Wake::Never, _) => Delivery::Waived,
+                (_, TaskEnd::Cancelled) => Delivery::Waived,
+                (_, TaskEnd::Completed { .. } | TaskEnd::Failed { .. }) => Delivery::Owed,
             };
             task.status = TaskStatus::Ended(end);
             task.ended_at = Some(Instant::now());
@@ -414,10 +653,13 @@ impl Inner {
             self.seed.tree.running.fetch_sub(1, Ordering::AcqRel);
             (
                 task.view_id.clone(),
+                task.parent_view.clone(),
+                task.agent.clone(),
                 task.view_title(),
                 task.title.clone(),
                 task.subagent_outcome(),
                 task.delivery == Delivery::Owed && task.wake == Wake::Always,
+                task.wake == Wake::Never,
                 std::mem::take(&mut task.relayed_approvals),
             )
         };
@@ -425,7 +667,23 @@ impl Inner {
             self.signal(Signal::Withdraw(withdrawn));
         }
         if let Some(outcome) = outcome {
-            self.announce(&view_id, title, label, SubagentState::Ended(outcome))
+            let another_active = self
+                .state
+                .lock()
+                .await
+                .tasks
+                .iter()
+                .any(|task| task.view_id == view_id && !task.status.is_ended());
+            let state = if another_active {
+                SubagentState::Running
+            } else if wake_never
+                && !matches!(outcome, nori_protocol::SubagentOutcome::Failed { .. })
+            {
+                SubagentState::Idle
+            } else {
+                SubagentState::Ended(outcome)
+            };
+            self.announce(&view_id, parent_view, agent, title, label, state)
                 .await;
         }
         self.touch();
@@ -441,7 +699,7 @@ impl Inner {
             let task = state
                 .tasks
                 .iter()
-                .find(|task| &task.id == id)
+                .find(|task| &task.id == id && !task.adoption_anchor)
                 .ok_or_else(|| format!("there is no task `{id}`"))?;
             if task.status.is_ended() {
                 return Ok(task.snapshot(Instant::now()));

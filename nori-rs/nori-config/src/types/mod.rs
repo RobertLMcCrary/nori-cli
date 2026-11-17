@@ -903,7 +903,7 @@ impl HotkeyAction {
     /// Description for the hotkey picker.
     pub fn description(&self) -> &'static str {
         match self {
-            Self::OpenTranscript => "Open the transcript pager (alternate screen)",
+            Self::OpenTranscript => "Browse conversation history on the primary screen",
             Self::OpenEditor => "Open an external editor to compose a message",
             Self::MoveBackwardChar => "Move cursor one character backward",
             Self::MoveForwardChar => "Move cursor one character forward",
@@ -983,7 +983,7 @@ impl HotkeyAction {
             Self::Yank => "ctrl+y",
             Self::HistorySearch => "ctrl+r",
             Self::TogglePlanDrawer => "ctrl+o",
-            Self::Redraw => "ctrl+l",
+            Self::Redraw => "ctrl+shift+l",
             Self::NextModel => "ctrl+n",
             Self::PreviousModel => "ctrl+p",
             Self::NextEffort => "ctrl+j",
@@ -1960,8 +1960,8 @@ impl Default for FooterLayoutConfig {
         Self {
             // Only self-hiding state lands on the left by default:
             // `CloudSession` renders when attached to a cloud session and
-            // `VimMode` when vim mode is on, so an ordinary local shell leaves
-            // this group empty. The remaining entries are all disabled in
+            // the mode indicator is displayed in the prompt bar instead.
+            // This group remains empty in an ordinary local shell. The remaining entries are all disabled in
             // `FooterSegmentConfig::default`; they stay listed so that turning
             // one on through `[tui.footer_segments]` alone still has somewhere
             // to render, without the user also writing a `[tui.footer_layout]`.
@@ -1969,7 +1969,6 @@ impl Default for FooterLayoutConfig {
                 FooterSegment::CloudSession.into(),
                 FooterSegment::PromptSummary.into(),
                 FooterSegment::SessionTitle.into(),
-                FooterSegment::VimMode.into(),
                 FooterSegment::GitStats.into(),
                 FooterSegment::ContextUsedPercent.into(),
                 FooterSegment::ContextRemainingPercent.into(),
@@ -1981,13 +1980,15 @@ impl Default for FooterLayoutConfig {
                 FooterSegment::NoriVersion.into(),
                 FooterSegment::TokenUsage.into(),
             ],
-            // Location and headroom, right-aligned under the prompt.
-            footer_right: vec![
+            footer_right: Vec::new(),
+            // Location and headroom belong to the prompt bar, leaving the rows
+            // below it available for subagent navigation.
+            textarea_top_left: vec![
+                FooterSegment::VimMode.into(),
                 FooterSegment::GitBranch.into(),
                 FooterSegment::WorktreeName.into(),
                 FooterSegment::Context.into(),
             ],
-            textarea_top_left: Vec::new(),
             // The model and the agent mode sit on the textarea's top-right
             // corner, above the prompt, so they read as properties of what you
             // are about to send rather than other metadata chips.
@@ -2078,6 +2079,9 @@ pub struct TuiConfigToml {
     /// Vim mode and Enter key behavior. Accepts `true`/`false` for backwards
     /// compatibility or one of `"newline"`, `"submit"`, `"off"`.
     pub vim_mode: Option<VimEnterBehavior>,
+
+    /// Prompt editor: `kakoune` (default), its `helix` alias, `vim`, or `standard`.
+    pub editor_mode: Option<String>,
 
     /// Configurable hotkey bindings.
     #[serde(default)]
@@ -2318,6 +2322,9 @@ pub struct NoriConfig {
     /// Vim mode and Enter key behavior.
     pub vim_mode: VimEnterBehavior,
 
+    /// Whether to use Kakoune editing in the prompt.
+    pub kakoune_mode: bool,
+
     /// Configurable hotkey bindings.
     pub hotkeys: HotkeyConfig,
 
@@ -2430,9 +2437,9 @@ impl Default for NoriConfig {
         Self {
             agent: DEFAULT_AGENT.to_string(),
             active_agent: DEFAULT_AGENT.to_string(),
-            sandbox_mode: SandboxMode::WorkspaceWrite,
-            sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-            approval_policy: AskForApproval::OnRequest,
+            sandbox_mode: SandboxMode::DangerFullAccess,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            approval_policy: AskForApproval::Never,
             has_explicit_approval_or_sandbox_policy: false,
             forced_auto_mode_downgraded_on_windows: false,
             windows_sandbox_enabled: false,
@@ -2457,6 +2464,7 @@ impl Default for NoriConfig {
             toasts: true,
             notify_after_idle: NotifyAfterIdle::default(),
             vim_mode: VimEnterBehavior::Off,
+            kakoune_mode: true,
             hotkeys: HotkeyConfig::default(),
             script_timeout: ScriptTimeout::default(),
             loop_count: None,

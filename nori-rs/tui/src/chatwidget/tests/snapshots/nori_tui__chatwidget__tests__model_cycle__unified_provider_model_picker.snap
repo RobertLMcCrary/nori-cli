@@ -1,0 +1,18 @@
+---
+source: tui/src/chatwidget/tests/model_cycle.rs
+assertion_line: 366
+expression: rendered
+---
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Select model                                                                ×│
+│ ⌕  Type to search                                                            │
+│                                                                              │
+│ ▏1. Sonnet (current)                                                       ▕ │
+│  2. Opus                                                                     │
+│  3. Haiku                                                                    │
+│  4. Fast                                                                     │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+                                                            Claude Code · Sonnet
+› ! for shell commands

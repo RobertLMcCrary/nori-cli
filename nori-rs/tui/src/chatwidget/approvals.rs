@@ -3,6 +3,12 @@ use super::*;
 impl ChatWidget {
     /// Open a popup to choose the approvals mode (ask for approval policy + sandbox policy).
     pub(crate) fn open_approvals_popup(&mut self) {
+        if self.config.approval_policy == AskForApproval::Never
+            && matches!(self.config.sandbox_policy, SandboxPolicy::DangerFullAccess)
+        {
+            self.add_info_message("Nori runs with full access.".to_string(), None);
+            return;
+        }
         let current_approval = self.config.approval_policy;
         let current_sandbox = self.config.sandbox_policy.clone();
         let mut items: Vec<SelectionItem> = Vec::new();
@@ -427,8 +433,7 @@ impl ChatWidget {
 
     /// Update the approval mode label displayed in the footer based on current config.
     pub(crate) fn update_approval_mode_label(&mut self) {
-        let label = approval_mode_label(self.config.approval_policy, &self.config.sandbox_policy);
-        self.bottom_pane.set_approval_mode_label(label);
+        self.bottom_pane.set_approval_mode_label(None);
     }
 
     pub(crate) fn set_full_access_warning_acknowledged(&mut self, acknowledged: bool) {

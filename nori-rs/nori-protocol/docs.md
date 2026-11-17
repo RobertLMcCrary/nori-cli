@@ -47,11 +47,12 @@ pub enum AcpEvent {
 }
 ```
 
-`NoriEvent` has exactly sixteen outer variants:
+`NoriEvent` includes these harness lifecycle and presentation variants:
 
 ```rust
 pub enum NoriEvent {
     SessionStarted(SessionStarted),
+    SessionReady(acp::v1::SessionId),
     SessionPhaseChanged(SessionPhase),
     SessionEnded(SessionEnded),
     QueueChanged(QueueSnapshot),
@@ -78,6 +79,10 @@ turn has no public Nori completion event; client-owned prompt turns complete
 through their correlated raw ACP prompt response. The source-owned event
 boundary is defined in
 [`session_event.rs`](src/session_event.rs).
+
+`SessionReady` identifies the ACP session after all startup replay batches have
+been emitted, including when there is no replay. `SessionStarted` can precede
+that replay and should not be used as its completion signal.
 
 `SessionForked` is emitted when branch-at-head `/fork` forks the transcript. It
 carries `previous_conversation_id` (the now-frozen parent conversation),

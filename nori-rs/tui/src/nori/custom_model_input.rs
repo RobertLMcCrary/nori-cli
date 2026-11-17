@@ -60,6 +60,7 @@ impl CustomModelInputView {
             value_name: value,
             is_custom_model: true,
             origin: self.origin,
+            route_token: None,
         });
         self.complete = true;
     }

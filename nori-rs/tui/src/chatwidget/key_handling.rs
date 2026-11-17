@@ -59,6 +59,7 @@ impl ChatWidget {
                 kind: KeyEventKind::Press,
                 ..
             } if !self.exiting
+                && self.focused_subagent.is_none()
                 && !self.bottom_pane.has_active_overlay_or_popup()
                 && self.cycle_acp_mode_config() =>
             {
@@ -70,6 +71,26 @@ impl ChatWidget {
             _ => {}
         }
 
+        if let Some(key) = self.focused_subagent
+            && key_event.kind == KeyEventKind::Press
+            && key_event.code == KeyCode::Enter
+            && key_event.modifiers.is_empty()
+            && !self.bottom_pane.has_active_overlay_or_popup()
+            && self.bottom_pane.composer_is_empty()
+        {
+            if let (Some(handle), Some(session_id)) =
+                (self.harness_handle.clone(), self.subagent_session(key))
+            {
+                let tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle.promote_subagent_queue(session_id).await {
+                        tx.send(AppEvent::TransientNotice(error.to_string()));
+                    }
+                });
+            }
+            return;
+        }
+
         match self.bottom_pane.handle_key_event(key_event) {
             InputResult::Submitted(text)
                 if self.cloud_mode && !self.session_configured_received =>
@@ -79,6 +100,27 @@ impl ChatWidget {
             InputResult::Submitted(text) if self.follow_only_attachment => {
                 self.bottom_pane.restore_composer_submission(text);
             }
+            InputResult::Submitted(text) if let Some(key) = self.focused_subagent => {
+                if let Some(agent_name) = text.strip_prefix("/login ").map(str::trim)
+                    && !agent_name.is_empty()
+                {
+                    self.handle_explicit_login(agent_name);
+                    return;
+                }
+                if self.subagent_session(key).is_some() {
+                    self.app_event_tx.send(AppEvent::SendSubagentMessage {
+                        key,
+                        text,
+                        image_paths: self.bottom_pane.take_recent_submission_images(),
+                        steer: false,
+                    });
+                } else {
+                    self.bottom_pane.restore_composer_submission(text);
+                    self.app_event_tx.send(AppEvent::TransientNotice(
+                        "This subagent has no session available for follow-up.".to_owned(),
+                    ));
+                }
+            }
             InputResult::Submitted(text) => {
                 let user_message = UserMessage {
                     text,
@@ -86,8 +128,67 @@ impl ChatWidget {
                 };
                 self.submit_user_message(user_message);
             }
+            InputResult::Steer(text) if let Some(key) = self.focused_subagent => {
+                if self.subagent_session(key).is_some() {
+                    self.app_event_tx.send(AppEvent::SendSubagentMessage {
+                        key,
+                        text,
+                        image_paths: self.bottom_pane.take_recent_submission_images(),
+                        steer: true,
+                    });
+                } else {
+                    self.bottom_pane.restore_composer_submission(text);
+                    self.app_event_tx.send(AppEvent::TransientNotice(
+                        "This child has no session available for steering.".to_owned(),
+                    ));
+                }
+            }
+            InputResult::Steer(text) => {
+                let user_message = UserMessage {
+                    text,
+                    image_paths: self.bottom_pane.take_recent_submission_images(),
+                };
+                self.steer_user_message(user_message);
+            }
+            InputResult::PromoteQueued => {
+                if let Some(key) = self.focused_subagent {
+                    if let (Some(handle), Some(session_id)) =
+                        (self.harness_handle.clone(), self.subagent_session(key))
+                    {
+                        let tx = self.app_event_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle.promote_subagent_queue(session_id).await {
+                                tx.send(AppEvent::TransientNotice(error.to_string()));
+                            }
+                        });
+                    }
+                } else if let Some(handle) = self.harness_handle.clone() {
+                    let tx = self.app_event_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle.promote_next_queued().await {
+                            tx.send(AppEvent::HarnessActionFailed(error.to_string()));
+                        }
+                    });
+                }
+            }
             InputResult::Command(cmd) => {
-                self.dispatch_command(cmd);
+                if self.focused_subagent.is_some()
+                    && !matches!(
+                        &cmd,
+                        SlashCommand::Quit
+                            | SlashCommand::Exit
+                            | SlashCommand::Reference
+                            | SlashCommand::Model
+                            | SlashCommand::Login
+                    )
+                {
+                    self.app_event_tx.send(AppEvent::TransientNotice(
+                        "Slash commands are available in the main session. Switch back with Ctrl+Tab."
+                            .to_owned(),
+                    ));
+                } else {
+                    self.dispatch_command(cmd);
+                }
             }
             InputResult::None => {}
         }
@@ -137,7 +238,7 @@ impl ChatWidget {
                 SlashCommand::New
                     | SlashCommand::Resume
                     | SlashCommand::ResumeViewonly
-                    | SlashCommand::Agent
+                    | SlashCommand::Providers
                     | SlashCommand::Close
             )
         {
@@ -163,6 +264,9 @@ impl ChatWidget {
             }
             SlashCommand::ResumeViewonly => {
                 self.open_viewonly_session_picker();
+            }
+            SlashCommand::Reference => {
+                self.open_reference_session_picker();
             }
             SlashCommand::Close => {
                 let Some(handle) = self.harness_handle.clone() else {
@@ -207,8 +311,8 @@ impl ChatWidget {
                     crate::app_event::HarnessAction::Compact,
                 ));
             }
-            SlashCommand::Agent => {
-                self.open_agent_popup();
+            SlashCommand::Providers => {
+                self.open_providers_popup();
             }
             SlashCommand::Model => {
                 self.open_model_popup();

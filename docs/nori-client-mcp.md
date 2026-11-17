@@ -12,8 +12,10 @@ backend-owned MCP server named `nori-client`, served as streamable HTTP on
 `127.0.0.1`, so they can call `get_goal`, `create_goal`, and `update_goal`
 against the same state the TUI uses.
 
-Agents built into Nori's own process do not get this server. They get the same
-tools as host tools, called directly; see [host-tools.md](host-tools.md).
+Agents that advertise Nori host-tool support get these tools directly instead
+of through the server; see [host-tools.md](host-tools.md). The in-process
+OpenCode adapter uses the `nori-client` MCP server because OpenCode's engine
+runs as a separate local process.
 Everything below about goals, capabilities and the connected gate applies to
 them too, with "initialized `nori-client`" read as "has the session".
 
@@ -25,6 +27,12 @@ state.
 The server is intentionally general-purpose: goal tools are the first tenant,
 not the whole API. It should remain the narrow harness-side channel for
 capabilities that ACP does not yet provide directly.
+
+The `conversation` tool accepts a Pkl program and applies ordered conversation
+commands through the same runtime as `HarnessHandle`. Programs, operation
+intents, actor bindings, and results are journaled. See
+[conversation-programs.md](conversation-programs.md) for the command schema and
+replay guarantees.
 
 ## Target Shape
 
@@ -77,7 +85,7 @@ goal tools:
 <context>
 Source: this message is from Nori CLI.
 
-When <goal_context> is present, Nori CLI owns the goal. Use only Nori's goal tools: read it with `get_goal` and update it with `update_goal`.
+When <goal_context> is present, Nori CLI owns the goal. Nori delivers changed goal context automatically when supported; use `get_goal` only if you need to inspect the current state, and use `update_goal` to change its status.
 </context>
 ```
 
@@ -85,6 +93,15 @@ This source attribution and conditional goal-routing guidance are distinct from
 the static Nori operating guidance that MCP-capable agents can discover through
 `nori-client`, and the envelope is consumed once rather than repeated on later
 prompts.
+
+For a Nori-managed goal, Nori includes a goal revision and the latest state when the state has
+changed since the conversation's previous delivered goal context. A cleared
+goal is reported once if the agent previously received that goal. Usage-only
+updates do not create a new goal revision. A reopened or forked conversation
+receives its current state again; an initially empty goal adds no context.
+For an in-process Codex root session, a pending change can also accompany the
+next Nori host-tool result. Provider-owned tool results do not yet carry these
+updates; they remain pending until a supported delivery point.
 
 Resources and prompts should be curated guidance, not an arbitrary filesystem
 read API. Tools should remain reserved for Nori-owned state changes.

@@ -25,7 +25,7 @@ pub(super) fn local_image_content(
 }
 
 impl ChatWidget {
-    pub(super) fn flush_active_cell(&mut self) {
+    pub(crate) fn flush_active_cell(&mut self) {
         // The answer of a turn that ended comes before whatever was shown after it.
         if self.stream_ending && self.active_cell.as_ref().is_some() {
             let active = self.active_cell.take();
@@ -80,6 +80,14 @@ impl ChatWidget {
     }
 
     pub(super) fn submit_user_message(&mut self, user_message: UserMessage) {
+        self.submit_user_message_with_steering(user_message, false);
+    }
+
+    pub(super) fn steer_user_message(&mut self, user_message: UserMessage) {
+        self.submit_user_message_with_steering(user_message, true);
+    }
+
+    fn submit_user_message_with_steering(&mut self, user_message: UserMessage, steer: bool) {
         // The app is exiting: teardown has started, so a prompt submitted by
         // a fast typist must not start another turn.
         if self.exiting {
@@ -112,7 +120,7 @@ impl ChatWidget {
         if let Some(agent_name) = text.strip_prefix("/login ").map(str::trim)
             && !agent_name.is_empty()
         {
-            self.handle_login_command_with_agent(agent_name);
+            self.handle_explicit_login(agent_name);
             return;
         }
 
@@ -211,7 +219,7 @@ impl ChatWidget {
             self.echo_submitted_prompt(&text, image_paths.len(), painted_already, echo.clone());
         }
         self.note_turn_prompt(&text);
-        self.submit_prompt(text.clone(), image_paths, echo);
+        self.submit_prompt(text.clone(), image_paths, echo, steer);
 
         // Persist the text to cross-session message history.
         self.persist_prompt_history(&text);

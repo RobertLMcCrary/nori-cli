@@ -47,17 +47,17 @@ fn test_startup_error_for_unregistered_model() {
     .expect("Failed to spawn");
 
     // When acp.allow_http_fallback=false (default) and the model is not registered as an ACP agent,
-    // the TUI should start and open the agent picker with the error as its
+    // the TUI should start and open the provider picker with the error as its
     // subtitle. History may be outside the viewport while the picker is open.
-    session.wait_for_text("Select agent", TIMEOUT).unwrap();
+    session.wait_for_text("Providers", TIMEOUT).unwrap();
 
     std::thread::sleep(TIMEOUT_PRESNAPSHOT);
     let contents = session.screen_contents();
 
     let mut lines = contents.lines();
     lines
-        .find(|line| line.contains("Select agent"))
-        .expect("Agent picker should be visible");
+        .find(|line| line.contains("Providers"))
+        .expect("Provider picker should be visible");
     let picker_subtitle = lines.next().unwrap_or_default();
 
     // Verify the recovery action itself keeps the startup error visible.
@@ -69,29 +69,47 @@ fn test_startup_error_for_unregistered_model() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
-fn test_startup_shows_welcome() {
+#[cfg(unix)]
+fn fresh_home_opens_the_composer_and_accepts_input() {
     let mut session = TuiSession::spawn_with_config(
         24,
         80,
-        SessionConfig::default()
-            // Don't skip trust directory - allows welcome screen to show
+        SessionConfig::new()
             .with_skip_trust_directory(false)
-            .with_config_toml(""),
+            .with_config_toml("")
+            .with_mock_response("Fresh start response"),
     )
-    .expect("Failed to spawn");
+    .expect("spawn Nori with a fresh home");
 
     session
-        .wait_for_text("Welcome to Nori", TIMEOUT)
-        .expect("Prompt did not appear");
-    std::thread::sleep(TIMEOUT_PRESNAPSHOT);
-
-    let contents = session.screen_contents();
-    assert!(contents.contains("Welcome to Nori, your AI coding assistant"));
-    assert_snapshot!(
-        "startup_shows_welcome",
-        normalize_for_input_snapshot(contents)
+        .wait_for_text("›", TIMEOUT)
+        .expect("composer appears without a welcome gate");
+    session
+        .wait_for_text("Nori CLI", TIMEOUT)
+        .expect("ordinary startup header appears");
+    let first_frame = session.screen_contents();
+    assert!(first_frame.contains("Nori CLI"), "{first_frame}");
+    assert!(!first_frame.contains("Welcome to Nori"), "{first_frame}");
+    assert!(
+        !first_frame.contains("You are running Nori in"),
+        "{first_frame}"
     );
+    session
+        .type_input("fresh start prompt")
+        .expect("type immediately");
+    session
+        .wait_for_text("fresh start prompt", TIMEOUT)
+        .expect("composer accepted input");
+    assert_snapshot!(
+        "fresh_startup_composer",
+        normalize_for_input_snapshot(session.screen_contents())
+    );
+    session
+        .send_key(tui_pty_e2e::Key::Enter)
+        .expect("submit prompt");
+    session
+        .wait_for_text("Fresh start response", TIMEOUT)
+        .expect("mock agent answered");
 }
 
 #[test]
@@ -263,77 +281,32 @@ fn test_startup_hides_install_hint_when_nori_installed() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
-fn test_trust_directory_saves_to_config() {
-    // This test verifies that when a user completes the trust directory onboarding,
-    // their choice is saved to config.toml in NORI_HOME.
-    use tui_pty_e2e::Key;
-
+#[cfg(unix)]
+fn first_launch_flag_does_not_gate_or_rewrite_existing_config() {
+    let original = "[cli]\nfirst_launch_complete = false\n";
     let mut session = TuiSession::spawn_with_config(
         24,
         80,
-        SessionConfig::default()
-            // Don't skip trust directory - allows trust prompt to appear
+        SessionConfig::new()
             .with_skip_trust_directory(false)
-            // Empty config means no config.toml written, triggering first-launch
-            .with_config_toml(""),
+            .with_config_toml(original)
+            .with_mock_response("Configured start response"),
     )
-    .expect("Failed to spawn");
-
-    // Step 1: Wait for the welcome screen
+    .expect("spawn Nori with an incomplete first-launch flag");
     session
-        .wait_for_text("Welcome to Nori", TIMEOUT)
-        .expect("Welcome screen did not appear");
-
-    // Step 2: Press Enter to advance past welcome screen
-    session.send_key(Key::Enter).expect("Failed to send Enter");
-
-    // Step 3: Wait for the trust directory screen
-    // The trust screen shows "You are running Nori in" for the directory path
+        .wait_for_text("›", TIMEOUT)
+        .expect("composer appears immediately");
+    let contents = session.screen_contents();
+    assert!(!contents.contains("Welcome to Nori"), "{contents}");
+    assert!(!contents.contains("You are running Nori in"), "{contents}");
     session
-        .wait_for_text("You are running Nori in", TIMEOUT)
-        .expect("Trust directory screen did not appear");
-
-    // Step 4: Press 'y' or '1' to select "Trust" option
-    // (The default for non-git repos is DontTrust, so we explicitly select Trust)
+        .submit_input("configured start")
+        .expect("submit without setup");
     session
-        .send_key(Key::Char('y'))
-        .expect("Failed to send 'y' key");
-
-    // Step 5: Wait for the main prompt to appear (onboarding complete). The
-    // idle footer no longer carries an approvals chip by default, so the trust
-    // screen giving way to the composer is the signal.
-    session
-        .wait_for(
-            |contents| contents.contains("›") && !contents.contains("You are running Nori in"),
-            TIMEOUT,
-        )
-        .expect("Main prompt did not appear after trust selection");
-
-    // Give a moment for config to be written
-    std::thread::sleep(TIMEOUT_PRESNAPSHOT);
-
-    // Step 6: Verify config.toml was created with trust entry
-    let nori_home = session
-        .nori_home_path()
-        .expect("No NORI_HOME temp directory");
-    let config_path = nori_home.join("config.toml");
-
-    assert!(
-        config_path.exists(),
-        "config.toml should exist after trust selection, NORI_HOME: {}",
-        nori_home.display()
-    );
-
-    let config_content = std::fs::read_to_string(&config_path).expect("Failed to read config.toml");
-
-    let project_key = format!("\"{}\"", nori_home.display());
-    assert!(
-        config_content.contains(&project_key)
-            && config_content.contains("trust_level = \"trusted\""),
-        "config.toml should mark {project_key} as trusted, got:\n{}",
-        config_content
-    );
+        .wait_for_text("Configured start response", TIMEOUT)
+        .expect("mock agent answered");
+    let config_path = session.nori_home_path().unwrap().join("config.toml");
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), original);
 }
 
 #[test]

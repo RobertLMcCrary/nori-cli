@@ -1,0 +1,10 @@
+---
+source: tui/src/chatwidget/tests/subagents.rs
+assertion_line: 326
+expression: rendered
+---
+
+ 2% / 1.00M
+› Ask Nori to do anything
+
+ │● Count lines i ││● Read a.txt co │

@@ -56,7 +56,6 @@ pub(crate) struct ModelCycle {
     /// Where the presses since the request went out point, one target per option.
     queued: Vec<Target>,
     /// What the run changes, for the words shown if the agent refuses.
-    kind: CycledOption,
     /// The configuration before the run's first press, restored if the agent refuses.
     before: Option<Vec<acp::SessionConfigOption>>,
 }
@@ -144,10 +143,10 @@ impl ChatWidget {
         let noun = kind.noun();
         let mut options = self.agent_config().raw_options();
         let Some(option) = options.iter_mut().find(|option| kind.selects(option)) else {
-            self.add_info_message(
-                format!("This agent doesn't offer a choice of {noun}."),
-                None,
-            );
+            self.app_event_tx
+                .send(crate::app_event::AppEvent::TransientNotice(format!(
+                    "This agent doesn't offer a choice of {noun}."
+                )));
             return true;
         };
         let option_name = option.name.clone();
@@ -201,7 +200,6 @@ impl ChatWidget {
             option_name,
             value_name,
         };
-        self.model_cycle.kind = kind;
         if self.model_cycle.in_flight {
             // The newest target for an option replaces an older one; another option's stays.
             self.model_cycle
@@ -224,6 +222,7 @@ impl ChatWidget {
             target.value_name,
             false,
             ConfigPickerOrigin::Cycle,
+            None,
         );
     }
 
@@ -243,15 +242,10 @@ impl ChatWidget {
         match result {
             Ok(Some(options)) => self.sync_acp_session_config_snapshot(&options),
             Ok(None) => {}
-            Err(error) => {
+            Err(_error) => {
                 if let Some(before) = before {
                     self.sync_acp_session_config_snapshot(&before);
                 }
-                let message = match self.model_cycle.kind {
-                    CycledOption::Model => format!("Couldn't switch models: {error}"),
-                    CycledOption::Effort => format!("Couldn't change the effort level: {error}"),
-                };
-                self.add_info_message(message, None);
             }
         }
         self.request_redraw();

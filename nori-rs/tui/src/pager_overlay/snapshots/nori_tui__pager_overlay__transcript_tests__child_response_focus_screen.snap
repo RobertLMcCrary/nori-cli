@@ -1,0 +1,23 @@
+---
+source: tui/src/pager_overlay/transcript_tests.rs
+expression: text(&render(&mut overlay))
+---
+/ T R A N S C R I P T / / / / / / / / / / / / / / / / / / /
+• First child answer
+
+• Second child answer
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+───────────────────────────────────────────────────── 100% ─
+ ctrl + h/ctrl + l responses   esc cancel
+ enter roll back   space fork subagent

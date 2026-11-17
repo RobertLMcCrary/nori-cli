@@ -13,12 +13,11 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Stylize;
 use ratatui::text::Line;
-use ratatui::text::Span;
 use std::time::Duration;
 
 mod approval_overlay;
+mod approval_tool_details;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
 mod bottom_pane_view;
@@ -31,6 +30,7 @@ mod file_search_popup;
 mod footer;
 mod history_search_popup;
 mod list_selection_view;
+mod popup_layout;
 mod prompt_args;
 pub(crate) use component_picker_view::ComponentPickerParams;
 #[cfg(test)]
@@ -42,7 +42,9 @@ mod queued_user_messages;
 mod scroll_state;
 mod selection_popup_common;
 mod skill_popup;
-mod textarea;
+mod user_question;
+pub(crate) use user_question::UserQuestionRequest;
+pub(crate) mod textarea;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancellationEvent {
@@ -158,7 +160,7 @@ impl BottomPane {
         };
 
         // Set description overrides for the slash command popup so that
-        // /agent and /model show the current agent name from startup.
+        // /model shows the current agent name from startup.
         if !pane.agent_display_name.is_empty() {
             let name = pane.agent_display_name.clone();
             pane.set_agent_display_name(name);
@@ -169,6 +171,11 @@ impl BottomPane {
 
     pub fn status_widget(&self) -> Option<&StatusIndicatorWidget> {
         self.status.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_composer_placeholder_for_test(&mut self, placeholder: &str) {
+        self.composer.set_placeholder_for_test(placeholder);
     }
 
     fn active_view(&self) -> Option<&dyn BottomPaneView> {
@@ -204,7 +211,11 @@ impl BottomPane {
             } else {
                 view.handle_key_event(key_event);
                 if view.is_complete() {
-                    self.view_stack.clear();
+                    if view.preserve_previous_views() {
+                        self.view_stack.pop();
+                    } else {
+                        self.view_stack.clear();
+                    }
                     self.on_active_view_complete();
                 }
             }
@@ -225,6 +236,21 @@ impl BottomPane {
                 self.request_redraw();
                 return InputResult::None;
             }
+            if matches!(
+                key_event,
+                crossterm::event::KeyEvent {
+                    code: crossterm::event::KeyCode::Enter,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                    kind: crossterm::event::KeyEventKind::Press,
+                    ..
+                }
+            ) && self.composer.is_empty()
+                && !self.composer.is_in_paste_burst()
+                && !self.composer.popup_active()
+                && self.has_queued_user_messages()
+            {
+                return InputResult::PromoteQueued;
+            }
             let (input_result, needs_redraw) = self.composer.handle_key_event(key_event);
             if needs_redraw {
                 self.request_redraw();
@@ -234,6 +260,29 @@ impl BottomPane {
             }
             input_result
         }
+    }
+
+    /// Route mouse input to the popup before any conversation gesture handling.
+    pub(crate) fn handle_popup_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        let Some(view) = self.view_stack.last_mut() else {
+            return false;
+        };
+        if !self.composer.input_enabled() {
+            return true;
+        }
+        let changed = view.handle_mouse_event(mouse);
+        if view.is_complete() {
+            if view.preserve_previous_views() {
+                self.view_stack.pop();
+            } else {
+                self.view_stack.clear();
+            }
+            self.on_active_view_complete();
+        }
+        if changed {
+            self.request_redraw();
+        }
+        true
     }
 
     /// Handle Ctrl-C in the bottom pane. If a modal view is active it gets a
@@ -441,10 +490,6 @@ impl BottomPane {
 
     fn refresh_agent_command_descriptions(&mut self) {
         let name = self.agent_display_name.clone();
-        self.composer.set_command_description_override_line(
-            crate::slash_command::SlashCommand::Agent,
-            agent_command_description(&name, self.acp_wire_recording_enabled),
-        );
         self.composer.set_command_description_override(
             crate::slash_command::SlashCommand::Model,
             format!(
@@ -482,6 +527,29 @@ impl BottomPane {
     /// Update the hotkey configuration used by the textarea for editing bindings.
     pub(crate) fn set_hotkey_config(&mut self, config: nori_config::HotkeyConfig) {
         self.composer.set_hotkey_config(config);
+    }
+
+    pub(crate) fn composer_cursor_style(&self) -> crossterm::cursor::SetCursorStyle {
+        if self.active_view().is_some() {
+            crossterm::cursor::SetCursorStyle::DefaultUserShape
+        } else {
+            self.composer.cursor_style()
+        }
+    }
+
+    pub(crate) fn place_cursor_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if self.active_view().is_some() {
+            return false;
+        }
+        let changed = self.composer.place_cursor_at(column, row, area);
+        if changed {
+            self.request_redraw();
+        }
+        changed
+    }
+
+    pub(crate) fn set_kakoune_mode(&mut self, enabled: bool) {
+        self.composer.set_kakoune_mode(enabled);
     }
 
     pub(crate) fn set_vim_mode(&mut self, value: nori_config::VimEnterBehavior) {
@@ -636,6 +704,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_child_context(&mut self, child: bool) {
+        self.composer.set_child_context(child);
+        self.request_redraw();
+    }
+
     /// Update the cloud session id displayed in the footer (None hides it).
     pub(crate) fn set_cloud_session(&mut self, cloud_session: Option<String>) {
         self.composer.set_cloud_session(cloud_session);
@@ -766,6 +839,14 @@ impl BottomPane {
         self.push_view(Box::new(modal));
     }
 
+    pub(crate) fn push_user_question(&mut self, request: UserQuestionRequest) {
+        self.pause_status_timer_for_modal();
+        self.push_view(Box::new(user_question::UserQuestionView::new(
+            request,
+            self.app_event_tx.clone(),
+        )));
+    }
+
     fn on_active_view_complete(&mut self) {
         self.resume_status_timer_after_modal();
     }
@@ -854,7 +935,14 @@ impl BottomPane {
 
     fn as_renderable(&'_ self) -> RenderableItem<'_> {
         if let Some(view) = self.active_view() {
-            RenderableItem::Borrowed(view)
+            if view.keeps_composer_visible() {
+                RenderableItem::Owned(Box::new(popup_layout::PopupLayout {
+                    view,
+                    composer: &self.composer,
+                }))
+            } else {
+                RenderableItem::Borrowed(view)
+            }
         } else {
             let mut flex = FlexRenderable::new();
             if let Some(status) = &self.status {
@@ -872,36 +960,12 @@ impl BottomPane {
     }
 }
 
-fn agent_command_description(agent_name: &str, recording_enabled: bool) -> Line<'static> {
-    let command_description = crate::slash_command::SlashCommand::Agent.description();
-    let prefix = if agent_name.is_empty() {
-        command_description.to_string()
-    } else {
-        format!("{command_description} (current: {agent_name})")
-    };
-    let (symbol, status) = if recording_enabled {
-        ("●", "on")
-    } else {
-        ("○", "off")
-    };
-    let symbol_span: Span<'static> = if recording_enabled {
-        symbol.red()
-    } else {
-        symbol.into()
-    };
-
-    Line::from(vec![
-        format!("{prefix} (").dim(),
-        symbol_span,
-        format!(" rec {status})").dim(),
-    ])
-}
-
 impl BottomPane {
     /// Rows of a popup or view that is open, beyond the prompt's own height, which the screen
     /// shows it over instead of pushing the history away.
     pub(crate) fn popup_rows(&self, width: u16) -> u16 {
         match self.active_view() {
+            Some(view) if view.keeps_composer_visible() => view.desired_height(width),
             Some(view) => view
                 .desired_height(width)
                 .saturating_sub(self.composer.desired_height(width)),
@@ -1033,53 +1097,42 @@ mod tests {
             None,
         ));
 
-        let rendered = render_snapshot(&pane, Rect::new(0, 0, 100, 22));
+        let rendered = render_snapshot(&pane, Rect::new(0, 0, 100, 22))
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert_selected_row_has_symmetric_rails(&rendered, "Pinned Plan Drawer");
-        assert!(rendered.contains("/ search"), "{rendered}");
+        assert!(!rendered.contains("/ search"), "{rendered}");
         assert_snapshot!("shared_settings_picker", rendered);
 
-        pane.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         for character in "resize reflow".chars() {
             pane.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
-        let filtered = render_snapshot(&pane, Rect::new(0, 0, 100, 22));
+        let filtered = render_snapshot(&pane, Rect::new(0, 0, 100, 22))
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(filtered.contains("Resize Reflow"), "{filtered}");
         assert!(!filtered.contains("Pinned Plan Drawer"), "{filtered}");
         assert_snapshot!("shared_settings_picker_search", filtered);
     }
 
     #[test]
-    fn agent_selection_uses_the_shared_non_searchable_picker() {
+    fn providers_picker_shows_connection_state() {
         let mut pane = test_bottom_pane();
-        let (tx, _rx) = unbounded_channel();
-        pane.show_selection_view(crate::nori::agent_picker::agent_picker_params(
-            "mock-model",
-            AppEventSender::new(tx),
-            false,
-        ));
-
-        let rendered = render_snapshot(&pane, Rect::new(0, 0, 100, 18));
-
-        assert_selected_row_has_symmetric_rails(&rendered, "Mock ACP");
-        assert!(!rendered.contains("/ search"), "{rendered}");
-        assert!(rendered.contains("shift-tab rec on"), "{rendered}");
-        assert_snapshot!("shared_agent_picker", rendered);
-
-        pane.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        pane.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        let navigated = render_snapshot(&pane, Rect::new(0, 0, 100, 18));
-        let mock_row = navigated
+        let mut params = crate::nori::agent_picker::provider_picker_params();
+        params.items.retain(|item| item.name == "Mock ACP");
+        pane.show_selection_view(params);
+        let rendered = render_snapshot(&pane, Rect::new(0, 0, 100, 12))
             .lines()
-            .find(|row| row.contains("Mock ACP"))
-            .expect("mock agent row");
-        assert!(!mock_row.contains('▏') && !mock_row.contains('▕'));
-        assert!(
-            navigated
-                .lines()
-                .any(|row| row.contains('▏') && row.contains('▕')),
-            "{navigated}"
-        );
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("sign-in status unknown"), "{rendered}");
+        assert_snapshot!("providers_picker", rendered);
     }
 
     #[test]
@@ -1125,7 +1178,11 @@ mod tests {
                 None,
             ),
         );
-        let config_render = render_snapshot(&pane, Rect::new(0, 0, 100, 16));
+        let config_render = render_snapshot(&pane, Rect::new(0, 0, 100, 16))
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_selected_row_has_symmetric_rails(&config_render, "Model");
         assert_snapshot!("shared_session_config_picker", config_render);
 
@@ -1139,7 +1196,11 @@ mod tests {
                 crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
             ),
         );
-        let model_render = render_snapshot(&pane, Rect::new(0, 0, 100, 18));
+        let model_render = render_snapshot(&pane, Rect::new(0, 0, 100, 22))
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(model_render.contains("Recommended"), "{model_render}");
         assert!(model_render.contains("Other"), "{model_render}");
         assert_selected_row_has_symmetric_rails(&model_render, "Stable");
@@ -1513,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_agent_description_appends_recording_status_after_current_agent() {
+    fn slash_providers_description_is_visible() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -1534,7 +1595,7 @@ mod tests {
         });
 
         pane.set_acp_wire_recording_enabled(false);
-        for ch in ['/', 'a', 'g'] {
+        for ch in ['/', 'p', 'r'] {
             let _ = pane.composer.handle_key_event(KeyEvent::new(
                 KeyCode::Char(ch),
                 crossterm::event::KeyModifiers::NONE,
@@ -1549,10 +1610,8 @@ mod tests {
         let rendered = snapshot_buffer(&buf);
 
         assert!(
-            rendered.contains(
-                "/agent  switch between available ACP agents (current: ElizACP) (○ rec off)"
-            ),
-            "expected /agent row to show current agent before recording status, got:\n{rendered}"
+            rendered.lines().any(|line| line.contains("/providers") && line.contains("connect model providers")),
+            "expected /providers row to describe provider setup, got:\n{rendered}"
         );
     }
 
@@ -1730,6 +1789,11 @@ mod tests {
         pane.set_task_running(true);
         pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
         pane.hide_status_indicator();
+        assert!(matches!(
+            pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputResult::PromoteQueued
+        ));
+        assert!(pane.has_queued_user_messages());
 
         let width = 48;
         let height = pane.desired_height(width);
@@ -1836,5 +1900,44 @@ mod tests {
             !snapshot.contains("Picker v1"),
             "old picker title should not appear after replacement: {snapshot:?}"
         );
+    }
+
+    #[test]
+    fn searchable_popup_keeps_draft_cursor_at_the_same_bottom_row() {
+        for width in [30, 80] {
+            let mut pane = test_bottom_pane();
+            pane.set_composer_text("draft stays here".to_owned());
+            let normal_height = pane.desired_height(width);
+            let normal_area = Rect::new(0, 25 - normal_height, width, normal_height);
+            let normal = pane.cursor_pos(normal_area).expect("draft cursor");
+            pane.show_selection_view(
+                SelectionViewParams {
+                    title: Some("Models".to_owned()),
+                    is_searchable: true,
+                    items: vec![SelectionItem {
+                        name: "Astra".to_owned(),
+                        actions: vec![Box::new(|_| {})],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .picker(),
+            );
+            let popup_height = pane.desired_height(width).min(25);
+            let popup_area = Rect::new(0, 25 - popup_height, width, popup_height);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 25));
+            pane.render(popup_area, &mut buffer);
+            let rendered = snapshot_buffer(&buffer);
+            let draft_row = rendered
+                .lines()
+                .position(|line| line.contains("draft stays here"))
+                .expect("draft stays visible below picker");
+            assert_eq!(draft_row, usize::from(normal.1));
+            pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            if pane.has_active_view() {
+                pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            assert_eq!(pane.cursor_pos(normal_area), Some(normal));
+        }
     }
 }

@@ -14,7 +14,8 @@ each crate's `docs.md`.
 | [warm-sessions.md](warm-sessions.md) | Agent sessions started ahead of time so switching is instant |
 | [headless.md](headless.md) | `nori exec` plaintext mode and the ACP stdio facade |
 | [transcripts.md](transcripts.md) | Transcript file locations and schema |
-| [workflows.md](workflows.md) | The `nori/workflow` Scheme DSL: scripts, inline prompts, and the sandbox |
+| [workflows.md](workflows.md) | Pkl workflow policies, machine properties, hooks, and model fallback |
+| [conversation-programs.md](conversation-programs.md) | Pkl commands, append-only journals, projections, and replay |
 
 Rules for these docs:
 

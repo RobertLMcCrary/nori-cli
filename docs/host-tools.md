@@ -10,6 +10,10 @@ no MCP server, port, socket or process between them. Every other agent gets the
 same tools from the `nori-client` MCP server (see
 [nori-client-mcp.md](nori-client-mcp.md)).
 
+For cross-provider delegation, agents use `agent_capabilities` to discover Nori's configured
+providers and models, then pass the returned values to `delegate_task`. An agent's own spawn tool
+may expose only its native provider's models and is not Nori's cross-provider catalog.
+
 Both paths serve the same `#[tool]` methods (`nori-rs/harness/src/backend/`),
 so names, schemas, descriptions and replies are identical whichever way an
 agent reaches them.
@@ -64,6 +68,27 @@ tool search when needed. `pull_request` asks the user itself when the workflow
 says to (see [forge.md](forge.md)), so being pre-allowed skips no question. The client's own MCP servers (stdio, HTTP,
 SSE) are handed to the CLI's `--mcp-config` as they are; the CLI connects to
 them itself.
+
+## Tool results and cancellation
+
+The in-process host boundary retains the complete MCP result as JSON, including
+content blocks, `structuredContent`, and `_meta`; its text view remains
+available to older callers. Claude's SDK server returns that MCP result as-is.
+OpenCode and Gemini receive Nori tools through MCP and their engines handle the
+MCP response. OpenCode preserves its complete tool event in ACP raw output,
+forwards valid ACP content blocks, and retains unknown blocks in raw output;
+replay retains the full persisted tool state. Codex dynamic tools support text, images, and audio: Nori passes media as
+data URLs, represents resource and unknown blocks as JSON text, and
+includes structured content and metadata as JSON text. Conversation-program
+receipts retain the original MCP result along with the text view.
+
+On Codex turn cancellation, Nori cancels the pending host-call future and
+submits an error result whose structured content identifies the cancelled call
+and tool. Claude's host server tracks MCP request IDs and cancels calls on an
+MCP cancellation notification or a session cancellation; its cancelled result
+also identifies the request and tool. Dropping a future cannot undo an effect
+already performed or stop work that a tool deliberately detached; cancellation
+does not promise rollback.
 
 ## In the TUI
 

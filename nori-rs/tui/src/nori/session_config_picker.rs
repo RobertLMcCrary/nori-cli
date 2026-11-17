@@ -18,6 +18,8 @@ pub(crate) enum ConfigPickerOrigin {
     Panel,
     /// A command for one setting, such as `/model`: choosing a value closes the picker.
     Direct,
+    /// A child model picker, bound to the session that opened it.
+    Child(crate::subagent_switcher::SubagentKey),
     /// A key that steps to the next or previous model: no picker, and the footer shows the
     /// change instead of a history line.
     Cycle,
@@ -139,7 +141,14 @@ pub(crate) fn acp_session_config_value_picker_params(
         acp::SessionConfigSelectOptions::Grouped(groups) => {
             for group in groups {
                 recommended.push(group_header_item(group));
-                for option_value in &group.options {
+                let mut options: Vec<&acp::SessionConfigSelectOption> =
+                    group.options.iter().collect();
+                if is_model {
+                    crate::nori::agent_config_state::sort_models(&mut options, |value| {
+                        (&value.value.0, &value.name)
+                    });
+                }
+                for option_value in options {
                     recommended.push(value_item(
                         option,
                         option_value,
@@ -293,6 +302,7 @@ fn other_model_item(
                 value_name: value_name.clone(),
                 is_custom_model: true,
                 origin,
+                route_token: None,
             });
         })]
     };
@@ -341,6 +351,7 @@ fn value_item(
                 value_name: value_name.clone(),
                 is_custom_model: false,
                 origin,
+                route_token: None,
             });
         })]
     };
@@ -380,6 +391,27 @@ fn count_select_values(options: &acp::SessionConfigSelectOptions) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_model_choice_retains_its_origin() {
+        let key = crate::subagent_switcher::SubagentKey(17);
+        let params = acp_session_config_value_picker_params(
+            &model_option(),
+            &[],
+            ConfigPickerOrigin::Child(key),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = crate::app_event_sender::AppEventSender::new(tx);
+        let selected = params
+            .items
+            .iter()
+            .find(|item| item.name == "Mock Fast Model")
+            .expect("alternate model");
+        selected.actions[0](&sender);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::SetAcpSessionConfigOption { origin: ConfigPickerOrigin::Child(actual), .. }) if actual == key)
+        );
+    }
 
     fn model_option() -> acp::SessionConfigOption {
         acp::SessionConfigOption::select(

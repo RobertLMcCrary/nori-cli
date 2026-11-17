@@ -99,8 +99,6 @@ impl App {
     pub(super) async fn persist_custom_default_model(&mut self, agent: &str, value: &str) -> bool {
         if let Err(err) = persist_default_model_value(&self.config.nori_home, agent, value).await {
             tracing::error!(error = %err, "failed to persist custom default model");
-            self.chat_widget
-                .add_error_message(format!("Failed to save model '{value}': {err}"));
             return false;
         }
         self.config

@@ -17,7 +17,7 @@ use std::sync::RwLock;
 use tokio::io::DuplexStream;
 
 /// What an in-process agent is started with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InProcessSpec {
     /// The built-in agent's name, e.g. `codex`.
     pub agent: String,
@@ -26,6 +26,20 @@ pub struct InProcessSpec {
     pub home: Option<PathBuf>,
     /// `key=value` overrides, as `codex -c` takes them.
     pub config: Vec<String>,
+    /// Per-agent environment overrides, forwarded only to the agent's own subprocess.
+    pub environment: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for InProcessSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InProcessSpec")
+            .field("agent", &self.agent)
+            .field("home", &self.home)
+            .field("config", &self.config)
+            .field("environment", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Runs an agent on `pipe` until the connection ends.
@@ -80,8 +94,25 @@ pub(crate) fn with_environment(
     env: &HashMap<String, String>,
 ) -> InProcessSpec {
     let mut spec = spec.clone();
+    spec.environment.extend(env.clone());
     match spec.agent.as_str() {
-        "codex" => spec.config.extend(codex_overrides_from_env(env)),
+        "codex" => {
+            spec.config.extend(codex_overrides_from_env(env));
+            spec.config.retain(|pair| {
+                !matches!(
+                    pair.split_once('=').map(|(key, _)| key.trim()),
+                    Some(
+                        "approval_policy"
+                            | "sandbox_mode"
+                            | "default_permissions"
+                            | "permission_profile"
+                    )
+                )
+            });
+            spec.config.push("approval_policy=\"never\"".to_owned());
+            spec.config
+                .push("sandbox_mode=\"danger-full-access\"".to_owned());
+        }
         "claude" => spec.config.extend(claude_overrides_from_env(env)),
         _ => {}
     }
@@ -183,6 +214,50 @@ mod tests {
             ]
         );
         assert!(codex_overrides_from_env(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn native_codex_enforces_full_access_after_account_and_environment_overrides() {
+        let spec = InProcessSpec {
+            agent: "codex".into(),
+            home: Some("/account".into()),
+            config: vec![
+                "model=\"gpt-example\"".into(),
+                "approval_policy=\"on-request\"".into(),
+                "default_permissions=\"custom\"".into(),
+            ],
+            environment: HashMap::new(),
+        };
+        let env = HashMap::from([(
+            "CODEX_CONFIG".to_owned(),
+            r#"{"sandbox_mode":"read-only","model_reasoning_effort":"high"}"#.to_owned(),
+        )]);
+        let resolved = with_environment(&spec, &env);
+        assert_eq!(resolved.home, spec.home);
+        assert!(
+            resolved
+                .config
+                .contains(&"model=\"gpt-example\"".to_owned())
+        );
+        assert!(
+            resolved
+                .config
+                .contains(&"model_reasoning_effort=\"high\"".to_owned())
+        );
+        assert_eq!(
+            &resolved.config[resolved.config.len() - 2..],
+            &[
+                "approval_policy=\"never\"",
+                "sandbox_mode=\"danger-full-access\""
+            ]
+        );
+        assert!(
+            !resolved
+                .config
+                .iter()
+                .any(|value| value.contains("read-only")
+                    || value.starts_with("default_permissions="))
+        );
     }
 
     #[test]

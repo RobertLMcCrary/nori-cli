@@ -28,6 +28,7 @@ fn announce(tree: &mut SubagentTree, parent: &acp::SessionId, index: usize, now:
         SubagentUpdate {
             parent_session_id: parent.clone(),
             session_id: session(index),
+            agent: Patch::Keep,
             title: Patch::Set("general-purpose".into()),
             description: Patch::Set(format!("task {index}")),
             state: Patch::Set(SubagentState::Running),
@@ -41,6 +42,7 @@ fn end(tree: &mut SubagentTree, index: usize, outcome: SubagentOutcome, now: Ins
         SubagentUpdate {
             parent_session_id: acp::SessionId::new("root"),
             session_id: session(index),
+            agent: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Ended(outcome)),
@@ -205,7 +207,8 @@ fn a_body_costs_the_rows_asked_for_not_the_length_of_the_conversation() {
         base,
     );
     let (ended_revision, ended_lines) = tree.body(SubagentKey(1), 80, 12).expect("ended body");
-    assert_eq!(ended_revision, -1);
+    let (ended_entries, _) = tree.entries(base);
+    assert_eq!(ended_revision, find(&ended_entries, 1).revision);
     assert_eq!(ended_lines.len(), 12);
     assert!(tree.body(SubagentKey(77), 80, 12).is_none());
 }
@@ -226,4 +229,75 @@ fn only_the_most_recent_finished_children_are_kept() {
             .iter()
             .all(|entry| entry.status == Status::Cancelled)
     );
+}
+
+#[test]
+fn idle_child_resumes_with_the_same_history_and_identity() {
+    let base = Instant::now();
+    let (mut tree, root) = new_tree();
+    announce(&mut tree, &root, 1, base);
+    say(&mut tree, 1, "first turn", base);
+    let state = |state| SubagentUpdate {
+        parent_session_id: root.clone(),
+        session_id: session(1),
+        agent: Patch::Keep,
+        title: Patch::Keep,
+        description: Patch::Keep,
+        state: Patch::Set(state),
+    };
+    tree.on_update(state(SubagentState::Idle), base);
+    assert_eq!(tree.running_count(), 0);
+    assert_eq!(find(&tree.entries(base).0, 1).status, Status::Idle);
+    tree.on_update(state(SubagentState::Running), base);
+    say(&mut tree, 1, "second turn", base);
+    assert_eq!(tree.running_count(), 1);
+    assert_eq!(find(&tree.entries(base).0, 1).status, Status::Running);
+    let (_, lines) = tree.body(SubagentKey(1), 80, 20).expect("child history");
+    let text = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("first turn"));
+    assert!(text.contains("second turn"));
+}
+
+#[test]
+fn announced_agent_identity_survives_child_completion() {
+    let now = Instant::now();
+    let (mut tree, root) = new_tree();
+    tree.on_update(
+        SubagentUpdate {
+            parent_session_id: root,
+            session_id: session(1),
+            agent: Patch::Set("claude-code".to_owned()),
+            title: Patch::Set("Research".to_owned()),
+            description: Patch::Keep,
+            state: Patch::Set(SubagentState::Running),
+        },
+        now,
+    );
+    assert_eq!(tree.agent_for_key(SubagentKey(1)), Some("claude-code"));
+    end(
+        &mut tree,
+        1,
+        SubagentOutcome::Completed { stop_reason: None },
+        now,
+    );
+    assert_eq!(tree.agent_for_key(SubagentKey(1)), Some("claude-code"));
+}
+
+#[test]
+fn parent_hierarchy_survives_parent_and_child_completion() {
+    let now = Instant::now();
+    let (mut tree, root) = new_tree();
+    announce(&mut tree, &root, 1, now);
+    announce(&mut tree, &session(1), 2, now);
+    assert_eq!(tree.parent_for_key(SubagentKey(2)), Some(SubagentKey(1)));
+    let done = SubagentOutcome::Completed { stop_reason: None };
+    end(&mut tree, 1, done.clone(), now);
+    assert_eq!(tree.parent_for_key(SubagentKey(2)), Some(SubagentKey(1)));
+    end(&mut tree, 2, done, now);
+    assert_eq!(tree.parent_for_key(SubagentKey(2)), Some(SubagentKey(1)));
+    assert_eq!(tree.parent_for_key(SubagentKey(1)), None);
 }

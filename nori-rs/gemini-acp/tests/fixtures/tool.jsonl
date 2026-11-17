@@ -1,0 +1,2 @@
+{"method":"generateContentStream","response":[{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","args":{"file_path":"/nori-gemini-nonexistent-test-file"}}}],"role":"model"},"finishReason":"STOP"}]}]}
+{"method":"generateContentStream","response":[{"candidates":[{"content":{"parts":[{"text":"done"}],"role":"model"},"finishReason":"STOP"}]}]}

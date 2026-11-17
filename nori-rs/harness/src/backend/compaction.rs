@@ -81,7 +81,7 @@ impl AcpBackend {
     }
 
     /// The newest exchanges of this session's transcript, for the checkpoint.
-    async fn recent_context(&self) -> Option<String> {
+    pub(super) async fn recent_context(&self) -> Option<String> {
         let recorder = self.transcript_recorder.read().await.clone()?;
         recorder.flush().await.ok()?;
         let transcript = crate::transcript::TranscriptLoader::new(self.nori_home.clone())

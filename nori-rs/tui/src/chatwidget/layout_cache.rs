@@ -133,6 +133,26 @@ impl Renderable for Capped<'_> {
     }
 }
 
+pub(super) struct PositionedBottomPane<'a> {
+    pub(super) pane: &'a crate::bottom_pane::BottomPane,
+    pub(super) area: &'a std::cell::Cell<Option<Rect>>,
+}
+
+impl Renderable for PositionedBottomPane<'_> {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.area.set(Some(area));
+        self.pane.render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.pane.desired_height(width)
+    }
+
+    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        self.pane.cursor_pos(area)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

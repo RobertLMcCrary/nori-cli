@@ -5,6 +5,112 @@ use super::*;
 const CLOUD_EXIT_CHILD_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl ChatWidget {
+    pub(crate) fn set_transcript_tools(&mut self, tools: Vec<super::tool_projection::ToolSpan>) {
+        if let Some(transcript) = &mut self.focused_transcript {
+            transcript.set_tools(tools);
+        }
+    }
+
+    pub(crate) fn transcript_tool_at(&self, column: u16, row: u16) -> Option<String> {
+        self.focused_transcript.as_ref()?.tool_at(column, row)
+    }
+
+    pub(crate) fn nearest_transcript_tool(&self) -> Option<String> {
+        self.focused_transcript.as_ref()?.nearest_tool()
+    }
+    pub(crate) fn set_main_history_view(
+        &mut self,
+        lines: Vec<ratatui::text::Line<'static>>,
+        scroll_offset: usize,
+    ) {
+        self.focused_transcript = Some(super::session_transcript::SessionTranscript::new(
+            lines,
+            scroll_offset,
+        ));
+    }
+
+    pub(crate) fn set_transcript_follow_live(&mut self, follow: bool) {
+        if let Some(transcript) = &mut self.focused_transcript {
+            transcript.set_follow_live(follow);
+        }
+    }
+
+    pub(crate) fn clear_main_history_view(&mut self) {
+        self.focused_transcript = None;
+    }
+
+    pub(crate) fn set_response_focus(&mut self, active: bool) {
+        self.response_focus.set_active(active);
+    }
+
+    pub(crate) fn set_response_focus_prompt(&mut self, sent_prompt: bool) {
+        self.response_focus.set_sent_prompt(sent_prompt);
+    }
+
+    pub(crate) fn response_focus_action_at(&self, column: u16, row: u16) -> Option<KeyEvent> {
+        if !self.response_focus.active() {
+            return None;
+        }
+        self.focused_transcript.as_ref().and_then(|transcript| {
+            transcript.action_at(column, row, self.response_focus.sent_prompt())
+        })
+    }
+
+    pub(crate) fn response_focus_viewport_height(&self, fallback: u16) -> usize {
+        let height = self
+            .focused_transcript
+            .as_ref()
+            .and_then(super::session_transcript::SessionTranscript::viewport_height)
+            // The primary projection starts below two reserved history rows and
+            // has one row of padding on each side of the transcript/composer seam.
+            .unwrap_or_else(|| {
+                self.bottom_pane_area
+                    .get()
+                    .map_or(fallback, |area| area.y)
+                    .saturating_sub(4)
+            });
+        usize::from(height.max(1))
+    }
+
+    pub(crate) fn set_response_focus_header(&mut self, header: usize) {
+        if let Some(transcript) = self.focused_transcript.as_mut() {
+            transcript.set_focus_header(header);
+        }
+    }
+
+    pub(crate) fn set_focused_subagent_view(
+        &mut self,
+        key: Option<crate::subagent_switcher::SubagentKey>,
+        lines: Vec<ratatui::text::Line<'static>>,
+        scroll_offset: usize,
+    ) {
+        if self.focused_subagent != key {
+            self.bottom_pane.set_child_context(key.is_some());
+            let queued = key
+                .and_then(|key| self.subagent_session(key))
+                .and_then(|id| self.child_queued_prompts.get(&id).cloned())
+                .unwrap_or_else(|| {
+                    if key.is_some() {
+                        Vec::new()
+                    } else {
+                        self.main_queued_prompts.clone()
+                    }
+                });
+            self.bottom_pane.set_queued_user_messages(queued);
+        }
+        self.focused_subagent = key;
+        self.focused_transcript =
+            key.map(|_| super::session_transcript::SessionTranscript::new(lines, scroll_offset));
+    }
+
+    pub(crate) fn focused_subagent(&self) -> Option<crate::subagent_switcher::SubagentKey> {
+        self.focused_subagent
+    }
+
+    pub(crate) fn restore_composer_submission(&mut self, text: String) {
+        self.bottom_pane.restore_composer_submission(text);
+    }
+
     /// Set the vertical footer layout flag for the TUI.
     pub(crate) fn set_vertical_footer(&mut self, enabled: bool) {
         self.bottom_pane.set_vertical_footer(enabled);
@@ -99,23 +205,6 @@ impl ChatWidget {
             std::time::Duration::ZERO
         };
         self.submit_harness_action(crate::app_event::HarnessAction::Shutdown { child_grace });
-    }
-
-    pub(crate) fn add_acp_session_config_set_message(
-        &mut self,
-        option_name: &str,
-        value_name: &str,
-        saved_as_default: bool,
-    ) {
-        self.add_to_history(
-            crate::nori::session_config_history::new_agent_option_set_history_cell(
-                self.bottom_pane.agent_display_name(),
-                option_name,
-                value_name,
-                saved_as_default,
-            ),
-        );
-        self.request_redraw();
     }
 
     pub(crate) fn add_plain_history_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -233,6 +322,10 @@ impl ChatWidget {
         (Some(text).filter(|text| !text.is_empty()), image_paths)
     }
 
+    pub(crate) fn has_initial_input(&self) -> bool {
+        self.initial_user_message.is_some()
+    }
+
     pub(crate) fn has_harness_session(&self) -> bool {
         self.harness_handle.is_some()
     }
@@ -258,6 +351,10 @@ impl ChatWidget {
     }
 
     /// Returns true if a popup or custom view is currently active in the bottom pane.
+    pub(crate) fn handle_popup_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        self.bottom_pane.handle_popup_mouse(mouse)
+    }
+
     pub(crate) fn has_active_popup(&self) -> bool {
         self.bottom_pane.has_active_view()
     }
@@ -317,7 +414,20 @@ impl ChatWidget {
 
     pub(crate) fn submit_harness_action(&self, action: crate::app_event::HarnessAction) {
         let Some(handle) = self.harness_handle.clone() else {
-            if matches!(action, crate::app_event::HarnessAction::Shutdown { .. }) {
+            if let crate::app_event::HarnessAction::SendSubagentMessage {
+                key,
+                text,
+                image_paths,
+                ..
+            } = action
+            {
+                self.app_event_tx.send(AppEvent::SubagentMessageFailed {
+                    key,
+                    text,
+                    image_paths,
+                    error: "No active harness session".to_owned(),
+                });
+            } else if matches!(action, crate::app_event::HarnessAction::Shutdown { .. }) {
                 self.app_event_tx.send(AppEvent::ExitRequest);
             } else {
                 self.app_event_tx.send(AppEvent::HarnessActionFailed(
@@ -340,6 +450,56 @@ impl ChatWidget {
                 }
                 HarnessAction::Compact => handle.compact().await,
                 HarnessAction::Branch => handle.branch().await,
+                HarnessAction::ForkHistory { context, source } => {
+                    handle.fork_history(context, source).await
+                }
+                HarnessAction::SendSubagentMessage {
+                    key,
+                    session_id,
+                    text,
+                    image_paths,
+                    steer,
+                } => {
+                    let mut content = Vec::new();
+                    if !text.is_empty() {
+                        content.push(nori_protocol::acp::v1::ContentBlock::Text(
+                            nori_protocol::acp::v1::TextContent::new(text.clone()),
+                        ));
+                    }
+                    let images = image_paths
+                        .iter()
+                        .map(|path| super::user_input::local_image_content(path))
+                        .collect::<Result<Vec<_>, _>>();
+                    let result = match images {
+                        Ok(images) => {
+                            content.extend(images);
+                            if steer {
+                                handle
+                                    .steer_subagent_content(session_id, content)
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            } else {
+                                handle
+                                    .send_subagent_content(session_id, content)
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            app_event_tx.send(AppEvent::SubagentMessageFailed {
+                                key,
+                                text,
+                                image_paths,
+                                error,
+                            });
+                            Ok(())
+                        }
+                    }
+                }
                 HarnessAction::UndoTo(index) => handle.undo_to(index).await,
                 HarnessAction::LoadUndoSnapshots => match handle.undo_snapshots().await {
                     Ok(snapshots) => {
@@ -411,6 +571,7 @@ impl ChatWidget {
         text: String,
         image_paths: Vec<PathBuf>,
         echo: nori_protocol::PromptEchoId,
+        steer: bool,
     ) {
         let Some(handle) = self.harness_handle.clone() else {
             self.app_event_tx.send(AppEvent::PromptSubmitFailed(
@@ -446,7 +607,12 @@ impl ChatWidget {
                     }
                 }
             }
-            if let Err(error) = handle.prompt_echoed(content, &echo).await {
+            let result = if steer {
+                handle.steer_echoed(content, &echo).await
+            } else {
+                handle.prompt_echoed(content, &echo).await
+            };
+            if let Err(error) = result {
                 app_event_tx.send(AppEvent::PromptSubmitFailed(error.to_string()));
             }
         });
@@ -497,25 +663,47 @@ impl ChatWidget {
     pub(crate) fn clear_token_usage(&mut self) {}
 
     pub(super) fn as_renderable(&self) -> RenderableItem<'_> {
-        let active_cell_renderable = if self.active_cell.is_some() {
-            RenderableItem::Borrowed(&self.active_cell).inset(Insets::tlbr(1, 0, 0, 0))
-        } else {
-            RenderableItem::Owned(Box::new(()))
-        };
         let mut flex = FlexRenderable::new();
-        flex.push(1, active_cell_renderable);
-        if self.live_tail.is_some() {
-            // The first line of a message sits under a blank separator, like its cell in history.
-            let separator = u16::from(self.live_tail_has_header);
-            flex.push(
-                1,
-                RenderableItem::Owned(Box::new(super::layout_cache::Capped {
-                    cell: &self.live_tail,
-                    bottom_pane: &self.bottom_pane,
-                    screen_rows: self.screen_rows.get(),
-                }))
-                .inset(Insets::tlbr(separator, 0, 0, 0)),
-            );
+        if let Some(transcript) = &self.focused_transcript {
+            if self.focused_subagent().is_none()
+                && !self.response_focus.active()
+                && transcript.follows_live()
+            {
+                flex.push(
+                    1,
+                    RenderableItem::Owned(Box::new(super::owned_transcript::OwnedTranscript {
+                        transcript,
+                        active: self.active_cell.is_some().then_some(&self.active_cell),
+                        live: self.live_tail.is_some().then_some(&self.live_tail),
+                        live_separator: self.live_tail_has_header,
+                    })),
+                );
+            } else {
+                flex.push(
+                    1,
+                    RenderableItem::Borrowed(transcript).inset(Insets::tlbr(1, 0, 0, 0)),
+                );
+            }
+        } else {
+            let active_cell_renderable = if self.active_cell.is_some() {
+                RenderableItem::Borrowed(&self.active_cell).inset(Insets::tlbr(1, 0, 0, 0))
+            } else {
+                RenderableItem::Owned(Box::new(()))
+            };
+            flex.push(1, active_cell_renderable);
+            if self.live_tail.is_some() {
+                // The first line of a message sits under a blank separator, like its cell in history.
+                let separator = u16::from(self.live_tail_has_header);
+                flex.push(
+                    1,
+                    RenderableItem::Owned(Box::new(super::layout_cache::Capped {
+                        cell: &self.live_tail,
+                        bottom_pane: &self.bottom_pane,
+                        screen_rows: self.screen_rows.get(),
+                    }))
+                    .inset(Insets::tlbr(separator, 0, 0, 0)),
+                );
+            }
         }
         // Pinned plan drawer: renders the latest plan state between the active
         // cell and the bottom pane. When no plan has been received yet, the
@@ -544,22 +732,24 @@ impl ChatWidget {
                 PlanDrawerMode::Off => {}
             }
         }
-        if self.subagents.has_running() {
-            flex.push(
-                0,
-                RenderableItem::Owned(Box::new(subagents::SubagentBlock {
-                    tree: &self.subagents,
-                    now: std::time::Instant::now(),
-                    screen_rows: self.screen_rows.get(),
-                    stoppable: self.subagents_stoppable(),
-                }))
-                .inset(Insets::tlbr(1, 0, 0, 0)),
-            );
-        }
         flex.push(
             0,
-            RenderableItem::Borrowed(&self.bottom_pane).inset(Insets::tlbr(1, 0, 0, 0)),
+            RenderableItem::Owned(Box::new(super::layout_cache::PositionedBottomPane {
+                pane: &self.bottom_pane,
+                area: &self.bottom_pane_area,
+            }))
+            .inset(Insets::tlbr(1, 0, 0, 0)),
         );
+        if self.subagents.visible_count() > 0 {
+            flex.push(
+                0,
+                RenderableItem::Owned(Box::new(subagents::SubagentStrip {
+                    tree: &self.subagents,
+                    focused: self.focused_subagent,
+                    state: &self.subagent_strip,
+                })),
+            );
+        }
         RenderableItem::Owned(Box::new(flex))
     }
 

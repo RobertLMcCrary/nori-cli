@@ -138,6 +138,7 @@ pub(crate) fn agent_prepare_spec(
     initial_context: Option<String>,
 ) -> AgentPrepareSpec {
     AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
         session_context: Some(SessionContext {

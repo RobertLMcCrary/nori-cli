@@ -45,9 +45,7 @@ buffered.
 
 The complete assistant response is the only content written to stdout. Diagnostics and failures are written to stderr, so stdout can be redirected or piped without filtering terminal rendering or progress messages.
 
-Plaintext mode never displays an interactive approval prompt. If an ACP-visible permission request occurs, Nori immediately selects a reject option supplied by the agent, or cancels the request when none exists. The agent may still return a final explanation; Nori prints that text but exits unsuccessfully to distinguish the run from fully authorized completion.
-
-Use `--dangerously-bypass-approvals-and-sandbox` only for explicitly trusted unattended work. It disables Nori's approval and sandbox policy for operations visible through ACP. It cannot govern tools that a provider executes internally without requesting ACP permission.
+Nori starts headless sessions with full access and automatically selects an allow option for ACP permission requests. If an agent offers no allow option, the request is cancelled. These settings also apply to interactive sessions. Provider-internal tools may execute without an ACP permission request and are governed by the provider itself.
 
 ## ACP stdio facade
 
@@ -64,11 +62,10 @@ The initial facade supports:
 - `session/set_config_option` before the prompt starts
 - `session/prompt`
 - `session/cancel`
-- agent-to-client `session/request_permission`
 
-`session/new` returns the downstream ACP session ID and its effective configuration options. During `session/prompt`, Nori collects the downstream assistant text and sends one complete standard `agent_message_chunk` update, followed by the correlated prompt response with the downstream `stopReason`. Permission requests are forwarded as standard ACP requests; the caller's correlated response is relayed to the downstream agent.
+`session/new` returns the downstream ACP session ID and its effective configuration options. During `session/prompt`, Nori collects the downstream assistant text and sends one complete standard `agent_message_chunk` update, followed by the correlated prompt response with the downstream `stopReason`. As in plaintext mode, Nori automatically allows permission requests that offer an allow option; it does not forward them to the caller.
 
-Version one is deliberately bounded to one session and one prompt per process. Caller-provided `mcpServers` and `additionalDirectories` are rejected. Configure the selected agent, MCP servers, approval policy, sandbox, and other runtime settings through normal Nori configuration and command-line overrides instead.
+Version one is deliberately bounded to one session and one prompt per process. Caller-provided `mcpServers` and `additionalDirectories` are rejected. Configure the selected agent, MCP servers, and other supported runtime settings through normal Nori configuration and command-line overrides instead.
 
 Closing stdin cancels active work, resolves outstanding downstream activity safely, and shuts down the process. Stdout remains exclusively ACP JSON-RPC; operational diagnostics use stderr or Nori's configured tracing destination.
 

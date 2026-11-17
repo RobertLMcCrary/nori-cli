@@ -1,3 +1,8 @@
+#[path = "thread/child_stream.rs"]
+mod child_stream;
+pub(crate) use child_stream::ChildPrompt;
+pub(crate) use child_stream::ChildPrompts;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
@@ -12,6 +17,8 @@ use std::time::Duration;
 use agent_client_protocol::Client;
 use agent_client_protocol::ConnectionTo;
 use agent_client_protocol::Error;
+use agent_client_protocol::UntypedMessage;
+use agent_client_protocol::schema::AudioContent;
 use agent_client_protocol::schema::AvailableCommand;
 use agent_client_protocol::schema::AvailableCommandInput;
 use agent_client_protocol::schema::AvailableCommandsUpdate;
@@ -103,6 +110,7 @@ use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::DynamicToolCallResponseEvent;
 use codex_protocol::protocol::ElicitationAction;
 use codex_protocol::protocol::ErrorEvent;
@@ -181,10 +189,20 @@ use uuid::Uuid;
 /// back to the client. This replaces the old `Client` trait usage.
 trait ClientSender: Send + Sync + 'static {
     fn send_session_notification(&self, notif: SessionNotification) -> Result<(), Error>;
+    fn send_untyped_notification(&self, params: serde_json::Value) -> Result<(), Error>;
     fn request_permission(
         &self,
         req: RequestPermissionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<RequestPermissionResponse, Error>> + Send + '_>>;
+    fn request_user_input(
+        &self,
+        _params: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, Error>> + Send + '_>> {
+        Box::pin(async { Err(Error::method_not_found()) })
+    }
+    fn send_question_cancelled(&self, _params: serde_json::Value) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// Production implementation that wraps a `ConnectionTo<Client>`.
@@ -195,11 +213,33 @@ impl ClientSender for AcpConnection {
         self.0.send_notification(notif)
     }
 
+    fn send_untyped_notification(&self, params: serde_json::Value) -> Result<(), Error> {
+        self.0
+            .send_notification(UntypedMessage::new("session/update", params)?)
+    }
+
     fn request_permission(
         &self,
         req: RequestPermissionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<RequestPermissionResponse, Error>> + Send + '_>> {
         Box::pin(async move { self.0.send_request(req).block_task().await })
+    }
+
+    fn request_user_input(
+        &self,
+        params: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, Error>> + Send + '_>> {
+        Box::pin(async move {
+            self.0
+                .send_request(UntypedMessage::new("_nori/request_user_input", params)?)
+                .block_task()
+                .await
+        })
+    }
+
+    fn send_question_cancelled(&self, params: serde_json::Value) -> Result<(), Error> {
+        self.0
+            .send_notification(UntypedMessage::new("_nori/user_input_cancelled", params)?)
     }
 }
 
@@ -448,6 +488,8 @@ impl Thread {
         config: Config,
         host_tools: Option<Arc<dyn HostTools>>,
         cx: ConnectionTo<Client>,
+        thread_manager: Arc<codex_core::ThreadManager>,
+        child_prompts: ChildPrompts,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = mpsc::unbounded_channel();
@@ -463,6 +505,10 @@ impl Thread {
             resolution_rx,
         );
         actor.host_tools = host_tools;
+        actor.child_streams = Some(child_stream::ChildStreams::new(
+            thread_manager,
+            child_prompts,
+        ));
         let handle = tokio::spawn(actor.spawn());
 
         Self {
@@ -985,6 +1031,8 @@ struct PromptState {
     seen_reasoning_deltas: bool,
     /// The host's tools, which answer this turn's dynamic tool calls.
     host_tools: Option<Arc<dyn HostTools>>,
+    host_tool_cancellation: tokio_util::sync::CancellationToken,
+    host_goal_contexts: crate::host_tools::GoalContexts,
 }
 
 impl PromptState {
@@ -1009,6 +1057,8 @@ impl PromptState {
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
             host_tools: None,
+            host_tool_cancellation: tokio_util::sync::CancellationToken::new(),
+            host_goal_contexts: Arc::default(),
         }
     }
 
@@ -1023,6 +1073,7 @@ impl PromptState {
         // Keep detached permission request tasks running so ACP can route the
         // client's required `Cancelled` response after session cancellation.
         self.pending_permission_interactions.clear();
+        self.host_tool_cancellation.cancel();
     }
 
     fn spawn_permission_request(
@@ -1582,12 +1633,63 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::RequestUserInput(event) => {
+                let params = json!({"sessionId": client.session_id, "callId": event.call_id, "turnId": event.turn_id, "questions": event.questions});
+                let withdrawn = json!({"sessionId": client.session_id, "callId": event.call_id, "turnId": event.turn_id});
+                let turn_id = event.turn_id;
+                let client = client.clone();
+                let thread = self.thread.clone();
+                let cancellation = self.host_tool_cancellation.clone();
+                drop(tokio::spawn(async move {
+                    let answer = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            if let Err(error) = client.client.send_question_cancelled(withdrawn) {
+                                warn!(%error, "failed to withdraw cancelled user question");
+                            }
+                            return;
+                        },
+                        answer = client.client.request_user_input(params) => answer,
+                    };
+                    if matches!(&answer, Ok(value) if value.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true)) {
+                        if let Err(error) = thread.submit(Op::Interrupt).await {
+                            warn!(%error, "failed to cancel the user question");
+                        }
+                        return;
+                    }
+                    match answer.and_then(|value| serde_json::from_value::<codex_protocol::request_user_input::RequestUserInputResponse>(value).map_err(|error| Error::invalid_params().data(error.to_string()))) {
+                        Ok(response) => {
+                            if let Err(error) = thread.submit(Op::UserInputAnswer { id: turn_id, response }).await {
+                                warn!(%error, "failed to submit user question response");
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "could not deliver user question; interrupting the turn");
+                            client.send_agent_text("The user question could not be displayed; the turn was stopped.\n".to_owned());
+                            drop(thread.submit(Op::Interrupt).await);
+                        }
+                    }
+                }));
+            }
             EventMsg::GuardianAssessment(event) => {
                 info!(
                     "Guardian assessment: id={}, status={:?}, turn_id={}",
                     event.id, event.status, event.turn_id
                 );
                 self.guardian_assessment(client, event);
+            }
+            EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id,
+                new_thread_id: Some(child_session),
+                new_agent_role,
+                prompt,
+                ..
+            }) => {
+                client.announce_subagent(
+                    &call_id,
+                    &child_session.to_string(),
+                    new_agent_role.as_deref().unwrap_or("codex-subagent"),
+                    &prompt,
+                );
             }
 
             // Ignore these events
@@ -1601,10 +1703,6 @@ impl PromptState {
             // Old events
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
-            // TODO: Subagent UI?
-            | EventMsg::CollabAgentSpawnBegin(..)
-            | EventMsg::CollabAgentSpawnEnd(..)
-            | EventMsg::CollabAgentInteractionBegin(..)
             | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
@@ -1618,8 +1716,7 @@ impl PromptState {
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
             e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)) => {
+            | EventMsg::DeprecationNotice(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
                     other => {
@@ -1871,6 +1968,9 @@ impl PromptState {
             call_id,
             tool,
             arguments,
+            client.session_id.to_string(),
+            Arc::clone(&self.host_goal_contexts),
+            self.host_tool_cancellation.clone(),
         );
     }
 
@@ -1888,7 +1988,19 @@ impl PromptState {
         );
     }
 
-    fn end_dynamic_tool_call(&self, client: &SessionClient, event: DynamicToolCallResponseEvent) {
+    fn end_dynamic_tool_call(
+        &self,
+        client: &SessionClient,
+        mut event: DynamicToolCallResponseEvent,
+    ) {
+        let context = self
+            .host_goal_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&event.call_id);
+        let context = context.filter(|context| {
+            crate::host_tools::remove_goal_context(&mut event.content_items, context)
+        });
         let raw_output = serde_json::json!(event);
         let DynamicToolCallResponseEvent {
             call_id,
@@ -1903,7 +2015,7 @@ impl PromptState {
             duration: _,
         } = event;
 
-        client.send_tool_call_update(ToolCallUpdate::new(
+        let mut update = ToolCallUpdate::new(
             call_id,
             ToolCallUpdateFields::new()
                 .status(if success {
@@ -1924,15 +2036,33 @@ impl PromptState {
                                     ResourceLink::new(image_url.clone(), image_url),
                                 )))
                             }
-                            // Audio has no place in an ACP tool call; say that it was there.
-                            _ => {
-                                ToolCallContent::Content(Content::new("[audio output]".to_string()))
+                            DynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                                let block = match audio_url
+                                    .strip_prefix("data:")
+                                    .and_then(|value| value.split_once(";base64,"))
+                                {
+                                    Some((mime, data)) => {
+                                        ContentBlock::Audio(AudioContent::new(data, mime))
+                                    }
+                                    None => ContentBlock::ResourceLink(ResourceLink::new(
+                                        audio_url.clone(),
+                                        audio_url,
+                                    )),
+                                };
+                                ToolCallContent::Content(Content::new(block))
                             }
                         })
                         .chain(error.map(|e| ToolCallContent::Content(Content::new(e))))
                         .collect::<Vec<_>>(),
                 ),
-        ));
+        );
+        if let Some(context) = context {
+            update = update.meta(Meta::from_iter([(
+                "nori/modelContext".to_owned(),
+                serde_json::json!(context),
+            )]));
+        }
+        client.send_tool_call_update(update);
     }
 
     fn end_mcp_tool_call(
@@ -2800,6 +2930,36 @@ impl SessionClient {
         }
     }
 
+    fn announce_subagent(&self, call_id: &str, child_session: &str, title: &str, task: &str) {
+        let params = json!({
+            "sessionId": self.session_id.to_string(),
+            "update": {
+                "sessionUpdate": "subagent_spawned",
+                "subagentSessionId": child_session,
+                "name": title,
+                "task": task,
+                "state": "running"
+            }
+        });
+        if let Err(error) = self.client.send_untyped_notification(params) {
+            error!(?error, call_id, "failed to announce Codex subagent");
+            return;
+        }
+        let link = json!({
+            "sessionId": self.session_id.to_string(),
+            "update": {
+                "sessionUpdate": "session_message",
+                "messageId": call_id,
+                "senderSessionId": self.session_id.to_string(),
+                "recipientSessionId": child_session,
+                "content": [{"type": "text", "text": task}]
+            }
+        });
+        if let Err(error) = self.client.send_untyped_notification(link) {
+            error!(?error, call_id, "failed to link Codex subagent");
+        }
+    }
+
     fn send_user_message(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
             text.into().into(),
@@ -2912,6 +3072,7 @@ struct ThreadActor<A> {
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
     /// The host's tools, which answer this thread's dynamic tool calls.
     host_tools: Option<Arc<dyn HostTools>>,
+    child_streams: Option<child_stream::ChildStreams>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2938,6 +3099,7 @@ impl<A: Auth> ThreadActor<A> {
             resolution_rx,
             last_sent_config_options: None,
             host_tools: None,
+            child_streams: None,
         }
     }
 
@@ -3843,10 +4005,20 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        let child = match &msg {
+            EventMsg::CollabAgentSpawnEnd(event) => event.new_thread_id,
+            EventMsg::CollabResumeEnd(event) => Some(event.receiver_thread_id),
+            _ => None,
+        };
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
+        }
+        if let (Some(child), Some(streams)) = (child, &mut self.child_streams) {
+            streams
+                .start(child, self.client.clone(), self.host_tools.clone())
+                .await;
         }
     }
 }
@@ -4494,6 +4666,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nori_full_access_overrides_an_accounts_read_only_mode() -> anyhow::Result<()> {
+        let home = std::env::temp_dir().join(format!("nori-codex-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home)?;
+        std::fs::write(
+            home.join("config.toml"),
+            "approval_policy = \"on-request\"\nsandbox_mode = \"read-only\"\nmodel = \"gpt-account-setting\"\n",
+        )?;
+        let overrides = codex_utils_cli::CliConfigOverrides {
+            raw_overrides: vec![
+                "approval_policy=\"never\"".into(),
+                "sandbox_mode=\"danger-full-access\"".into(),
+            ],
+        }
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+        for persisted in [None, Some(PermissionProfile::read_only())] {
+            let config = codex_core::config::ConfigBuilder::default()
+                .codex_home(home.clone())
+                .cli_overrides(overrides.clone())
+                .harness_overrides(ConfigOverrides {
+                    approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
+                    sandbox_mode: Some(codex_protocol::config_types::SandboxMode::DangerFullAccess),
+                    persisted_permission_profile: persisted,
+                    ..ConfigOverrides::default()
+                })
+                .build()
+                .await?;
+            assert_eq!(
+                current_session_mode_id(&config)
+                    .expect("recognized mode")
+                    .0
+                    .as_ref(),
+                "full-access"
+            );
+            assert_eq!(config.model.as_deref(), Some("gpt-account-setting"));
+        }
+        std::fs::remove_dir_all(home)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn modes_match_augmented_workspace_permission_profile() -> anyhow::Result<()> {
         let mut config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
@@ -4894,6 +5107,10 @@ mod tests {
             content: Option<serde_json::Value>,
             meta: Option<serde_json::Value>,
         },
+        UserInputAnswer {
+            id: String,
+            response: codex_protocol::request_user_input::RequestUserInputResponse,
+        },
         Interrupt,
         Shutdown,
         Other(String),
@@ -4929,6 +5146,10 @@ mod tests {
                     decision: *decision,
                     content: content.clone(),
                     meta: meta.clone(),
+                },
+                Op::UserInputAnswer { id, response } => Self::UserInputAnswer {
+                    id: id.clone(),
+                    response: response.clone(),
                 },
                 Op::Interrupt => Self::Interrupt,
                 Op::Shutdown => Self::Shutdown,
@@ -5326,6 +5547,7 @@ mod tests {
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
                     | Op::PatchApproval { .. }
+                    | Op::UserInputAnswer { .. }
                     | Op::Interrupt => {}
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
@@ -5370,6 +5592,56 @@ mod tests {
         permission_requests: std::sync::Mutex<Vec<RequestPermissionRequest>>,
         permission_responses: std::sync::Mutex<VecDeque<RequestPermissionResponse>>,
         block_permission_requests: Option<Arc<Notify>>,
+        question_requests: std::sync::Mutex<Vec<serde_json::Value>>,
+        question_response: std::sync::Mutex<Option<serde_json::Value>>,
+    }
+
+    #[test]
+    fn model_only_goal_context_is_recorded_without_changing_visible_tool_output() {
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(SessionId::new("root"), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (resolution_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, _) = tokio::sync::oneshot::channel();
+        let state = PromptState::new("submission".into(), thread, resolution_tx, response_tx);
+        let context = "<goal_context>revision 2</goal_context>";
+        state
+            .host_goal_contexts
+            .lock()
+            .unwrap()
+            .insert("call".into(), context.into());
+        let item = DynamicToolCallOutputContentItem::InputText {
+            text: context.into(),
+        };
+        state.end_dynamic_tool_call(
+            &session_client,
+            DynamicToolCallResponseEvent {
+                call_id: "call".into(),
+                turn_id: "turn".into(),
+                completed_at_ms: 0,
+                namespace: None,
+                tool: "task_list".into(),
+                arguments: serde_json::json!({}),
+                content_items: vec![item.clone(), item],
+                success: true,
+                error: None,
+                duration: Duration::ZERO,
+            },
+        );
+        let notifications = client.notifications.lock().unwrap();
+        let SessionUpdate::ToolCallUpdate(update) = &notifications[0].update else {
+            panic!("expected tool update")
+        };
+        assert_eq!(
+            update.fields.raw_output.as_ref().unwrap()["content_items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(update.fields.content.as_ref().unwrap().len(), 1);
+        assert_eq!(update.meta.as_ref().unwrap()["nori/modelContext"], context);
     }
 
     impl StubClient {
@@ -5379,6 +5651,8 @@ mod tests {
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::default(),
                 block_permission_requests: None,
+                question_requests: std::sync::Mutex::default(),
+                question_response: std::sync::Mutex::default(),
             }
         }
 
@@ -5388,6 +5662,8 @@ mod tests {
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
                 block_permission_requests: None,
+                question_requests: std::sync::Mutex::default(),
+                question_response: std::sync::Mutex::default(),
             }
         }
 
@@ -5400,6 +5676,8 @@ mod tests {
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
                 block_permission_requests: Some(notify),
+                question_requests: std::sync::Mutex::default(),
+                question_response: std::sync::Mutex::default(),
             }
         }
     }
@@ -5408,6 +5686,24 @@ mod tests {
         fn send_session_notification(&self, args: SessionNotification) -> Result<(), Error> {
             self.notifications.lock().unwrap().push(args);
             Ok(())
+        }
+
+        fn send_untyped_notification(&self, _params: serde_json::Value) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn request_user_input(
+            &self,
+            params: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, Error>> + Send + '_>> {
+            Box::pin(async move {
+                self.question_requests.lock().unwrap().push(params);
+                self.question_response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(Error::method_not_found)
+            })
         }
 
         fn request_permission(
@@ -5501,6 +5797,74 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_questions_reach_the_requesting_session_and_resume_the_turn() {
+        use codex_protocol::request_user_input::RequestUserInputEvent;
+        use codex_protocol::request_user_input::RequestUserInputQuestion;
+        for (session, answer) in [
+            ("root", json!({"answers":{"choice":{"answers":["yes"]}}})),
+            ("child", json!({"cancelled":true})),
+        ] {
+            let client = Arc::new(StubClient::new());
+            *client.question_response.lock().unwrap() = Some(answer.clone());
+            let session_client =
+                SessionClient::with_client(SessionId::new(session), client.clone(), Arc::default());
+            let thread = Arc::new(StubCodexThread::new());
+            let (resolution_tx, _resolution_rx) = mpsc::unbounded_channel();
+            let (response_tx, _response_rx) = oneshot::channel();
+            let mut state = PromptState::new(
+                "submission".into(),
+                thread.clone(),
+                resolution_tx,
+                response_tx,
+            );
+            state
+                .handle_event(
+                    &session_client,
+                    EventMsg::RequestUserInput(RequestUserInputEvent {
+                        call_id: "call".into(),
+                        turn_id: "actual-turn".into(),
+                        is_blocking: true,
+                        auto_resolution_ms: None,
+                        questions: vec![RequestUserInputQuestion {
+                            id: "choice".into(),
+                            header: "Choice".into(),
+                            question: "Proceed?".into(),
+                            is_other: true,
+                            is_secret: false,
+                            options: None,
+                        }],
+                    }),
+                )
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if thread.ops.lock().unwrap().iter().any(|op| {
+                        matches!(op, Recorded::UserInputAnswer { .. } | Recorded::Interrupt)
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("question response submitted");
+            let requests = client.question_requests.lock().unwrap();
+            assert_eq!(requests[0]["sessionId"], session);
+            assert_eq!(requests[0]["questions"][0]["question"], "Proceed?");
+            let ops = thread.ops.lock().unwrap();
+            if session == "child" {
+                assert_eq!(ops[0], Recorded::Interrupt);
+            } else {
+                let Recorded::UserInputAnswer { id, response } = &ops[0] else {
+                    panic!("expected answer")
+                };
+                assert_eq!(id, "actual-turn");
+                assert_eq!(serde_json::to_value(response).unwrap(), answer);
+            }
+        }
     }
 
     #[tokio::test]

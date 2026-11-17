@@ -355,6 +355,30 @@ async fn establish_connection(
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
+            .on_receive_notification(
+                {
+                    let event_tx = event_tx.clone();
+                    async move |notification: UntypedMessage, _connection: ConnectionTo<Agent>| {
+                        if notification.method() == "_nori/user_input_cancelled" {
+                            let raw = serde_json::value::RawValue::from_string(
+                                notification.params().to_string(),
+                            )
+                            .map_err(|error| {
+                                acp::Error::invalid_params().data(error.to_string())
+                            })?;
+                            let event = nori_protocol::AcpEvent::Notification(
+                                acp::AgentNotification::ExtNotification(acp::ExtNotification::new(
+                                    notification.method(),
+                                    raw.into(),
+                                )),
+                            );
+                            let _ = event_tx.send(ConnectionEvent::Acp(Box::new(event))).await;
+                        }
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
             .on_receive_request(
                 {
                     let event_tx = event_tx.clone();
@@ -455,6 +479,61 @@ async fn establish_connection(
                                     acp::Error::internal_error().data(error.to_string())
                                 }),
                             )?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let event_tx = event_tx.clone();
+                    async move |request: UntypedMessage,
+                                responder: agent_client_protocol::Responder<serde_json::Value>,
+                                connection: ConnectionTo<Agent>| {
+                        if request.method() != "_nori/request_user_input" {
+                            responder.respond_with_error(acp::Error::method_not_found())?;
+                            return Ok(());
+                        }
+                        let raw =
+                            serde_json::value::RawValue::from_string(request.params().to_string())
+                                .map_err(|error| {
+                                    acp::Error::invalid_params().data(error.to_string())
+                                })?;
+                        let (response_tx, response_rx) = oneshot::channel();
+                        let delegated = DelegatedRequest {
+                            request_id: schema_request_id(responder.id()),
+                            request: acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(
+                                request.method(),
+                                raw.into(),
+                            )),
+                            response_tx,
+                        };
+                        if event_tx
+                            .send(ConnectionEvent::DelegatedRequest(delegated))
+                            .await
+                            .is_err()
+                        {
+                            responder.respond_with_error(
+                                acp::Error::internal_error().data("question host disconnected"),
+                            )?;
+                            return Ok(());
+                        }
+                        connection.spawn(async move {
+                            let response = match response_rx.await {
+                                Ok(Ok(acp::ClientResponse::ExtMethodResponse(response))) => {
+                                    serde_json::from_str(response.0.get()).map_err(|error| {
+                                        acp::Error::internal_error().data(error.to_string())
+                                    })
+                                }
+                                Ok(Ok(_)) => Err(acp::Error::invalid_params()
+                                    .data("response variant does not match user question")),
+                                Ok(Err(error)) => Err(error),
+                                Err(_) => Err(acp::Error::internal_error()
+                                    .data("question response channel closed")),
+                            };
+                            responder.respond_with_result(response)?;
                             Ok(())
                         })?;
                         Ok(())
@@ -1172,6 +1251,16 @@ impl AcpConnection {
         (request_id, result)
     }
 
+    /// Wait until the harness has handled preceding connection events.
+    pub async fn event_barrier(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.event_tx
+            .send(ConnectionEvent::Barrier(tx))
+            .await
+            .context("ACP event relay closed")?;
+        rx.await.context("ACP event relay closed")
+    }
+
     /// Cancel an ongoing prompt.
     pub async fn cancel(&self, session_id: &acp::SessionId) -> Result<()> {
         self.cx
@@ -1301,6 +1390,38 @@ impl AcpConnection {
         }
 
         Ok(())
+    }
+
+    /// Set a child session's config without changing the root session snapshot.
+    pub async fn set_child_config_option(
+        &self,
+        session_id: &acp::SessionId,
+        config_id: acp::SessionConfigId,
+        value: acp::SessionConfigValueId,
+    ) -> Result<Vec<acp::SessionConfigOption>> {
+        let request = self
+            .cx
+            .send_request(acp::SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                config_id,
+                acp::SessionConfigOptionValue::value_id(value),
+            ));
+        let response = request.block_task().await.map_err(|error| {
+            let detail = error.data.as_ref().and_then(|data| {
+                data.get("details")
+                    .or_else(|| data.get("detail"))
+                    .unwrap_or(data)
+                    .as_str()
+                    .map(str::to_owned)
+            });
+            match detail {
+                Some(detail) => anyhow::anyhow!("{detail}"),
+                None => {
+                    anyhow::Error::new(error).context("Failed to set child session config option")
+                }
+            }
+        })?;
+        Ok(response.config_options)
     }
 
     /// Explicitly tear down the ACP subprocess and background tasks with the

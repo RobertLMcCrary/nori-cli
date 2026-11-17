@@ -32,8 +32,7 @@ mod error;
 mod host;
 mod inline;
 mod load;
-mod model;
-mod render;
+use nori_workflow as model;
 mod sandbox;
 
 pub use engine::TIME_BUDGET;

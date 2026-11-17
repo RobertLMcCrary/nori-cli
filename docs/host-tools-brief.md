@@ -21,18 +21,18 @@ Nothing from the forge, CI, process-cleanup or fork work is committed yet.
   time, process-wide. Nori primes other built-in agents 5 s after a root session starts.
   Measurements are in `nori-rs/scripts/perf/README-switch.md`: CLI spawn to `initialize` is
   about 1.0 s, Nori `initialize` 10 ms, and `session/new` 16 ms.
-- **Workflows** ([workflows.md](workflows.md)). A Steel Scheme DSL (crate `nori-script`)
-  loaded Helix-style from `$NORI_HOME/init.scm` and, in trusted directories,
-  `.nori/nori.scm`. It supports inline clauses in prompts, hooks (`on-change`, `on-commit`,
-  `on-turn`, `on-stop`) sent as hidden turns within a turn budget, commit and PR rules told to
-  the agent, and a designated commit agent that runs as a delegated task.
+- **Workflows** ([workflows.md](workflows.md)). Pkl policy (crate `nori-pkl`)
+  loads from `$NORI_HOME/init.pkl` and trusted `.nori/nori.pkl`. Hooks, commit
+  guidance, a designated reviewer, and ranked subscription fallback use the
+  same captured machine properties. Hook turns have no default policy cap.
+  [Conversation programs](conversation-programs.md) dispatch journaled effects.
 - **Forge** ([forge.md](forge.md)). Crate `nori-forge` is a GitHub REST client with
   conditional reads; nothing shells out to `gh`. Built and unit-tested (14 crate tests, with
   wiremock for the GitHub calls).
   - `ci_status` reports the branch's pull request and checks, with failed jobs' log tails.
   - `pull_request` opens or updates the branch's pull request. It enforces the workflow's
     rules (sections, size, base, draft, `upstream-when`), gives the `on-pr` prompt before
-    opening, and asks the user through Nori's own approval prompt (`Orchestrator::ask_user`).
+    opening. Nori runs these actions without an approval prompt.
   - New hooks `on-ci-fail` and `on-ci-pass`: Nori watches the checks on what the agent
     pushed.
   - TUI views for both tools, with snapshot tests (`ci_status`, opened pull request, refused

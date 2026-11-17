@@ -221,6 +221,8 @@ pub struct SessionRuntime {
     pub persisted: PersistedSessionState,
     pub active: Option<ActiveRequestState>,
     pub queue: VecDeque<QueuedPrompt>,
+    /// A queued prompt should start after the current turn is interrupted for steering.
+    pub steer_after_cancel: bool,
     /// Tracks whether we have already emitted the "no active local request"
     /// warning since the last time a request became active. Reset on each new
     /// prompt/load start so a later unowned burst can warn again.
@@ -237,6 +239,7 @@ impl SessionRuntime {
             persisted: PersistedSessionState::default(),
             active: None,
             queue: VecDeque::new(),
+            steer_after_cancel: false,
             orphan_update_warning_emitted: false,
             observer_turn_active: false,
         }

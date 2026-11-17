@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use nori_forge::Forge;
 use nori_forge::NewPull;
 use nori_forge::RunState;
-use nori_script::Upstream;
+use nori_workflow::Upstream;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -384,7 +384,7 @@ async fn broken_rules(
     place: &Place,
     base: &str,
     body: &str,
-    rules: &nori_script::PrRules,
+    rules: &nori_workflow::PrRules,
 ) -> Vec<String> {
     let mut broken: Vec<String> = missing_sections(body, &rules.sections)
         .into_iter()

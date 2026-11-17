@@ -21,9 +21,7 @@ use super::task::TaskId;
 use crate::backend::nori_client_mcp::NoriClientService;
 
 /// What the server tells agents about delegation, after its other instructions.
-pub(crate) const INSTRUCTIONS: &str = "Delegated tasks: hand independent work to a child agent with `delegate_task` (another agent \
-     or model if `agent_capabilities` offers a better fit), then keep working or end your turn. \
-     Tasks end with this session, and the user stopping you stops them.";
+pub(crate) const INSTRUCTIONS: &str = nori_host_tools::DELEGATION_INSTRUCTIONS;
 
 /// `agent_capabilities` re-reads agents whose entry is older than this...
 const CAPABILITIES_FRESH_FOR: Duration = Duration::from_secs(120);
@@ -118,7 +116,7 @@ pub(crate) struct TaskSendRequest {
 #[tool_router(router = task_tool_router, vis = "pub(crate)")]
 impl NoriClientService {
     #[tool(
-        description = "List the agents you can delegate tasks to, with the models and other settings (such as reasoning effort) each offers, and whether you can delegate now (depth and running-task limits).",
+        description = "List the agents you can delegate tasks to, with the models and other settings (such as reasoning effort) each offers, plus your current delegation depth and running-task count.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn agent_capabilities(&self) -> Result<CallToolResult, McpError> {
@@ -168,6 +166,10 @@ impl NoriClientService {
             timeout: seconds(request.timeout_seconds),
             client_request_id: request.client_request_id,
             options: request.options.unwrap_or_default().into_iter().collect(),
+            fork_context: None,
+            fork_source: None,
+            fork_entries: Vec::new(),
+            parent_view: None,
         };
         let inner = Arc::clone(self.orchestrator().inner());
         Ok(outcome(
@@ -237,6 +239,8 @@ impl NoriClientService {
                         request.message,
                         request.mode.unwrap_or_default(),
                         seconds(request.timeout_seconds),
+                        super::launch::FollowUp::Tool,
+                        None,
                     )
                     .await
             })

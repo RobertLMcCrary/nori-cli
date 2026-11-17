@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
@@ -17,6 +19,8 @@ use unicode_width::UnicodeWidthStr;
 use super::PickerColumn;
 use super::PickerColumnWidth;
 use super::PickerDensity;
+use super::PickerHit;
+use super::PickerHitTarget;
 use super::PickerLoadState;
 use super::PickerMode;
 use super::PickerState;
@@ -40,6 +44,7 @@ pub struct Picker<'a, K> {
     show_details: bool,
     fullscreen_selection_rails: bool,
     footer_hints: Option<Vec<KeyHint<'static>>>,
+    hit_regions: Option<&'a RefCell<Vec<PickerHit<K>>>>,
 }
 
 impl<'a, K> Picker<'a, K> {
@@ -52,7 +57,14 @@ impl<'a, K> Picker<'a, K> {
             show_details: true,
             fullscreen_selection_rails: false,
             footer_hints: None,
+            hit_regions: None,
         }
+    }
+
+    /// Capture pointer targets from the rendered rows and controls.
+    pub fn hit_regions(mut self, regions: &'a RefCell<Vec<PickerHit<K>>>) -> Self {
+        self.hit_regions = Some(regions);
+        self
     }
 
     pub fn theme(mut self, theme: Theme) -> Self {
@@ -95,6 +107,10 @@ impl<'a, K> Picker<'a, K> {
 
 impl<K: Clone + Eq> Widget for Picker<'_, K> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if let Some(regions) = self.hit_regions {
+            regions.borrow_mut().clear();
+        }
+
         if area.width < 8 || area.height < 4 {
             return;
         }
@@ -144,6 +160,14 @@ impl<K: Clone + Eq> Widget for Picker<'_, K> {
             self.render_detail(detail_area, buf);
         }
         self.render_footer(page[2], buf);
+        if let Some(regions) = self.hit_regions {
+            let close = Rect::new(area.right().saturating_sub(2), area.y + 1, 1, 1);
+            buf.set_string(close.x, close.y, "×", self.theme.muted);
+            regions.borrow_mut().push(PickerHit {
+                area: close,
+                target: PickerHitTarget::Close,
+            });
+        }
     }
 }
 
@@ -151,9 +175,7 @@ impl<K: Clone + Eq> Picker<'_, K> {
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
         let subtitle_height = u16::from(self.state.subtitle.is_some());
         let category_height = u16::from(!self.state.categories.is_empty());
-        let search_height = u16::from(
-            self.state.search_active && !matches!(self.state.search_mode, SearchMode::None),
-        );
+        let search_height = u16::from(!matches!(self.state.search_mode, SearchMode::None));
         let header_gap = u16::from(area.height > subtitle_height + category_height + search_height);
         let fixed_height = subtitle_height + category_height + search_height + header_gap;
         let content_height = area.height.saturating_sub(fixed_height);
@@ -187,9 +209,25 @@ impl<K: Clone + Eq> Picker<'_, K> {
                 )
             }),
         );
+        let mut hit_x = area.x;
         let spans = options
             .enumerate()
             .flat_map(|(index, (label, category, active))| {
+                if index > 0 {
+                    hit_x = hit_x.saturating_add(2);
+                }
+                let hit_width = u16::try_from(label.width())
+                    .unwrap_or(u16::MAX)
+                    .min(area.right().saturating_sub(hit_x));
+                if hit_width > 0
+                    && let Some(regions) = self.hit_regions
+                {
+                    regions.borrow_mut().push(PickerHit {
+                        area: Rect::new(hit_x, area.y, hit_width, 1),
+                        target: PickerHitTarget::Category(category.map(str::to_owned)),
+                    });
+                }
+                hit_x = hit_x.saturating_add(hit_width);
                 let gap = (index > 0).then(|| Span::raw("  "));
                 let style = category
                     .and_then(|category| self.state.category_tones.get(category))
@@ -218,6 +256,12 @@ impl<K: Clone + Eq> Picker<'_, K> {
     fn render_search(&self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 {
             return;
+        }
+        if let Some(regions) = self.hit_regions {
+            regions.borrow_mut().push(PickerHit {
+                area,
+                target: PickerHitTarget::Search,
+            });
         }
         let query = if self.state.query.is_empty() {
             Span::styled(self.state.search_placeholder.clone(), self.theme.muted)
@@ -415,6 +459,15 @@ impl<K: Clone + Eq> Picker<'_, K> {
                 area.width,
                 row_height,
             );
+            if !item.disabled
+                && !item.section_heading
+                && let Some(regions) = self.hit_regions
+            {
+                regions.borrow_mut().push(PickerHit {
+                    area: row_area,
+                    target: PickerHitTarget::Item(item.key.clone()),
+                });
+            }
             buf.set_style(row_area, style);
             if selected && self.fullscreen_selection_rails {
                 let rail_style = style.patch(self.theme.pointer);

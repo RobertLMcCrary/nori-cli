@@ -28,7 +28,9 @@ impl SubagentSummaryCell {
         let (mark, detail) = match &finished.outcome {
             SubagentOutcome::Completed { .. } => ("✓".green(), None),
             SubagentOutcome::Failed { reason } => ("✗".red(), reason.clone()),
-            SubagentOutcome::Cancelled => ("⊘".dim(), Some("cancelled".to_owned())),
+            SubagentOutcome::Cancelled | SubagentOutcome::Closed => {
+                ("⊘".dim(), Some("cancelled".to_owned()))
+            }
         };
         let mut spans: Vec<Span<'static>> = vec![
             "  ".repeat(finished.depth).into(),

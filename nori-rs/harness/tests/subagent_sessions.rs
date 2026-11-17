@@ -53,6 +53,7 @@ async fn launch(fixture: &str) -> (LaunchedSession, tempfile::TempDir, EnvGuard)
         ..Default::default()
     };
     let agent = prepare_agent(AgentPrepareSpec {
+        handoff: None,
         config: Arc::new(config),
         cli_version: "subagent-test".to_string(),
         session_context: None,
@@ -220,4 +221,65 @@ async fn without_announcements_everything_stays_on_the_root() {
         })
         .count();
     assert_eq!(tagged, 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn opencode_child_tool_and_nested_messages_stay_in_child_sessions() {
+    let (mut session, _temp, _guard) = launch("opencode_child_wire.jsonl").await;
+    let events = run_prompt(&mut session).await;
+    session.handle.shutdown().await.expect("shutdown");
+    assert_eq!(root_text(&events), "parent-only words");
+
+    let wires: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Nori(NoriEvent::Subagent(SubagentWire::Update(update))) => Some(update),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        wires
+            .iter()
+            .any(|update| update.session_id.to_string() == "oc-grandchild"
+                && update.parent_session_id.to_string() == "oc-child")
+    );
+    let child: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Acp(AcpEvent::ChildNotification(notification)) => Some(notification),
+            _ => None,
+        })
+        .collect();
+    assert!(child.iter().any(
+        |notification| notification.session_id.to_string() == "oc-child"
+            && matches!(&notification.update, acp::SessionUpdate::ToolCall(_))
+    ));
+    assert!(child.iter().any(
+        |notification| notification.session_id.to_string() == "oc-child"
+            && matches!(&notification.update, acp::SessionUpdate::ToolCallUpdate(_))
+    ));
+    assert!(
+        child.iter().any(
+            |notification| notification.session_id.to_string() == "oc-grandchild"
+                && matches!(
+                    &notification.update,
+                    acp::SessionUpdate::AgentMessageChunk(_)
+                )
+        )
+    );
+    let child_finished = wires
+        .iter()
+        .filter(|update| {
+            update.session_id.to_string() == "oc-child"
+                && matches!(
+                    &update.state,
+                    nori_protocol::Patch::Set(nori_protocol::SubagentState::Ended(_))
+                )
+        })
+        .count();
+    assert_eq!(
+        child_finished, 1,
+        "a completed tool is not a completed child"
+    );
 }

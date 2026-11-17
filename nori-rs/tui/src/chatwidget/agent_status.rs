@@ -2,8 +2,7 @@
 //!
 //! One place owns the agent's advertised ACP configuration: it is updated from
 //! config-option updates, explicit snapshots, and successful mutations, and it
-//! feeds `/config`, the footer's mode label, the configuration history lines,
-//! and both status renderings. The status views themselves are pure, so every
+//! feeds `/config`, the footer's mode label, and both status renderings. The status views are pure, so every
 //! value they show is assembled here.
 
 use super::*;
@@ -25,7 +24,13 @@ fn footer_label(agent: &str, config: &AgentConfigState) -> Option<String> {
         parts.push(agent.to_owned());
     }
     if let Some(model) = config.option_for_category(&Category::Model) {
-        parts.push(model.display_value());
+        let value = model.display_value();
+        parts.push(
+            value
+                .rsplit_once('/')
+                .map_or(value.as_str(), |(_, name)| name)
+                .to_owned(),
+        );
     }
     let effort = config.effort_option();
     if let Some(effort) = effort {
@@ -46,13 +51,45 @@ fn footer_label(agent: &str, config: &AgentConfigState) -> Option<String> {
 impl ChatWidget {
     /// Show the agent in the footer now, before it has told us anything else about itself.
     pub(crate) fn show_agent_in_footer(&mut self) {
-        let label = footer_label(self.bottom_pane.agent_display_name(), &self.agent_config);
+        let label = self.current_footer_label();
         self.bottom_pane.set_model_label(label);
     }
 
     /// The agent's advertised configuration, in advertised order.
     pub(crate) fn agent_config(&self) -> &AgentConfigState {
-        &self.agent_config
+        self.focused_session_config
+            .as_ref()
+            .unwrap_or(&self.agent_config)
+    }
+
+    pub(crate) fn set_focused_session_config(
+        &mut self,
+        config: Option<AgentConfigState>,
+        display_name: Option<&str>,
+    ) {
+        self.focused_session_config = config;
+        self.bottom_pane.set_model_label(
+            display_name
+                .map(|name| self.current_footer_label_for(name))
+                .unwrap_or_else(|| self.current_footer_label()),
+        );
+        self.request_redraw();
+    }
+
+    fn current_footer_label(&self) -> Option<String> {
+        match (&self.focused_session_config, self.focused_subagent) {
+            (Some(config), Some(_)) => footer_label("subagent", config),
+            _ => footer_label(self.bottom_pane.agent_display_name(), &self.agent_config),
+        }
+    }
+
+    fn current_footer_label_for(&self, agent: &str) -> Option<String> {
+        self.focused_session_config
+            .as_ref()
+            .map(|config| footer_label(agent, config))
+            .unwrap_or_else(|| {
+                footer_label(self.bottom_pane.agent_display_name(), &self.agent_config)
+            })
     }
 
     /// Adopt a new configuration snapshot: publish it to the status views and
@@ -61,35 +98,18 @@ impl ChatWidget {
         self.agent_status
             .set(AgentStatus::from_config(&self.config.active_agent, &config));
         let mode = config.mode_config();
-        self.bottom_pane
-            .set_model_label(footer_label(self.bottom_pane.agent_display_name(), &config));
         self.agent_config = config;
+        self.bottom_pane
+            .set_model_label(self.current_footer_label());
         self.apply_acp_mode_config_snapshot(self.acp_mode_config_generation, mode);
     }
 
-    /// Handle a `session/update` config announcement: report what changed (or
-    /// announce the initial set), then adopt it.
+    /// Adopt a `session/update` configuration announcement without adding history.
     pub(crate) fn handle_acp_session_config_update(
         &mut self,
         config_options: &[nori_protocol::acp::v1::SessionConfigOption],
     ) {
-        let next = AgentConfigState::from_options(config_options);
-
-        // The first announcement is not printed: the footer shows the agent, model, effort and
-        // mode, and only what changes after that is worth a line in the history.
-        if !self.agent_config.is_empty() {
-            let changes = next.changes_since(&self.agent_config);
-            if !changes.is_empty() {
-                self.add_to_history(
-                    crate::nori::session_config_history::new_agent_options_history_cell(
-                        self.bottom_pane.agent_display_name(),
-                        &changes,
-                    ),
-                );
-            }
-        }
-
-        self.adopt_agent_config(next);
+        self.adopt_agent_config(AgentConfigState::from_options(config_options));
         self.request_redraw();
     }
 
@@ -164,8 +184,6 @@ impl ChatWidget {
     ) -> StatusViewModel {
         let footer = self.bottom_pane.status_footer_values();
         let mut model = StatusViewModel::new(agent, self.config.cwd.clone());
-        model.approval_mode_label =
-            approval_mode_label(self.config.approval_policy, &self.config.sandbox_policy);
         model.skillset = SkillsetStatus {
             names: footer.active_skillsets,
             version: footer.nori_version,

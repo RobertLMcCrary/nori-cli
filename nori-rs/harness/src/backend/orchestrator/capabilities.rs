@@ -5,8 +5,6 @@ use std::sync::atomic::Ordering;
 use serde::Serialize;
 
 use super::Inner;
-use super::MAX_DEPTH;
-use super::MAX_RUNNING_TASKS;
 
 /// The agents a session can delegate to, for `agent_capabilities`.
 #[derive(Debug, Serialize)]
@@ -15,9 +13,7 @@ pub(super) struct Capabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reason: Option<String>,
     pub(super) depth: i64,
-    pub(super) max_depth: i64,
     pub(super) running_tasks: i64,
-    pub(super) max_running_tasks: i64,
     pub(super) agents: Vec<AgentEntry>,
 }
 
@@ -58,7 +54,6 @@ pub(super) struct SettingEntry {
 
 impl Inner {
     pub(super) fn capabilities(&self) -> Capabilities {
-        let refusal = self.delegation_refusal();
         let config = &self.seed.config;
         let agents = crate::registry::list_available_agents()
             .into_iter()
@@ -90,12 +85,10 @@ impl Inner {
             })
             .collect();
         Capabilities {
-            can_delegate: refusal.is_none(),
-            reason: refusal,
+            can_delegate: true,
+            reason: None,
             depth: self.seed.depth,
-            max_depth: MAX_DEPTH,
             running_tasks: self.seed.tree.running.load(Ordering::Acquire),
-            max_running_tasks: MAX_RUNNING_TASKS,
             agents,
         }
     }

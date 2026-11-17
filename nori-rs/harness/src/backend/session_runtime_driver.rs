@@ -24,9 +24,14 @@ pub(crate) struct CompletedTurn {
 
 pub(crate) enum SessionRuntimeInput {
     Reducer(InboundEvent),
+    GuardedContinuation {
+        generation: i64,
+        event: InboundEvent,
+    },
     Barrier {
         response_tx: tokio::sync::oneshot::Sender<()>,
     },
+    QuestionCancelled(Box<nori_protocol::AcpEvent>),
     PermissionRequest {
         pending_request: Box<PendingApprovalRequest>,
         current_policy: AskForApproval,
@@ -197,6 +202,7 @@ const CANCEL_FORCE_SECS: u64 = 10;
 
 impl AcpBackend {
     pub(super) async fn apply_session_event(&self, event: InboundEvent) {
+        let generation = self.orchestrator.admission_generation();
         let event_kind = session_reducer::inbound_event_kind(&event);
         let actions = {
             let mut driver = self.session_driver.lock().await;
@@ -226,7 +232,7 @@ impl AcpBackend {
             }
             *self.prompt_task_abort.lock().await = None;
         }
-        self.dispatch_reducer_actions(actions).await;
+        self.dispatch_reducer_actions(actions, generation).await;
         if is_prompt_terminal {
             self.maybe_start_idle_timer().await;
         }
@@ -237,6 +243,32 @@ impl AcpBackend {
         pending_request: Box<PendingApprovalRequest>,
         current_policy: AskForApproval,
     ) {
+        if let acp::AgentRequest::ExtMethodRequest(request) = &pending_request.request.request
+            && request.method.as_ref() == "_nori/request_user_input"
+        {
+            let key = serde_json::from_str::<serde_json::Value>(request.params.get())
+                .ok()
+                .and_then(|params| super::user_question::question_key(&params));
+            if let Some(key) = key
+                && self.withdrawn_questions.lock().await.remove(&key)
+            {
+                let _ = pending_request
+                    .request
+                    .response_tx
+                    .send(Err(acp::Error::internal_error()));
+                return;
+            }
+            let event = nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Request {
+                request_id: pending_request.request.request_id.clone(),
+                request: pending_request.request.request.clone(),
+            });
+            self.pending_approvals.lock().await.push(*pending_request);
+            let _ = self
+                .backend_event_tx
+                .send(BackendEvent::Public(event))
+                .await;
+            return;
+        }
         let acp::AgentRequest::RequestPermissionRequest(permission) =
             &pending_request.request.request
         else {
@@ -260,7 +292,8 @@ impl AcpBackend {
             );
             (actions, permission_is_valid)
         };
-        self.dispatch_reducer_actions(actions).await;
+        self.dispatch_reducer_actions(actions, self.orchestrator.admission_generation())
+            .await;
 
         if !permission_is_valid {
             let _ = pending_request.request.response_tx.send(Ok(
@@ -326,7 +359,7 @@ impl AcpBackend {
             });
     }
 
-    async fn dispatch_reducer_actions(&self, actions: ReducerActions) {
+    async fn dispatch_reducer_actions(&self, actions: ReducerActions, generation: i64) {
         let completed_prompt = actions.completed_turn.is_some();
         match actions.completed_turn.as_ref().map(|turn| turn.prompt.kind) {
             // Summarize-and-swap compaction defers `PromptCompleted` until after
@@ -346,7 +379,8 @@ impl AcpBackend {
                 }
                 self.forward_client_events(&non_completion_events).await;
                 if let Some(completed_turn) = actions.completed_turn {
-                    self.handle_completed_turn(&completed_turn).await;
+                    self.handle_completed_turn(&completed_turn, generation)
+                        .await;
                 }
                 if let Some(event) = completion_event {
                     self.forward_client_event(event).await;
@@ -355,7 +389,8 @@ impl AcpBackend {
             _ => {
                 self.forward_client_events(&actions.events).await;
                 if let Some(completed_turn) = actions.completed_turn {
-                    self.handle_completed_turn(&completed_turn).await;
+                    self.handle_completed_turn(&completed_turn, generation)
+                        .await;
                 }
             }
         }
@@ -484,7 +519,7 @@ impl AcpBackend {
         }
     }
 
-    async fn handle_completed_turn(&self, completed_turn: &CompletedTurn) {
+    async fn handle_completed_turn(&self, completed_turn: &CompletedTurn, generation: i64) {
         match completed_turn.prompt.kind {
             QueuedPromptKind::User
             | QueuedPromptKind::GoalContinuation
@@ -578,8 +613,10 @@ impl AcpBackend {
                 }
 
                 // The workflow's follow-up comes first; the goal continues once it is done.
-                self.maybe_submit_workflow_hook(completed_turn).await;
-                self.maybe_submit_goal_continuation(completed_turn).await;
+                self.maybe_submit_workflow_hook(completed_turn, generation)
+                    .await;
+                self.maybe_submit_goal_continuation(completed_turn, generation)
+                    .await;
             }
             QueuedPromptKind::Compact => {
                 self.finish_compaction(completed_turn).await;
@@ -595,12 +632,19 @@ impl AcpBackend {
         }
         // Results that arrived while the turn ran are handed over now, unless the turn queued
         // another.
-        self.deliver_task_results_if_idle().await;
-        self.maybe_watch_ci().await;
+        // Delivery waits for the runtime queue to admit its hidden prompt, so it must not wait
+        // on that same queue from inside the runtime actor.
+        let backend = self.clone();
+        tokio::spawn(async move { backend.deliver_task_results_if_idle().await });
+        self.maybe_watch_ci(generation).await;
         self.deliver_ci_if_idle().await;
     }
 
-    async fn maybe_submit_goal_continuation(&self, completed_turn: &CompletedTurn) {
+    async fn maybe_submit_goal_continuation(
+        &self,
+        completed_turn: &CompletedTurn,
+        generation: i64,
+    ) {
         if completed_turn.stop_reason != nori_protocol::acp::v1::StopReason::EndTurn {
             return;
         }
@@ -631,26 +675,22 @@ impl AcpBackend {
             | QueuedPromptKind::NativeCompact => return,
         }
 
-        self.submit_goal_continuation_if_idle().await;
+        self.submit_goal_continuation_if_idle(generation).await;
     }
 
-    pub(super) async fn submit_goal_continuation_if_idle(&self) {
+    pub(super) async fn submit_goal_continuation_if_idle(&self, generation: i64) {
         if self.thread_goal_state.lock().await.ext_driven() {
             return;
         }
-        if self.goal_mcp_http_server.lock().await.is_none() {
+        if !self
+            .goal_mcp_http_server
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(nori_client_mcp::NoriClient::has_goal_tools)
+        {
             return;
         }
-
-        let prompt_text = {
-            self.thread_goal_state
-                .lock()
-                .await
-                .continuation_prompt(thread_goal::now_seconds())
-        };
-        let Some(prompt_text) = prompt_text else {
-            return;
-        };
 
         let can_start_continuation = {
             let driver = self.session_driver.lock().await;
@@ -664,10 +704,20 @@ impl AcpBackend {
             return;
         }
 
+        let prompt_text = self
+            .thread_goal_state
+            .lock()
+            .await
+            .continuation_prompt(thread_goal::now_seconds());
+        let Some(prompt_text) = prompt_text else {
+            return;
+        };
+
         let _ = self
             .session_event_tx
-            .send(SessionRuntimeInput::Reducer(
-                session_reducer::InboundEvent::PromptSubmit(
+            .send(SessionRuntimeInput::GuardedContinuation {
+                generation,
+                event: session_reducer::InboundEvent::PromptSubmit(
                     crate::normalized::session_runtime::QueuedPrompt {
                         event_id: format!("goal-continuation-{}", uuid::Uuid::new_v4()),
                         kind:
@@ -679,7 +729,7 @@ impl AcpBackend {
                         display_text: None,
                     },
                 ),
-            ))
+            })
             .await;
     }
 
@@ -745,8 +795,19 @@ impl AcpBackend {
                 let prompt_result_tx = self.prompt_result_tx.clone();
                 let request_id_for_task = request_id.clone();
                 let prompt_meta_for_task = prompt_meta.clone();
+                let echo_id_for_task =
+                    nori_protocol::PromptEchoId::in_meta(prompt_meta.as_ref()).map(str::to_owned);
+                let original_content_for_task = original_content.clone();
                 let prompt_task = tokio::spawn(async move {
                     let session_id = backend.session_id.read().await.clone();
+                    let mut prompt = prompt;
+                    if !matches!(
+                        prompt_kind,
+                        QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact
+                    ) && let Some(context) = backend.take_goal_context_for_prompt().await
+                    {
+                        prompt.push(acp::ContentBlock::Text(acp::TextContent::new(context)));
+                    }
                     debug!(
                         target: "acp_event_flow",
                         request_id = %request_id_for_task,
@@ -783,6 +844,29 @@ impl AcpBackend {
                                 error = %err,
                                 "Prompt task failed before reducer observed a prompt response"
                             );
+                            if prompt_kind == QueuedPromptKind::User
+                                && nori_acp_host::is_subscription_exhausted(&err)
+                            {
+                                let (models, ranked) = backend.fallback_policy().await;
+                                let context = backend.recent_context().await;
+                                backend.wait_for_prompt_phase().await;
+                                let _ = backend
+                                    .backend_event_tx
+                                    .send(BackendEvent::Public(SessionEvent::Nori(
+                                        nori_protocol::NoriEvent::SubscriptionExhausted(
+                                            nori_protocol::SubscriptionExhausted {
+                                                request_id: wire_request_id.clone(),
+                                                echo_id: echo_id_for_task,
+                                                models,
+                                                ranked,
+                                                content: original_content_for_task,
+                                                context,
+                                                original_error: format!("{err:#}"),
+                                            },
+                                        ),
+                                    )))
+                                    .await;
+                            }
                             let failure = backend
                                 .send_prompt_error(&wire_request_id, prompt_kind, &err)
                                 .await;
@@ -816,7 +900,12 @@ impl AcpBackend {
                         )),
                     };
 
-                if prompt_kind == QueuedPromptKind::User {
+                let handoff_retry = prompt_meta
+                    .as_ref()
+                    .and_then(|meta| meta.get(nori_protocol::HANDOFF_RETRY_META_KEY))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if prompt_kind == QueuedPromptKind::User && !handoff_retry {
                     if let Some(recorder) = self.transcript_recorder.read().await.clone()
                         && let Some(display_text) = display_text.as_deref()
                         && let Err(error) = recorder

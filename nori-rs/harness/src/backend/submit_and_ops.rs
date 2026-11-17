@@ -1,6 +1,93 @@
 use super::*;
 
 impl AcpBackend {
+    pub(crate) async fn send_subagent_message(
+        &self,
+        session_id: acp::SessionId,
+        text: String,
+    ) -> Result<()> {
+        self.send_subagent_content(
+            session_id,
+            vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+        )
+        .await
+    }
+
+    pub(crate) async fn spawn_conversation_agent(
+        &self,
+        actor: String,
+        agent: String,
+    ) -> anyhow::Result<String> {
+        self.orchestrator
+            .spawn_program_actor(actor, agent)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) async fn send_subagent_content(
+        &self,
+        session_id: acp::SessionId,
+        content: Vec<acp::ContentBlock>,
+    ) -> Result<()> {
+        let _child_gate = self.native_children.control_gate(&session_id).await;
+        let generation = self.orchestrator.admission_generation();
+        let _admission = self.program_effects.read().await;
+        anyhow::ensure!(
+            generation == self.orchestrator.admission_generation(),
+            "The conversation was rewound before the child message started"
+        );
+        if self.orchestrator.owns_view(&session_id).await {
+            self.orchestrator
+                .send_user_content_message_locked(session_id, content)
+                .await
+                .map_err(anyhow::Error::msg)
+        } else if self.native_children.owns(&session_id).await {
+            self.native_children.enqueue(&session_id, content).await
+        } else if let Some(next) = self.orchestrator.descendant_next_hop(&session_id).await {
+            next.handle
+                .send_subagent_content(next.session_id, content)
+                .await
+        } else {
+            Err(anyhow::anyhow!("Unknown child session"))
+        }
+    }
+
+    pub(crate) async fn fork_history(
+        &self,
+        context: String,
+        source: Option<(String, i64, i64)>,
+    ) -> anyhow::Result<()> {
+        let generation = self.orchestrator.admission_generation();
+        let _admission = self.orchestrator.rewind_admission().await;
+        anyhow::ensure!(
+            generation == self.orchestrator.admission_generation(),
+            "The conversation was rewound before the fork started"
+        );
+        let (context, entries) = if let Some((session_id, start, end)) = &source {
+            let recorder = self
+                .transcript_recorder
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("The source conversation has no event log"))?;
+            let records = recorder
+                .projected_fork_records(session_id, *start, *end)
+                .await?;
+            let entries =
+                crate::transcript::fork_context::replay_entries_from_records(&records, session_id);
+            (
+                crate::transcript::fork_context::context_from_records(records)?,
+                entries,
+            )
+        } else {
+            (context, Vec::new())
+        };
+        self.orchestrator
+            .fork_history(context, source, entries)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+
     /// Flush the active transcript recorder to disk (write barrier). A
     /// missing recorder (transcripts disabled) flushes trivially.
     pub(crate) async fn flush_transcript(&self) -> Result<()> {
@@ -50,6 +137,8 @@ impl AcpBackend {
         cancel_session: bool,
         child_grace: Option<std::time::Duration>,
     ) {
+        self.withdraw_all_questions().await;
+        self.native_children.shutdown().await;
         self.is_shutting_down
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(abort) = self.cancel_timeout_abort.lock().await.take() {
@@ -184,8 +273,10 @@ impl AcpBackend {
         Ok(())
     }
 
-    pub(crate) fn set_approval_policy(&self, policy: nori_config::AskForApproval) {
-        let _ = self.approval_policy_tx.send(policy);
+    pub(crate) fn set_approval_policy(&self, _policy: nori_config::AskForApproval) {
+        let _ = self
+            .approval_policy_tx
+            .send(nori_config::AskForApproval::Never);
     }
 
     pub(crate) async fn respond_to_agent(
@@ -213,6 +304,19 @@ impl AcpBackend {
         content: Vec<acp::ContentBlock>,
         prompt_meta: Option<acp::Meta>,
         admission: PromptAdmission,
+        response_tx: oneshot::Sender<Result<acp::RequestId>>,
+    ) {
+        let (_, cancellation) = tokio::sync::watch::channel(false);
+        self.submit_prompt_cancellable(content, prompt_meta, admission, cancellation, response_tx)
+            .await;
+    }
+
+    pub(crate) async fn submit_prompt_cancellable(
+        &self,
+        content: Vec<acp::ContentBlock>,
+        prompt_meta: Option<acp::Meta>,
+        admission: PromptAdmission,
+        cancellation: tokio::sync::watch::Receiver<bool>,
         response_tx: oneshot::Sender<Result<acp::RequestId>>,
     ) {
         let has_content = content.iter().any(|block| match block {
@@ -254,12 +358,37 @@ impl AcpBackend {
             .await
             .insert(id.clone(), response_tx);
         if let Err(error) = self
-            .handle_prompt(content, &id, prompt_meta, admission)
+            .handle_prompt(content, &id, prompt_meta, admission, cancellation)
             .await
             && let Some(response_tx) = self.pending_prompt_submissions.lock().await.remove(&id)
         {
             let _ = response_tx.send(Err(error));
         }
+    }
+
+    /// Prioritize a queued prompt without stopping delegated child sessions.
+    pub(crate) async fn promote_next_queued(&self) -> Result<()> {
+        let generation = self.orchestrator.admission_generation();
+        let _admission = self.orchestrator.rewind_admission().await;
+        anyhow::ensure!(
+            generation == self.orchestrator.admission_generation(),
+            "The conversation was rewound before queue promotion"
+        );
+        self.session_event_tx
+            .send(session_runtime_driver::SessionRuntimeInput::Reducer(
+                session_reducer::InboundEvent::PromoteQueued,
+            ))
+            .await
+            .map_err(|_| anyhow::anyhow!("session runtime closed"))?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.session_event_tx
+            .send(session_runtime_driver::SessionRuntimeInput::Barrier { response_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("session runtime closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("session runtime closed"))?;
+        Ok(())
     }
 
     /// Handle the /compact operation.

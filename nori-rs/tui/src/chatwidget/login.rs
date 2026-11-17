@@ -3,8 +3,53 @@ use super::*;
 use std::path::Path;
 
 impl ChatWidget {
+    pub(super) fn handle_explicit_login(&mut self, agent_name: &str) {
+        self.login_child_target = self.focused_subagent;
+        self.handle_login_command_with_agent(agent_name);
+        if self.login_handler.is_none() {
+            self.login_child_target = None;
+        }
+    }
+    pub(super) fn add_login_message(&mut self, message: String, hint: Option<String>) {
+        if let Some(key) = self.login_child_target {
+            let mut text = message;
+            if let Some(hint) = hint {
+                text.push('\n');
+                text.push_str(&hint);
+            }
+            text.push('\n');
+            self.app_event_tx
+                .send(AppEvent::ChildSessionOutput { key, text });
+        } else {
+            self.add_info_message(message, hint);
+        }
+    }
+
+    fn add_login_error(&mut self, message: String) {
+        if self.login_child_target.is_some() {
+            self.add_login_message(message, None);
+        } else {
+            self.add_error_message(message);
+        }
+    }
+
     /// Handle the /login slash command
     pub(super) fn handle_login_command(&mut self) {
+        if let Some(key) = self.focused_subagent {
+            let Some(agent_name) = self.subagents.agent_for_key(key).map(str::to_owned) else {
+                self.app_event_tx.send(AppEvent::TransientNotice(
+                    "This child does not identify its provider; login is unavailable.".to_owned(),
+                ));
+                return;
+            };
+            self.login_child_target = Some(key);
+            self.handle_login_command_with_agent(&agent_name);
+            if self.login_handler.is_none() {
+                self.login_child_target = None;
+            }
+            return;
+        }
+        self.login_child_target = None;
         let agent_name = self.login_target_agent().to_string();
         self.handle_login_command_with_agent(&agent_name);
     }
@@ -20,7 +65,7 @@ impl ChatWidget {
     }
 
     /// Handle the /login <agent> command with explicit agent name
-    pub(super) fn handle_login_command_with_agent(&mut self, agent_name: &str) {
+    pub(crate) fn handle_login_command_with_agent(&mut self, agent_name: &str) {
         match LoginHandler::check_agent_support(agent_name) {
             AgentLoginSupport::Supported {
                 agent,
@@ -30,7 +75,7 @@ impl ChatWidget {
                 if !is_installed {
                     let display_name = agent.display_name();
                     let npm_package = agent.npm_package();
-                    self.add_info_message(
+                    self.add_login_message(
                         format!(
                             "{display_name} is not installed. To install, run:\n\n  npm install -g {npm_package}\n\nThen run /login again to authenticate."
                         ),
@@ -44,7 +89,7 @@ impl ChatWidget {
                         let mut handler = LoginHandler::new();
                         handler.start_oauth();
 
-                        self.add_info_message(
+                        self.add_login_message(
                             "Starting authentication...\n\nA browser window will open for you to sign in with your OpenAI account.\n\nAlternatively, you can set the OPENAI_API_KEY environment variable.".to_string(),
                             Some("Press Esc to cancel".to_string()),
                         );
@@ -56,7 +101,7 @@ impl ChatWidget {
                         let agent_display_name = agent.display_name().to_string();
                         handler.start_external_cli(agent_display_name.clone());
 
-                        self.add_info_message(
+                        self.add_login_message(
                             format!(
                                 "Starting authentication for {agent_display_name}...\n\nThe {agent_display_name} login process will run in-app.",
                             ),
@@ -72,21 +117,8 @@ impl ChatWidget {
                     }
                 }
             }
-            AgentLoginSupport::NotSupported { agent_name } => {
-                let instructions = match agent_name.as_str() {
-                    "Claude Code" => {
-                        "In-app login for Claude Code is not yet supported.\n\n\
-                         To authenticate, run `claude` in a separate terminal and use the /login command.\n\n\
-                         Alternatively, set the ANTHROPIC_API_KEY environment variable."
-                    }
-                    _ => {
-                        "In-app login for this agent is not yet supported. Please authenticate externally using the agent's native login command or API keys."
-                    }
-                };
-                self.add_info_message(instructions.to_string(), None);
-            }
             AgentLoginSupport::Unknown { agent_name } => {
-                self.add_info_message(
+                self.add_login_message(
                     format!("Unknown agent '{agent_name}'. Cannot determine login method."),
                     None,
                 );
@@ -116,9 +148,12 @@ impl ChatWidget {
 
                 // Store the handler
                 self.login_handler = Some(handler);
+                self.app_event_tx.send(AppEvent::LoginStarted {
+                    target: self.login_child_target,
+                });
 
                 // Update the info message with the URL
-                self.add_info_message(
+                self.add_login_message(
                     format!(
                         "Opening browser for authentication...\n\nIf the browser doesn't open automatically, visit:\n{auth_url}\n\nWaiting for authentication to complete..."
                     ),
@@ -142,7 +177,7 @@ impl ChatWidget {
                 });
             }
             Err(e) => {
-                self.add_error_message(format!("Failed to start login server: {e}"));
+                self.add_login_error(format!("Failed to start login server: {e}"));
             }
         }
     }
@@ -160,6 +195,9 @@ impl ChatWidget {
 
         let app_event_tx = self.app_event_tx.clone();
         let cwd = self.config.cwd.clone();
+        // Install the queue before spawning so input entered immediately is retained.
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        handler.set_pty_input_sender(input_tx);
 
         // Spawn the PTY process and stream output
         let task_handle = tokio::spawn(async move {
@@ -172,13 +210,14 @@ impl ChatWidget {
             match codex_utils_pty::spawn_pty_process(&command, &args, &cwd, &env, &None).await {
                 Ok(spawned) => {
                     // Keep session alive so process keeps running
-                    let _session = spawned.session;
+                    let session = spawned.session;
+                    let writer_tx = session.writer_sender();
                     let mut output_rx = spawned.output_rx;
-                    let exit_rx = spawned.exit_rx;
+                    let mut exit_rx = spawned.exit_rx;
 
                     // Spawn a task to stream output
                     let output_event_tx = app_event_tx.clone();
-                    let output_task = tokio::spawn(async move {
+                    let mut output_task = tokio::spawn(async move {
                         loop {
                             match output_rx.recv().await {
                                 Ok(data) => {
@@ -202,9 +241,25 @@ impl ChatWidget {
                     });
 
                     // Wait for process exit
-                    let exit_code = exit_rx.await.unwrap_or(-1);
+                    let exit_code = loop {
+                        tokio::select! {
+                            result = &mut exit_rx => break result.unwrap_or(-1),
+                            input = input_rx.recv() => match input {
+                                Some(bytes) => {
+                                    if writer_tx.send(bytes).await.is_err() {
+                                        break -1;
+                                    }
+                                }
+                                None => break -1,
+                            },
+                        }
+                    };
 
-                    // Cancel output task
+                    // Allow the PTY reader to deliver output written immediately before exit.
+                    // The session itself holds an output sender, so the stream does not close
+                    // until the session is dropped.
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(100), &mut output_task).await;
                     output_task.abort();
 
                     // Send completion event
@@ -227,6 +282,9 @@ impl ChatWidget {
         // Store the task handle for cancellation support
         handler.set_pty_task_handle(task_handle);
         self.login_handler = Some(handler);
+        self.app_event_tx.send(AppEvent::LoginStarted {
+            target: self.login_child_target,
+        });
     }
 
     /// Start the external CLI login flow (stub for non-login builds)
@@ -238,7 +296,7 @@ impl ChatWidget {
         _args: Vec<String>,
         _agent_display_name: String,
     ) {
-        self.add_error_message(
+        self.add_login_error(
             "Login feature is not enabled. Rebuild with --features login".to_string(),
         );
     }
@@ -249,7 +307,7 @@ impl ChatWidget {
             if success {
                 self.login_agent_override = None;
                 handler.oauth_complete();
-                self.add_info_message(
+                self.add_login_message(
                     "Successfully authenticated with OpenAI!\n\nYou can now use Nori.".to_string(),
                     None,
                 );
@@ -263,36 +321,58 @@ impl ChatWidget {
                 }
             } else {
                 handler.cancel();
-                self.add_info_message("Login cancelled or failed.".to_string(), None);
+                self.add_login_message("Login cancelled or failed.".to_string(), None);
             }
         }
+        self.login_child_target = None;
         self.request_redraw();
     }
 
     /// Handle external CLI login output (streaming text from the PTY process)
     pub(crate) fn handle_external_cli_login_output(&mut self, data: String) {
+        if !self
+            .login_handler
+            .as_ref()
+            .is_some_and(LoginHandler::has_external_cli_task)
+        {
+            return;
+        }
         // Display the output as an info message (append to existing or create new)
-        self.add_info_message(data, None);
+        if let Some(key) = self.login_child_target {
+            self.app_event_tx
+                .send(AppEvent::ChildSessionOutput { key, text: data });
+        } else {
+            self.add_info_message(data, None);
+        }
         self.request_redraw();
     }
 
     /// Handle external CLI login completion
     pub(crate) fn handle_external_cli_login_complete(&mut self, success: bool, agent_name: String) {
-        if let Some(mut handler) = self.login_handler.take() {
-            handler.cancel(); // Clear any handler state
-        }
+        let Some(mut handler) = self.login_handler.take() else {
+            return;
+        };
+        handler.cancel(); // Clear any handler state
 
         if success {
             self.login_agent_override = None;
-            self.add_info_message(
+            self.add_login_message(
                 format!(
                     "Successfully authenticated with {agent_name}!\n\nYou can now use {agent_name}."
                 ),
                 None,
             );
+            if agent_name == "Claude Code"
+                && nori_harness::AgentKind::from_slug(&self.config.active_agent)
+                    == Some(nori_harness::AgentKind::ClaudeCode)
+                && !self.has_harness_session()
+            {
+                self.app_event_tx.send(AppEvent::NewSession);
+            }
         } else {
-            self.add_info_message(format!("{agent_name} login failed or was cancelled."), None);
+            self.add_login_message(format!("{agent_name} login failed or was cancelled."), None);
         }
+        self.login_child_target = None;
         self.request_redraw();
     }
 }

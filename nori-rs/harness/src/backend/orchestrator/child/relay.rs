@@ -19,6 +19,7 @@ pub(super) async fn relay(
     orchestrator: &Arc<Inner>,
     harness: &HarnessHandle,
     child_session: &acp::SessionId,
+    scope: &acp::SessionId,
     view: Option<&acp::SessionId>,
     active: Option<&mut Active>,
     event: SessionEvent,
@@ -69,27 +70,78 @@ pub(super) async fn relay(
                 .await;
             None
         }
-        // The child's own subagents are the parent's grandchildren; nested deeper they keep their
-        // own ids, which are unique already.
-        SessionEvent::Acp(AcpEvent::ChildNotification(notification)) => {
+        // ACP session IDs are connection-scoped. Distinct child connections may use the same ID.
+        SessionEvent::Acp(AcpEvent::ChildNotification(mut notification)) => {
+            let original = notification.session_id.clone();
+            notification.session_id = scoped_id(scope, &original);
+            orchestrator.state.lock().await.descendants.insert(
+                notification.session_id.clone(),
+                super::super::DescendantRoute { handle: harness.clone(), session_id: original },
+            );
             orchestrator
                 .emit(SessionEvent::Acp(AcpEvent::ChildNotification(notification)))
                 .await;
             None
         }
         SessionEvent::Nori(NoriEvent::Subagent(mut wire)) => {
+            if let SubagentWire::Update(update) = &wire {
+                let public_id = scoped_id(scope, &update.session_id);
+                orchestrator
+                    .state
+                    .lock()
+                    .await
+                    .descendants
+                    .insert(public_id, super::super::DescendantRoute {
+                        handle: harness.clone(), session_id: update.session_id.clone(),
+                    });
+            }
             if let Some(view) = view {
-                retarget(&mut wire, child_session, view);
+                retarget(&mut wire, child_session, scope, view);
             }
             orchestrator
                 .emit(SessionEvent::Nori(NoriEvent::Subagent(wire)))
                 .await;
             None
         }
+        SessionEvent::Nori(NoriEvent::SubagentQueueChanged { mut session_id, prompts }) => {
+            if &session_id == child_session && let Some(view) = view {
+                session_id = view.clone();
+            } else {
+                let original = session_id;
+                session_id = scoped_id(scope, &original);
+                orchestrator.state.lock().await.descendants.insert(
+                    session_id.clone(),
+                    super::super::DescendantRoute { handle: harness.clone(), session_id: original },
+                );
+            }
+            orchestrator.emit(SessionEvent::Nori(NoriEvent::SubagentQueueChanged { session_id, prompts })).await;
+            None
+        }
         SessionEvent::Acp(AcpEvent::Request {
             request_id,
-            request,
+            mut request,
         }) => {
+            if let acp::AgentRequest::ExtMethodRequest(ext) = &mut request
+                && ext.method.as_ref() == "_nori/request_user_input"
+                && let Ok(mut params) = serde_json::from_str::<serde_json::Value>(ext.params.get())
+                && let Some(id) = params.get("sessionId").and_then(serde_json::Value::as_str)
+            {
+                let original = acp::SessionId::new(id);
+                let public = if &original == child_session {
+                    view.cloned()
+                } else {
+                    let public = scoped_id(scope, &original);
+                    orchestrator.state.lock().await.descendants.insert(public.clone(),
+                        super::super::DescendantRoute { handle: harness.clone(), session_id: original });
+                    Some(public)
+                };
+                if let Some(public) = public {
+                    params["sessionId"] = serde_json::Value::String(public.to_string());
+                    if let Ok(raw) = serde_json::value::RawValue::from_string(params.to_string()) {
+                        ext.params = raw.into();
+                    }
+                }
+            }
             let task = active.map(|active| active.task.clone());
             orchestrator
                 .relay_request(harness, task, view.cloned(), request_id, request)
@@ -123,6 +175,12 @@ pub(super) async fn relay(
                 },
             })
         }
+        SessionEvent::Nori(NoriEvent::RequestWithdrawn(request_id)) => {
+            if let Some(view) = view {
+                orchestrator.signal(super::super::Signal::Withdraw(vec![acp::RequestId::Str(format!("{view}/{request_id}"))]));
+            }
+            None
+        }
         SessionEvent::Nori(NoriEvent::RequestFailed(failure)) => {
             let active = active?;
             (failure.request_id.as_ref() == Some(&active.request_id)).then_some(TaskEnd::Failed {
@@ -139,6 +197,7 @@ pub(super) async fn relay(
         SessionEvent::Acp(AcpEvent::Notification(_))
         | SessionEvent::Nori(
             NoriEvent::SessionStarted(_)
+            | NoriEvent::SessionReady(_)
             | NoriEvent::SessionPhaseChanged(_)
             | NoriEvent::QueueChanged(_)
             | NoriEvent::ReplayStarted(_)
@@ -152,10 +211,10 @@ pub(super) async fn relay(
             | NoriEvent::HookOutput(_)
             | NoriEvent::PromptSummaryUpdated(_)
             | NoriEvent::Notice(_)
+            | NoriEvent::SubscriptionExhausted(_)
             // Results the child's own tasks handed to it are the child's business.
             | NoriEvent::TaskResultsDelivered(_)
-            // The child's requests reach the parent relayed, with ids of the parent's own.
-            | NoriEvent::RequestWithdrawn(_),
+            | NoriEvent::ConversationResponseBoundary(_),
         ) => None,
     }
 }
@@ -188,14 +247,24 @@ fn note_changes(
 }
 
 /// Re-parent the child's own subagent traffic onto the task's view of the child.
-fn retarget(wire: &mut SubagentWire, child_session: &acp::SessionId, view: &acp::SessionId) {
+fn retarget(
+    wire: &mut SubagentWire,
+    child_session: &acp::SessionId,
+    scope: &acp::SessionId,
+    view: &acp::SessionId,
+) {
     let swap = |id: &mut acp::SessionId| {
         if id == child_session {
             *id = view.clone();
+        } else {
+            *id = scoped_id(scope, id);
         }
     };
     match wire {
-        SubagentWire::Update(update) => swap(&mut update.parent_session_id),
+        SubagentWire::Update(update) => {
+            swap(&mut update.parent_session_id);
+            swap(&mut update.session_id);
+        }
         SubagentWire::Message(message) => {
             swap(&mut message.session_id);
             if let Some(sender) = message.sender_session_id.as_mut() {
@@ -205,5 +274,51 @@ fn retarget(wire: &mut SubagentWire, child_session: &acp::SessionId, view: &acp:
                 swap(recipient);
             }
         }
+    }
+}
+
+/// Stable, unambiguous public identity for an ID on this child connection.
+fn scoped_id(scope: &acp::SessionId, id: &acp::SessionId) -> acp::SessionId {
+    let scope = scope.to_string();
+    acp::SessionId::new(format!("nori-relay:{}:{scope}{id}", scope.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nori_protocol::Patch;
+    use nori_protocol::SubagentUpdate;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn identical_connection_local_ids_remain_distinct_and_keep_ancestry() {
+        let raw = acp::SessionId::new("native-child");
+        let first = acp::SessionId::new("first-parent");
+        let second = acp::SessionId::new("second-parent");
+        assert_ne!(scoped_id(&first, &raw), scoped_id(&second, &raw));
+        assert_eq!(scoped_id(&first, &raw), scoped_id(&first, &raw));
+        assert_ne!(
+            scoped_id(&acp::SessionId::new("a"), &acp::SessionId::new("bc")),
+            scoped_id(&acp::SessionId::new("ab"), &acp::SessionId::new("c"))
+        );
+        let mut wire = SubagentWire::Update(SubagentUpdate {
+            parent_session_id: acp::SessionId::new("provider-root"),
+            session_id: raw.clone(),
+            agent: Patch::Keep,
+            title: Patch::Keep,
+            description: Patch::Keep,
+            state: Patch::Keep,
+        });
+        retarget(
+            &mut wire,
+            &acp::SessionId::new("provider-root"),
+            &first,
+            &first,
+        );
+        let SubagentWire::Update(update) = wire else {
+            panic!("expected update")
+        };
+        assert_eq!(update.parent_session_id, first.clone());
+        assert_eq!(update.session_id, scoped_id(&first, &raw));
     }
 }

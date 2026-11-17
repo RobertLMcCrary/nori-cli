@@ -14,6 +14,12 @@ use crate::normalized::ClientEvent;
 pub(super) enum SessionSwapMode {
     /// Create a brand-new session (summarize-and-swap `/compact`).
     NewAfterCompact,
+    /// Start a fresh engine after moving the canonical visible head.
+    Rewind {
+        head: Option<i64>,
+        context: String,
+        recorder: Arc<TranscriptRecorder>,
+    },
     /// Fork the current head into a new session (branch-at-head `/fork`).
     ForkFromHead { from: acp::SessionId },
 }
@@ -29,6 +35,24 @@ impl AcpBackend {
         &self,
         mode: SessionSwapMode,
     ) -> Result<acp::SessionId> {
+        let prior_model = if matches!(&mode, SessionSwapMode::Rewind { .. }) {
+            self.connection
+                .config_options()
+                .into_iter()
+                .find_map(|option| {
+                    if option.category != Some(acp::SessionConfigOptionCategory::Model) {
+                        return None;
+                    }
+                    match option.kind {
+                        acp::SessionConfigKind::Select(select) => {
+                            Some(select.current_value.to_string())
+                        }
+                        _ => None,
+                    }
+                })
+        } else {
+            None
+        };
         let cwd = self.cwd.clone();
         let mut mcp_servers = crate::connection::mcp::to_acp_mcp_servers(
             &self.mcp_servers,
@@ -89,7 +113,7 @@ impl AcpBackend {
         });
 
         let swap_result = match &mode {
-            SessionSwapMode::NewAfterCompact => {
+            SessionSwapMode::NewAfterCompact | SessionSwapMode::Rewind { .. } => {
                 self.connection.create_session(&cwd, mcp_servers).await
             }
             SessionSwapMode::ForkFromHead { from } => {
@@ -101,6 +125,59 @@ impl AcpBackend {
 
         match swap_result {
             Ok(new_session_id) => {
+                if let Some(model) = prior_model {
+                    let option = self.connection.config_options().into_iter().find(|option| {
+                        option.category == Some(acp::SessionConfigOptionCategory::Model)
+                    });
+                    let result = match option {
+                        Some(option) if matches!(&option.kind, acp::SessionConfigKind::Select(select) if select.current_value.to_string() == model) => {
+                            Ok(())
+                        }
+                        Some(option) => {
+                            self.connection
+                                .set_config_option(&new_session_id, option.id, model)
+                                .await
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "Replacement session does not advertise a model selector"
+                        )),
+                    };
+                    if let Err(error) = result {
+                        if let Some(previous) = previous_goal_mcp_connected {
+                            self.goal_mcp_connected.store(previous, Ordering::Relaxed);
+                        }
+                        return Err(error);
+                    }
+                }
+                if let SessionSwapMode::Rewind {
+                    head,
+                    context,
+                    recorder,
+                } = &mode
+                {
+                    if let Err(error) = recorder.rewind_head(*head).await {
+                        if let Some(previous) = previous_goal_mcp_connected {
+                            self.goal_mcp_connected.store(previous, Ordering::Relaxed);
+                        }
+                        return Err(error.into());
+                    }
+                    // Rewind is durable now; always commit the fresh engine, even if the
+                    // additional binding record cannot be written.
+                    if let Err(error) = recorder
+                        .record_backend_bound(
+                            serde_json::json!({
+                                "agent": self.agent_name,
+                                "acp_session_id": new_session_id.to_string(),
+                            })
+                            .to_string(),
+                        )
+                        .await
+                    {
+                        warn!(%error, "Failed to record backend binding after rewind");
+                    }
+                    *self.pending_compact_summary.lock().await =
+                        Some(crate::compact::checkpoint(context, None));
+                }
                 if let Some(server) = pending_nori_client_server {
                     server.commit(&self.goal_mcp_http_server).await;
                 }
@@ -111,7 +188,11 @@ impl AcpBackend {
                 // `session_id` still names the old session) so the
                 // nori-client loop can take the local goal back over.
                 self.stop_stale_ext_goal().await;
-                *self.session_id.write().await = new_session_id.clone();
+                {
+                    let mut active_session = self.session_id.write().await;
+                    self.native_children.shutdown().await;
+                    *active_session = new_session_id.clone();
+                }
                 self.orchestrator.bind(orchestrator::Binding {
                     session_id: new_session_id.clone(),
                     approval_policy: self.approval_policy_tx.subscribe(),
@@ -119,11 +200,30 @@ impl AcpBackend {
                 if matches!(mode, SessionSwapMode::ForkFromHead { .. }) {
                     self.fork_transcript(&new_session_id).await;
                 }
+                if !matches!(mode, SessionSwapMode::Rewind { .. })
+                    && let Some(recorder) = self.transcript_recorder.read().await.clone()
+                    && let Err(error) = recorder
+                        .record_backend_bound(
+                            serde_json::json!({
+                                "agent": self.agent_name,
+                                "acp_session_id": new_session_id.to_string(),
+                            })
+                            .to_string(),
+                        )
+                        .await
+                {
+                    warn!(%error, "Failed to record backend binding after session swap");
+                }
                 self.forward_client_event(ClientEvent::SessionCapabilitiesChanged(
                     nori_client_mcp::capabilities_update_for_nori_client(
                         &self.connection,
                         nori_client_advertised,
                         self.goal_mcp_connected.load(Ordering::Relaxed),
+                        self.goal_mcp_http_server
+                            .lock()
+                            .await
+                            .as_ref()
+                            .is_some_and(nori_client_mcp::NoriClient::has_goal_tools),
                     ),
                 ))
                 .await;

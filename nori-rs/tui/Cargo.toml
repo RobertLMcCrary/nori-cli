@@ -37,6 +37,7 @@ base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 nori-harness = { workspace = true }
+nori-acp-host = { workspace = true }
 nori-config = { workspace = true }
 nori-host-tools = { workspace = true }
 codex-ansi-escape = { workspace = true }
@@ -66,6 +67,8 @@ itertools = { workspace = true }
 lazy_static = { workspace = true }
 mcp-types = { workspace = true }
 memchr = { workspace = true }
+modalkit = { workspace = true }
+modalkit-ratatui = { workspace = true }
 pathdiff = { workspace = true }
 pulldown-cmark = { workspace = true }
 rand = { workspace = true }

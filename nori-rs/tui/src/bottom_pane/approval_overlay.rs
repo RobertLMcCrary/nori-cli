@@ -23,8 +23,6 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
-use ratatui::widgets::Wrap;
 
 /// An ACP permission request awaiting a schema-native client response.
 #[derive(Clone, Debug)]
@@ -260,7 +258,6 @@ impl Renderable for ApprovalOverlay {
 }
 
 fn approval_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
-    let title = crate::client_event_format::relativize_paths_in_text(&request.title, &request.cwd);
     let edit_like = matches!(
         request.kind,
         crate::presentation::ToolKind::Create
@@ -284,22 +281,13 @@ fn approval_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
         }
     }
 
-    let mut lines = vec![Line::from(title.clone())];
-    if let Some(invocation) =
-        crate::client_event_format::format_invocation(&request.snapshot.invocation)
-    {
-        let invocation =
-            crate::client_event_format::relativize_paths_in_text(&invocation, &request.cwd);
-        if !crate::client_event_format::is_invocation_redundant(&invocation, &title) {
-            lines.push(Line::from(invocation));
-        }
-    }
-    lines.extend(
-        crate::client_event_format::format_artifacts(&request.snapshot.artifacts)
-            .into_iter()
-            .map(Line::from),
-    );
-    Box::new(Paragraph::new(lines).wrap(Wrap { trim: false }))
+    Box::new(super::approval_tool_details::ToolDetails(
+        crate::client_tool_cell::ClientToolCell::new(
+            (*request.snapshot).clone(),
+            request.cwd.clone(),
+            false,
+        ),
+    ))
 }
 
 #[derive(Clone)]

@@ -24,20 +24,18 @@ use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
 
 mod message_menu;
-mod subagent;
 mod transcript;
 #[cfg(test)]
 mod transcript_tests;
 
 pub(crate) use message_menu::MessageAction;
 pub(crate) use message_menu::MessageChoice;
-pub(crate) use subagent::SubagentFocus;
 pub(crate) use transcript::TranscriptOverlay;
 
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
-    /// The subagent switcher, or the focused view of one subagent.
+    /// The subagent switcher.
     Subagents(Box<crate::subagent_switcher::SubagentOverlay>),
 }
 
@@ -570,7 +568,7 @@ impl StaticOverlay {
                 other => self.view.handle_key_event(tui, other),
             },
             TuiEvent::Draw => {
-                tui.draw(u16::MAX, 0, |frame| {
+                tui.draw_overlay(|frame| {
                     self.render(frame.area(), frame.buffer);
                 })?;
                 Ok(())

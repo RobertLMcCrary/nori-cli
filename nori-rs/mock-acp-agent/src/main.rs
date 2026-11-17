@@ -134,19 +134,37 @@ fn default_session_config() -> MockSessionConfig {
 }
 
 fn config_options_for_state(config: &MockSessionConfig) -> Vec<acp::SessionConfigOption> {
+    let mut models = vec![
+        acp::SessionConfigSelectOption::new("mock-model-default", "Mock Default Model")
+            .description("The default mock model"),
+        acp::SessionConfigSelectOption::new("mock-model-fast", "Mock Fast Model")
+            .description("A faster mock model variant"),
+    ];
+    if std::env::var_os("MOCK_AGENT_VERSIONED_MODEL").is_some() {
+        let model_name = std::env::var("MOCK_AGENT_MODEL_NAME").unwrap_or_default();
+        let default_value = if model_name == "mock-model-alt" {
+            "gateway/gpt-6.1-sol"
+        } else if model_name == "opencode" {
+            "openai/gpt-6-astra"
+        } else if model_name == "codex" {
+            "codex/gpt-6-astra"
+        } else {
+            "openai/gpt-6.1-sol"
+        };
+        let default_display = if model_name == "opencode" || model_name == "codex" {
+            "GPT-6 Astra"
+        } else {
+            "GPT 6.1 Sol"
+        };
+        let value =
+            std::env::var("MOCK_AGENT_MODEL_VALUE").unwrap_or_else(|_| default_value.into());
+        let display =
+            std::env::var("MOCK_AGENT_MODEL_DISPLAY").unwrap_or_else(|_| default_display.into());
+        models.push(acp::SessionConfigSelectOption::new(value, display));
+    }
     let mut options = vec![
-        acp::SessionConfigOption::select(
-            "model",
-            "Model",
-            config.model_id.clone(),
-            vec![
-                acp::SessionConfigSelectOption::new("mock-model-default", "Mock Default Model")
-                    .description("The default mock model"),
-                acp::SessionConfigSelectOption::new("mock-model-fast", "Mock Fast Model")
-                    .description("A faster mock model variant"),
-            ],
-        )
-        .category(acp::SessionConfigOptionCategory::Model),
+        acp::SessionConfigOption::select("model", "Model", config.model_id.clone(), models)
+            .category(acp::SessionConfigOptionCategory::Model),
     ];
 
     if config.model_id == "mock-model-fast" {
@@ -450,7 +468,11 @@ impl MockAgent {
                 ));
             }
         }
-        if std::env::var("MOCK_AGENT_EXIT_DURING_PROMPT").is_ok() {
+        if std::env::var("MOCK_AGENT_EXIT_DURING_PROMPT").is_ok()
+            || std::env::var("MOCK_AGENT_EXIT_DURING_PROMPT_MODEL").is_ok_and(|model| {
+                std::env::var("MOCK_AGENT_MODEL_NAME").is_ok_and(|current| current == model)
+            })
+        {
             eprintln!("Mock agent: exiting during prompt");
             std::process::exit(17);
         }
@@ -471,6 +493,7 @@ impl MockAgent {
                 "pid": std::process::id(),
                 "session": session_id.to_string(),
                 "text": prompt_text,
+                "content": arguments.prompt,
             });
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
@@ -481,7 +504,69 @@ impl MockAgent {
             }
         }
 
-        if let Some(result) = wire_replay::run(&self, &session_id).await {
+        if std::env::var("MOCK_AGENT_FAIL_TEXT").is_ok_and(|text| prompt_text == text) {
+            return Err(acp::Error::new(-32001, "Mock child prompt failure"));
+        }
+        let fixture_prompt = last_prompt_text_block(&arguments.prompt);
+        if fixture_prompt == Some("fixture:withdraw-user-question")
+            || fixture_prompt == Some("fixture:early-withdraw-user-question")
+        {
+            let make_request = |call: &str| {
+                agent_client_protocol::UntypedMessage::new(
+                    "_nori/request_user_input",
+                    json!({
+                        "sessionId": session_id.to_string(), "callId": call, "turnId": "fixture-turn",
+                        "questions": [{"id":"choice","header":"Choice","question":"Proceed?","isOther":true,"isSecret":false,"options":null}]
+                    }),
+                )
+            };
+            let withdraw = || {
+                agent_client_protocol::UntypedMessage::new(
+                    "_nori/user_input_cancelled",
+                    json!({"sessionId": session_id.to_string(), "callId": "withdrawn", "turnId": "fixture-turn"}),
+                )
+            };
+            if fixture_prompt == Some("fixture:early-withdraw-user-question") {
+                self.cx.send_notification(withdraw()?)?;
+                sleep(Duration::from_millis(250)).await;
+            }
+            let withdrawn = self.cx.send_request(make_request("withdrawn")?);
+            let retained = self.cx.send_request(make_request("retained")?);
+            if fixture_prompt == Some("fixture:withdraw-user-question") {
+                // Give the host time to expose both pending requests before testing withdrawal.
+                sleep(Duration::from_millis(250)).await;
+                self.cx.send_notification(withdraw()?)?;
+            }
+            let _ = withdrawn.block_task().await;
+            let answer: serde_json::Value = retained.block_task().await?;
+            self.send_text_chunk(session_id, &format!("question-response:{answer}"))
+                .await?;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        if fixture_prompt == Some("fixture:user-question")
+            || fixture_prompt == Some("fixture:child-user-question")
+        {
+            let target = if fixture_prompt == Some("fixture:child-user-question") {
+                "nested-child".to_owned()
+            } else {
+                session_id.to_string()
+            };
+            let request = agent_client_protocol::UntypedMessage::new(
+                "_nori/request_user_input",
+                json!({
+                    "sessionId": target, "callId": "fixture-call", "turnId": "fixture-turn",
+                    "questions": [{"id":"choice","header":"Choice","question":"Proceed?","isOther":true,"isSecret":false,"options":null}]
+                }),
+            )?;
+            let answer: serde_json::Value = self.cx.send_request(request).block_task().await?;
+            self.send_text_chunk(session_id, &format!("question-response:{answer}"))
+                .await?;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        if !std::env::var("MOCK_AGENT_REPLAY_EXCEPT_TEXT")
+            .is_ok_and(|text| prompt_text.contains(&text))
+            && let Some(result) = wire_replay::run(&self, &session_id).await
+        {
             return result;
         }
 
@@ -592,6 +677,14 @@ impl MockAgent {
         // Each special mode should return early to avoid executing default behavior
 
         // Support simulating prompt failures for testing error propagation
+        if std::env::var("MOCK_AGENT_EXHAUSTED_MODEL").is_ok_and(|model| {
+            model == "*" || std::env::var("MOCK_AGENT_MODEL_NAME").is_ok_and(|name| name == model)
+        }) {
+            return Err(acp::Error::internal_error().data(json!({
+                "codex_error_info": "usage_limit_exceeded",
+                "message": "mock subscription exhausted"
+            })));
+        }
         if std::env::var("MOCK_AGENT_PROMPT_FAIL").is_ok() {
             eprintln!("Mock agent: simulating prompt failure");
             return Err(acp::Error::new(-32001, "Mock prompt failure for testing"));
@@ -1158,6 +1251,14 @@ impl MockAgent {
         // Support custom response text for TUI testing. A model-specific
         // variable lets multi-agent tests distinguish which subprocess
         // produced a response while retaining the generic fallback.
+        if let (Ok(marker), Ok(response)) = (
+            std::env::var("MOCK_AGENT_RESPONSE_MATCH_TEXT"),
+            std::env::var("MOCK_AGENT_RESPONSE_MATCH"),
+        ) && prompt_text.contains(&marker)
+        {
+            self.send_text_chunk(session_id.clone(), &response).await?;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
         let model_name = std::env::var("MOCK_AGENT_MODEL_NAME").unwrap_or_default();
         let model_response_var = format!(
             "MOCK_AGENT_RESPONSE_{}",
@@ -1430,7 +1531,10 @@ impl MockAgent {
             }
         }
 
-        if std::env::var("MOCK_AGENT_STREAM_UNTIL_CANCEL").is_ok() {
+        if std::env::var("MOCK_AGENT_STREAM_UNTIL_CANCEL").is_ok()
+            || std::env::var("MOCK_AGENT_STREAM_UNTIL_CANCEL_TEXT")
+                .is_ok_and(|text| !text.is_empty() && prompt_text.contains(&text))
+        {
             let mut iterations = 0usize;
             while !self.cancel_requested() && iterations < 10_000 {
                 self.send_text_chunk(session_id.clone(), "Streaming...")
@@ -1895,6 +1999,17 @@ async fn main() -> acp::Result<()> {
                         .or_insert_with(default_session_config)
                         .clone();
 
+                    if std::env::var_os("MOCK_AGENT_LOAD_NATIVE_CHILD").is_some() {
+                        cx.send_notification(agent_client_protocol::UntypedMessage::new(
+                            "session/update",
+                            json!({"sessionId":arguments.session_id.to_string(),"update":{"sessionUpdate":"subagent_update","sessionId":"resumed-child","state":{"state":"idle","stopReason":"end_turn"}}}),
+                        )?)?;
+                        cx.send_notification(acp::SessionNotification::new(
+                            "resumed-child",
+                            acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(config_options_for_state(&default_session_config()))),
+                        ))?;
+                    }
+
                     // Send configurable number of notifications during load_session
                     // to simulate history replay. Uses the session_id from the request
                     // so notifications are routed to the correct update channel.
@@ -2096,6 +2211,23 @@ async fn main() -> acp::Result<()> {
                     let Some(value) = arguments.value.as_value_id().map(ToString::to_string) else {
                         return responder.respond_with_error(acp::Error::invalid_params());
                     };
+                    if arguments.config_id.to_string() == "model"
+                        && let Ok(path) = std::env::var("MOCK_AGENT_CONFIG_SET_LOG")
+                    {
+                        use std::io::Write;
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            let _ = writeln!(
+                                file,
+                                "{}\t{}",
+                                std::env::var("MOCK_AGENT_MODEL_NAME").unwrap_or_default(),
+                                value
+                            );
+                        }
+                    }
 
                     let result = {
                         let mut sessions = state.session_configs.lock().unwrap();
@@ -2104,6 +2236,19 @@ async fn main() -> acp::Result<()> {
                             .or_insert_with(default_session_config);
 
                         match arguments.config_id.to_string().as_str() {
+                            "model"
+                                if std::env::var("MOCK_AGENT_CONFIG_SET_FAIL_VALUE")
+                                    .is_ok_and(|fail_value| fail_value == value) =>
+                            {
+                                if std::env::var("MOCK_AGENT_CONFIG_SET_FAIL_KIND")
+                                    .is_ok_and(|kind| kind == "quota")
+                                {
+                                    Err(acp::Error::new(-32003, "Mock provider quota exhausted")
+                                        .data(json!({"code": "insufficient_quota"})))
+                                } else {
+                                    Err(acp::Error::new(-32602, "Mock config set rejected"))
+                                }
+                            }
                             // Simulate a real adapter rejecting a model outside
                             // its advertised catalog, so tests can exercise the
                             // rejection path.
@@ -2226,7 +2371,13 @@ async fn main() -> acp::Result<()> {
         .on_receive_notification(
             {
                 let state = state.clone();
-                async move |_notification: acp::CancelNotification, _cx: ConnectionTo<Client>| {
+                async move |notification: acp::CancelNotification, _cx: ConnectionTo<Client>| {
+                    if let Some(path) = std::env::var_os("MOCK_AGENT_CANCEL_LOG") {
+                        use std::io::Write as _;
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            let _ = writeln!(file, "{}", notification.session_id);
+                        }
+                    }
                     eprintln!("Mock agent: cancel");
                     if std::env::var("MOCK_AGENT_IGNORE_CANCEL").is_err() {
                         state.cancel_requested.store(true, Ordering::SeqCst);

@@ -1,0 +1,20 @@
+---
+source: tui/src/app/response_focus.rs
+expression: text
+---
+
+› First question
+
+
+• first answer
+  continued
+
+╭─ ‹ › ↶ ⑂ × ───────────────────────────────────────────────────────────────────
+
+› Second question
+
+
+• second answer
+
+
+› Pending question

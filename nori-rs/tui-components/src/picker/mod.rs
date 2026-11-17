@@ -11,7 +11,11 @@ use ratatui::text::Line;
 
 use crate::ProviderKind;
 
+mod hit;
 mod render;
+
+pub use hit::PickerHit;
+pub use hit::PickerHitTarget;
 
 pub use render::Picker;
 

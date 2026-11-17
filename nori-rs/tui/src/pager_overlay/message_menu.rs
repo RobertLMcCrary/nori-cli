@@ -22,6 +22,8 @@ pub(crate) enum MessageChoice {
     Rewind,
     /// A new conversation with everything up to and including this message.
     ForkThrough,
+    RollbackThrough,
+    ForkSubagent,
 }
 
 /// A choice made for the message at `cell` of the transcript.
@@ -37,6 +39,8 @@ impl MessageChoice {
             MessageChoice::EditPrompt => "Edit this prompt",
             MessageChoice::Rewind => "Rewind here and restore files",
             MessageChoice::ForkThrough => "Fork from here",
+            MessageChoice::RollbackThrough => "Roll back here",
+            MessageChoice::ForkSubagent => "Fork subagent",
         }
     }
 
@@ -45,6 +49,8 @@ impl MessageChoice {
             MessageChoice::EditPrompt => "New conversation before it, prompt in the composer",
             MessageChoice::Rewind => "Restores the files edited since, then edits it",
             MessageChoice::ForkThrough => "A new conversation with everything up to here",
+            MessageChoice::RollbackThrough => "Continue from this response",
+            MessageChoice::ForkSubagent => "Start a subagent from this response",
         }
     }
 }

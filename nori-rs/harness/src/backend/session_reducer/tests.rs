@@ -1304,3 +1304,118 @@ fn orphan_warning_resets_when_a_new_prompt_starts() {
         "a new prompt should reset the burst window so the warning fires again"
     );
 }
+
+#[test]
+fn steering_interrupts_active_turn_and_runs_before_existing_queue() {
+    let mut runtime = new_runtime();
+    let mut normalizer = new_normalizer();
+    let prompt = |id: &str, text: &str| QueuedPrompt {
+        event_id: id.into(),
+        text: text.into(),
+        content: text_content(text),
+        original_content: text_content(text),
+        display_text: Some(text.into()),
+        ..simple_prompt()
+    };
+    reduce(
+        &mut runtime,
+        InboundEvent::PromptSubmit(prompt("active", "active")),
+        &mut normalizer,
+    );
+    reduce(
+        &mut runtime,
+        InboundEvent::PromptSubmit(prompt("queued", "queued")),
+        &mut normalizer,
+    );
+    let out = reduce(
+        &mut runtime,
+        InboundEvent::PromptSteer(prompt("steer", "steer")),
+        &mut normalizer,
+    );
+    assert!(has_side_effect(&out.side_effects, |effect| matches!(
+        effect,
+        SideEffect::SendCancel
+    )));
+    assert_eq!(
+        runtime
+            .queue
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["steer", "queued"]
+    );
+    let out = reduce(
+        &mut runtime,
+        InboundEvent::PromptResponse {
+            stop_reason: acp::StopReason::Cancelled,
+        },
+        &mut normalizer,
+    );
+    assert!(has_side_effect(
+        &out.side_effects,
+        |effect| matches!(effect, SideEffect::SendPrompt { prompt, .. } if *prompt == text_content("steer"))
+    ));
+    assert_eq!(
+        runtime
+            .queue
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["queued"]
+    );
+    let out = reduce(
+        &mut runtime,
+        InboundEvent::PromptResponse {
+            stop_reason: acp::StopReason::EndTurn,
+        },
+        &mut normalizer,
+    );
+    assert!(has_side_effect(
+        &out.side_effects,
+        |effect| matches!(effect, SideEffect::SendPrompt { prompt, .. } if *prompt == text_content("queued"))
+    ));
+    assert!(runtime.queue.is_empty());
+}
+
+#[test]
+fn promotion_starts_the_oldest_queued_prompt_once_even_after_cancel_failure() {
+    let mut runtime = new_runtime();
+    let mut normalizer = new_normalizer();
+    reduce(
+        &mut runtime,
+        InboundEvent::PromptSubmit(simple_prompt()),
+        &mut normalizer,
+    );
+    let mut queued = simple_prompt();
+    queued.event_id = "queued".into();
+    queued.text = "queued".into();
+    queued.content = text_content("queued");
+    reduce(
+        &mut runtime,
+        InboundEvent::PromptSubmit(queued),
+        &mut normalizer,
+    );
+    let out = reduce(&mut runtime, InboundEvent::PromoteQueued, &mut normalizer);
+    assert!(has_side_effect(&out.side_effects, |effect| matches!(
+        effect,
+        SideEffect::SendCancel
+    )));
+    let duplicate = reduce(&mut runtime, InboundEvent::PromoteQueued, &mut normalizer);
+    assert!(!has_side_effect(
+        &duplicate.side_effects,
+        |effect| matches!(effect, SideEffect::SendCancel)
+    ));
+    let out = reduce(
+        &mut runtime,
+        InboundEvent::PromptFailed { failure: None },
+        &mut normalizer,
+    );
+    assert_eq!(
+        out.side_effects
+            .iter()
+            .filter(|effect| matches!(effect, SideEffect::SendPrompt { .. }))
+            .count(),
+        1
+    );
+    assert!(runtime.queue.is_empty());
+}

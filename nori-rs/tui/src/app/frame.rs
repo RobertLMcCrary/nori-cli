@@ -39,8 +39,12 @@ impl App {
         Ok(true)
     }
 
-    /// Ctrl+L: hide everything above the prompt, leaving scrollback alone.
+    /// Clear-screen binding: hide everything above the prompt, leaving scrollback alone.
     pub(super) fn repaint_screen(&mut self, tui: &mut tui::Tui) {
+        // Remember the transcript boundary so a resize/focus redraw can distinguish the exact
+        // clear-screen state from a later turn or a switched/backtracked session.
+        self.hidden_transcript_len =
+            Some(i64::try_from(self.transcript_cells.len()).unwrap_or(i64::MAX));
         if tui.is_alt_screen_active() {
             // A pager overlay draws the whole screen every frame; forgetting what the terminal
             // shows is all it takes.

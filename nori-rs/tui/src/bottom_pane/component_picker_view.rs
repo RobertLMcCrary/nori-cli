@@ -1,3 +1,5 @@
+mod mouse;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -108,10 +110,11 @@ impl ComponentPickerParams {
             items,
         )
         .search_mode(if searchable {
-            SearchMode::Substring
+            SearchMode::Fuzzy
         } else {
             SearchMode::None
         });
+        state.search_active = searchable;
         state.subtitle = params.subtitle;
         if let Some(search_placeholder) = params.search_placeholder {
             state.search_placeholder = search_placeholder;
@@ -163,7 +166,7 @@ pub(crate) struct ComponentPickerView {
     show_title: bool,
     show_details: bool,
     keep_open: BTreeSet<String>,
-    footer_hints: Option<Vec<KeyHint<'static>>>,
+    mouse: mouse::PickerMouse,
 }
 
 impl ComponentPickerView {
@@ -182,7 +185,7 @@ impl ComponentPickerView {
             show_title: params.show_title,
             show_details: params.show_details,
             keep_open: params.keep_open,
-            footer_hints: params.footer_hints,
+            mouse: mouse::PickerMouse::default(),
         }
     }
 
@@ -216,6 +219,14 @@ impl ComponentPickerView {
 }
 
 impl BottomPaneView for ComponentPickerView {
+    fn keeps_composer_visible(&self) -> bool {
+        true
+    }
+
+    fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        self.on_mouse_event(mouse)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         let search_active = self.state.search_active;
         let action = match key_event {
@@ -393,6 +404,15 @@ impl BottomPaneView for ComponentPickerView {
         };
         item.cells.insert(self.primary_column.clone(), name);
         item.description.clone_from(&description);
+        if self.detail_column.as_deref() == Some("preview")
+            && let Some(detail) = item
+                .details
+                .iter_mut()
+                .find(|detail| detail.label == "First message")
+            && let Some(preview) = &description
+        {
+            detail.value = preview.clone().into();
+        }
         if let Some(detail_column) = &self.detail_column {
             if let Some(description) = description {
                 item.cells.insert(detail_column.clone(), description);
@@ -401,6 +421,17 @@ impl BottomPaneView for ComponentPickerView {
             }
         }
         item.search_text = search_value;
+        let visible = self.state.visible_indices();
+        if self
+            .state
+            .selected_index
+            .is_none_or(|selected| !visible.contains(&selected))
+        {
+            self.state.selected_index = visible.into_iter().find(|index| {
+                let item = &self.state.items[*index];
+                !item.disabled && !item.section_heading
+            });
+        }
         true
     }
 
@@ -429,20 +460,26 @@ impl BottomPaneView for ComponentPickerView {
 
 impl Renderable for ComponentPickerView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let mut picker = Picker::new(&self.state)
+        self.mouse.area.set(area);
+        let picker = Picker::new(&self.state)
+            .hit_regions(&self.mouse.regions)
             .theme(crate::style::component_theme())
             .density(self.density)
             .show_title(self.show_title)
             .show_details(self.show_details)
-            .fullscreen_selection_rails(true);
-        if let Some(footer_hints) = &self.footer_hints {
-            picker = picker.footer_hints(footer_hints.clone());
-        }
+            .fullscreen_selection_rails(true)
+            .footer_hints(std::iter::empty());
         picker.render(area, buf);
+        if area.width > 1 && area.height > 1 {
+            ratatui::widgets::Block::bordered()
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(crate::style::component_theme().border)
+                .render(area, buf);
+        }
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        let rows = self.state.visible_indices().len().clamp(1, 10) as u16;
+        let rows = self.state.items.len().clamp(1, 10) as u16;
         let row_height = match self.density {
             PickerDensity::Compact => 1,
             PickerDensity::Normal => 2,
@@ -451,7 +488,7 @@ impl Renderable for ComponentPickerView {
             + u16::from(self.show_title && !self.state.title.is_empty())
             + u16::from(self.state.subtitle.is_some())
             + u16::from(!self.state.categories.is_empty())
-            + u16::from(self.state.search_active)
+            + u16::from(!matches!(self.state.search_mode, SearchMode::None))
             + u16::from(self.state.columns.len() > 1);
         let minimum_height = if self.show_title { 9 } else { 6 };
         rows.saturating_mul(row_height)
@@ -493,6 +530,27 @@ mod tests {
             keep_open: BTreeSet::new(),
             footer_hints: None,
         }
+    }
+
+    #[test]
+    fn newly_loaded_search_result_becomes_selected() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut view = ComponentPickerView::new(params(), AppEventSender::new(tx));
+        view.state.search_active = true;
+        for ch in "unicorn".chars() {
+            view.state.handle(PickerAction::AppendQuery(ch));
+        }
+        assert_eq!(view.state.selected_index, None);
+        assert!(view.update_selection_item(
+            "two",
+            "Second".to_owned(),
+            Some("unicorn".to_owned()),
+            "beta unicorn".to_owned()
+        ));
+        assert_eq!(
+            view.state.selected_item().map(|item| item.key.as_str()),
+            Some("two")
+        );
     }
 
     #[test]
@@ -660,7 +718,7 @@ mod tests {
         let titleless = ComponentPickerView::new(titleless_params, AppEventSender::new(tx));
 
         assert_eq!(titled.desired_height(100), 9);
-        assert_eq!(titleless.desired_height(100), 7);
+        assert_eq!(titleless.desired_height(100), 8);
     }
 
     #[test]
@@ -799,5 +857,113 @@ mod tests {
         view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(matches!(rx.try_recv(), Ok(AppEvent::BeginExit)));
+    }
+
+    #[test]
+    fn pointer_selects_the_rendered_result_and_swipe_never_submits() {
+        use crossterm::event::MouseButton;
+        use crossterm::event::MouseEvent;
+        use crossterm::event::MouseEventKind;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut params = params();
+        params.actions.insert(
+            "two".to_owned(),
+            Box::new(|tx| tx.send(AppEvent::BeginExit)),
+        );
+        let mut view = ComponentPickerView::new(params, AppEventSender::new(tx));
+        let area = Rect::new(4, 7, 30, 18);
+        let mut buffer = Buffer::empty(area);
+        view.render(area, &mut buffer);
+        let row = (area.y..area.bottom())
+            .find(|row| {
+                (area.x..area.right())
+                    .map(|column| buffer[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains("Second")
+            })
+            .expect("second result is actually painted");
+        let event = |kind, row| MouseEvent {
+            kind,
+            column: area.x + 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.handle_mouse_event(event(MouseEventKind::Down(MouseButton::Left), row));
+        view.handle_mouse_event(event(MouseEventKind::Drag(MouseButton::Left), row + 3));
+        view.handle_mouse_event(event(MouseEventKind::Up(MouseButton::Left), row + 3));
+        assert!(!view.is_complete());
+        assert!(rx.try_recv().is_err());
+        view.render(area, &mut buffer);
+        view.handle_mouse_event(event(MouseEventKind::Down(MouseButton::Left), row));
+        view.handle_mouse_event(event(MouseEventKind::Up(MouseButton::Left), row));
+        assert!(view.is_complete());
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::BeginExit)));
+    }
+
+    #[test]
+    fn picker_pointer_geometry_follows_filtered_results_and_resize() {
+        use crossterm::event::MouseButton;
+        use crossterm::event::MouseEvent;
+        use crossterm::event::MouseEventKind;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut view = ComponentPickerView::new(params(), AppEventSender::new(tx));
+        let old_area = Rect::new(4, 7, 80, 18);
+        view.render(old_area, &mut Buffer::empty(old_area));
+        view.state.search_active = true;
+        view.state.query = "beta".to_owned();
+        let area = Rect::new(2, 3, 30, 18);
+        let mut buffer = Buffer::empty(area);
+        view.render(area, &mut buffer);
+        let rows = (area.y..area.bottom())
+            .map(|row| {
+                (area.x..area.right())
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        insta::assert_snapshot!("pointer_picker_narrow_filtered", rows.join("\n"));
+        let row = rows
+            .iter()
+            .position(|row| row.contains("Second"))
+            .expect("filtered result is painted");
+        let row = area.y + u16::try_from(row).expect("viewport row");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            view.handle_mouse_event(MouseEvent {
+                kind,
+                column: area.x + 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(
+            view.state.selected_item().map(|item| item.key.as_str()),
+            Some("two")
+        );
+        assert!(view.is_complete());
+    }
+
+    #[test]
+    fn filtering_keeps_picker_geometry_stable() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut view = ComponentPickerView::new(params(), AppEventSender::new(tx));
+        for width in [30, 80] {
+            let height = view.desired_height(width);
+            view.state.search_active = true;
+            assert_eq!(view.desired_height(width), height);
+            view.state.query = "beta".to_owned();
+            assert_eq!(view.desired_height(width), height);
+            view.state.query = "no match".to_owned();
+            assert_eq!(view.desired_height(width), height);
+            view.state.query.clear();
+            view.state.search_active = false;
+            assert_eq!(view.desired_height(width), height);
+        }
     }
 }

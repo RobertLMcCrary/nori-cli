@@ -15,7 +15,7 @@ pub(crate) enum GoalStatus {
     Complete,
 }
 
-pub(super) const NORI_GOAL_CONTROL_INSTRUCTIONS: &str = "Nori CLI owns this goal. Use only Nori's goal tools (`get_goal`, `update_goal`), never another goal tool.\n- Before ending a goal turn, call `get_goal`.\n- When the requested work is verified complete, you MUST call `update_goal` with status `complete`, then check that it returned `complete`.\n- When genuinely blocked, call `update_goal` with status `blocked`, then check that it returned `blocked`.";
+pub(super) const NORI_GOAL_CONTROL_INSTRUCTIONS: &str = "Nori CLI owns this goal. Use only Nori's goal tools (`get_goal`, `update_goal`), never another goal tool. Nori delivers changed goal context automatically when supported; do not routinely poll `get_goal`. Use `get_goal` only when you need to inspect the current state.\n- When the requested work is verified complete, call `update_goal` with status `complete` and check its result.\n- When genuinely blocked, call `update_goal` with status `blocked` and check its result.";
 
 fn goal_control_context() -> String {
     format!("<goal_control>\n{NORI_GOAL_CONTROL_INSTRUCTIONS}\n</goal_control>")
@@ -91,6 +91,9 @@ struct StoredThreadGoal {
 pub(crate) struct ThreadGoalState {
     goal: Option<StoredThreadGoal>,
     last_session_used_tokens: Option<i64>,
+    revision: i64,
+    delivered_revision: Option<i64>,
+    delivered_goal: bool,
     /// True while the agent's native goal loop (driven via the
     /// `_session/goal` extension) owns continuation for the current goal.
     ext_driven: bool,
@@ -118,13 +121,26 @@ impl ThreadGoalState {
         for event in events {
             match event {
                 ClientEvent::ThreadGoalUpdated(update) => {
+                    let changed = state.goal.as_ref().is_none_or(|goal| {
+                        goal.objective != update.goal.objective
+                            || client_status(goal.status) != update.goal.status
+                            || goal.created_at != update.goal.created_at
+                    });
                     state.goal = Some(StoredThreadGoal::from_client_goal(
                         &update.goal,
                         state.last_session_used_tokens,
                     ));
+                    if changed {
+                        state.revision = state.revision.saturating_add(1);
+                    }
                 }
                 ClientEvent::ThreadGoalCleared => {
-                    state.goal = None;
+                    if state.goal.take().is_some() {
+                        state.revision = state.revision.saturating_add(1);
+                        // Replayed history can contain the previous goal even though
+                        // the current store is empty; tell the reattached model once.
+                        state.delivered_goal = true;
+                    }
                 }
                 ClientEvent::SessionUpdateInfo(update) => {
                     if let Some(usage) = &update.usage {
@@ -168,7 +184,8 @@ impl ThreadGoalState {
                 GoalStatus::Complete => "complete",
             };
             format!(
-                "<goal_context>\nStatus: {}\nObjective: {}\nTime used: {}\nTokens used: {}\n</goal_context>\n\n{}",
+                "<goal_context>\nRevision: {}\nStatus: {}\nObjective: {}\nTime used: {}\nTokens used: {}\n</goal_context>\n\n{}",
+                self.revision,
                 status,
                 goal.objective,
                 format_elapsed_seconds(goal.time_used_seconds),
@@ -176,6 +193,25 @@ impl ThreadGoalState {
                 goal_control_context()
             )
         })
+    }
+
+    /// Deliver each meaningful goal change once to this conversation. Usage-only
+    /// accounting does not create a revision, and an initially empty goal is silent.
+    pub(crate) fn take_goal_context(&mut self, now: i64) -> Option<String> {
+        if self.delivered_revision == Some(self.revision) {
+            return None;
+        }
+        let context = match self.prompt_context(now) {
+            Some(context) => context,
+            None if self.delivered_goal => format!(
+                "<goal_context>\nRevision: {}\nGoal: cleared\n</goal_context>",
+                self.revision
+            ),
+            None => return None,
+        };
+        self.delivered_revision = Some(self.revision);
+        self.delivered_goal = self.goal.is_some();
+        Some(context)
     }
 
     pub(crate) fn continuation_prompt(&self, now: i64) -> Option<String> {
@@ -263,6 +299,11 @@ Before deciding that the goal is achieved, treat completion as unproven and veri
             return Err("goal objective cannot be empty".to_string());
         }
         let status = status.unwrap_or(GoalStatus::Active);
+        let changed = self.goal.as_ref().is_none_or(|previous| {
+            previous.objective != objective
+                || previous.status != status
+                || previous.created_at != now
+        });
         let goal = StoredThreadGoal {
             objective,
             status,
@@ -275,6 +316,9 @@ Before deciding that the goal is achieved, treat completion as unproven and veri
         };
         let snapshot = goal.snapshot(now);
         self.goal = Some(goal);
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
         Ok(snapshot)
     }
 
@@ -286,12 +330,21 @@ Before deciding that the goal is achieved, treat completion as unproven and veri
         let Some(goal) = self.goal.as_mut() else {
             return Err("cannot update goal: no goal exists".to_string());
         };
+        let changed = goal.status != status;
         goal.apply_status(status, now);
-        Ok(goal.snapshot(now))
+        let snapshot = goal.snapshot(now);
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(snapshot)
     }
 
     pub(crate) fn clear(&mut self) -> bool {
-        self.goal.take().is_some()
+        let removed = self.goal.take().is_some();
+        if removed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        removed
     }
 
     pub(crate) fn ext_driven(&self) -> bool {
@@ -441,6 +494,7 @@ impl AcpBackend {
         objective: String,
         status: Option<nori_protocol::ThreadGoalStatus>,
     ) -> Result<nori_protocol::ThreadGoal> {
+        let generation = self.orchestrator.admission_generation();
         let status = status.map(status_from_client);
         // A non-active initial status cannot be expressed over the goal
         // extension, so such goals always use the nori-client loop.
@@ -503,7 +557,7 @@ impl AcpBackend {
         let goal = goal.into_client_goal();
         self.emit_goal_changed(Some(goal.clone())).await;
         if should_start {
-            self.submit_goal_continuation_if_idle().await;
+            self.submit_goal_continuation_if_idle(generation).await;
         }
         Ok(goal)
     }
@@ -524,6 +578,7 @@ impl AcpBackend {
         &self,
         status: nori_protocol::ThreadGoalStatus,
     ) -> Result<nori_protocol::ThreadGoal> {
+        let generation = self.orchestrator.admission_generation();
         let internal_status = status_from_client(status);
         let ext = self.goal_ext_capability();
         if ext.is_none() && !self.goal_automation_available().await {
@@ -584,7 +639,7 @@ impl AcpBackend {
         let goal = goal.into_client_goal();
         self.emit_goal_changed(Some(goal.clone())).await;
         if should_start {
-            self.submit_goal_continuation_if_idle().await;
+            self.submit_goal_continuation_if_idle(generation).await;
         }
         Ok(goal)
     }
@@ -684,23 +739,21 @@ impl AcpBackend {
         }))
     }
 
-    pub(super) async fn prepend_goal_context_to_prompt(&self, prompt: String) -> String {
-        let goal_context = {
-            let state = self.thread_goal_state.lock().await;
+    pub(super) async fn take_goal_context_for_prompt(&self) -> Option<String> {
+        let client = self.goal_mcp_http_server.lock().await;
+        if client.is_none() {
+            return None;
+        }
+        drop(client);
+        {
+            let mut state = self.thread_goal_state.lock().await;
             // While the agent's native goal loop drives, it owns goal context
             // and the nori-client instructions would point at the wrong
             // control plane.
             if state.ext_driven() {
-                return prompt;
+                return None;
             }
-            state.prompt_context(now_seconds())
-        };
-        if !self.goal_automation_available().await {
-            return prompt;
-        }
-        match goal_context {
-            Some(goal_context) => format!("{goal_context}\n\n{prompt}"),
-            None => prompt,
+            state.take_goal_context(now_seconds())
         }
     }
 
@@ -833,7 +886,7 @@ mod tests {
 
     #[test]
     fn rehydration_respects_latest_clear_event() {
-        let goals = ThreadGoalState::from_replay_events(&[
+        let mut goals = ThreadGoalState::from_replay_events(&[
             crate::normalized::ClientEvent::ThreadGoalUpdated(
                 crate::normalized::ThreadGoalUpdated {
                     goal: nori_protocol::ThreadGoal {
@@ -850,6 +903,11 @@ mod tests {
         ]);
 
         assert_eq!(goals.snapshot(30), None);
+        assert_eq!(
+            goals.take_goal_context(30),
+            Some("<goal_context>\nRevision: 2\nGoal: cleared\n</goal_context>".to_owned())
+        );
+        assert_eq!(goals.take_goal_context(31), None);
     }
 
     #[test]
@@ -864,10 +922,44 @@ mod tests {
 
         assert_eq!(
             goals.prompt_context(73),
-            Some(
-                "<goal_context>\nStatus: active\nObjective: Keep going\nTime used: 1m 3s\nTokens used: 1.06K\n</goal_context>\n\n<goal_control>\nNori CLI owns this goal. Use only Nori's goal tools (`get_goal`, `update_goal`), never another goal tool.\n- Before ending a goal turn, call `get_goal`.\n- When the requested work is verified complete, you MUST call `update_goal` with status `complete`, then check that it returned `complete`.\n- When genuinely blocked, call `update_goal` with status `blocked`, then check that it returned `blocked`.\n</goal_control>"
-                    .to_string()
-            )
+            Some(format!(
+                "<goal_context>\nRevision: 1\nStatus: active\nObjective: Keep going\nTime used: 1m 3s\nTokens used: 1.06K\n</goal_context>\n\n<goal_control>\n{}\n</goal_control>",
+                super::NORI_GOAL_CONTROL_INSTRUCTIONS
+            ))
+        );
+    }
+
+    #[test]
+    fn goal_context_tracks_changes_without_polling_or_usage_spam() {
+        let mut goals = ThreadGoalState::default();
+        assert_eq!(goals.take_goal_context(1), None);
+        goals.set_objective("First".into(), None, 2).unwrap();
+        let first = goals.take_goal_context(3).unwrap();
+        assert!(first.contains("Revision: 1\nStatus: active\nObjective: First"));
+        assert_eq!(goals.take_goal_context(4), None);
+        goals.update_session_tokens(42, 5);
+        assert_eq!(goals.take_goal_context(6), None);
+        goals.set_status(GoalStatus::Paused, 7).unwrap();
+        assert!(
+            goals
+                .take_goal_context(8)
+                .unwrap()
+                .contains("Revision: 2\nStatus: paused")
+        );
+        goals.set_status(GoalStatus::Paused, 9).unwrap();
+        assert_eq!(goals.take_goal_context(10), None);
+        assert!(goals.clear());
+        assert_eq!(
+            goals.take_goal_context(11),
+            Some("<goal_context>\nRevision: 3\nGoal: cleared\n</goal_context>".into())
+        );
+        assert_eq!(goals.take_goal_context(12), None);
+        goals.set_objective("Second".into(), None, 13).unwrap();
+        assert!(
+            goals
+                .take_goal_context(14)
+                .unwrap()
+                .contains("Revision: 4\nStatus: active\nObjective: Second")
         );
     }
 

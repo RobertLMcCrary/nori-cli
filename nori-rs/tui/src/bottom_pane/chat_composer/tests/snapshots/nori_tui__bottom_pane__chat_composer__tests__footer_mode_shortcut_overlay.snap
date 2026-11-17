@@ -1,17 +1,13 @@
 ---
 source: tui/src/bottom_pane/chat_composer/tests/mod.rs
+assertion_line: 43
 expression: terminal.backend()
 ---
 "                                                                                                    "
-"? Ask Nori to do anything                                                                           "
+"› Ask Nori to do anything                                                                           "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
-"  / for commands                            shift + enter for newline                               "
-"  @ for file paths                          ctrl + v to paste images                                "
-"  esc again to edit previous message        ctrl + g to open editor                                 "
-"  ctrl + c to exit                          ctrl + o to toggle plan drawer                          "
-"                                            ctrl + t to view transcript                             "
