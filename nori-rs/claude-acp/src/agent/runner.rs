@@ -815,6 +815,15 @@ where
                 let config = agent.config().clone();
                 let sessions = agent.sessions().clone();
                 async move |message: Dispatch, connection_cx: ConnectionTo<Client>| {
+                    // Replies to our own requests (e.g. session/request_permission) also land here.
+                    // Answering them with "Unknown method" beat the real reply to the awaiter, so
+                    // every client-approved tool call was denied.
+                    let message = match message {
+                        Dispatch::Response(result, router) => {
+                            return router.respond_with_result(result);
+                        }
+                        other @ (Dispatch::Request(..) | Dispatch::Notification(_)) => other,
+                    };
                     let method = message.method().to_string();
                     let span = tracing::info_span!(
                         "handle_message",
